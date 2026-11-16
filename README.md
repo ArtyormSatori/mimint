@@ -1,7 +1,7 @@
 # Mimint
 
 <p align="center">
-  <video src="assets/mimint-thinking.mp4" poster="assets/mint-thinking.jpg" width="360" autoplay muted loop playsinline controls></video>
+  <video src="https://raw.githubusercontent.com/ArtyormSatori/mimint/main/assets/mimint-thinking.mp4" poster="https://raw.githubusercontent.com/ArtyormSatori/mimint/main/assets/mint-thinking.jpg" width="360" autoplay muted loop playsinline controls></video>
 </p>
 
 **Mimint** là trợ lý AI cá nhân viết từ đầu bằng Rust, cho macOS, Android, Windows và Linux — nhanh, riêng tư, thuộc về bạn. Đây là Mint.
