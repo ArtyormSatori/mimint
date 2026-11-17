@@ -1,6 +1,11 @@
 # Mimint Phase 2 — License Audit
 
-> SOURCE OF TRUTH: this file is the authoritative license audit for the
+> SUPERSEDED: this file covers the Phase 2 dependency tree only (156
+> packages). The authoritative license audit for the current tree is
+> `phase3/LICENSE-AUDIT.md` (494 packages, Phase 3). This file is kept
+> as a historical record; do not treat it as the source of truth.
+
+> SOURCE OF TRUTH (historical): this file was the authoritative license audit for the
 > Phase 2 dependency tree. `phase1/LICENSE-AUDIT.md` covers the Phase 1
 > tree only and is superseded by this file (see the notice at its top).
 
