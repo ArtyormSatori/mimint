@@ -1,16 +1,24 @@
-//! OpenAI-compatible provider client (D4: OpenAI-compatible first).
+//! Provider trait and the OpenAI-compatible provider client (D4:
+//! OpenAI-compatible first, Claude second).
 //!
+//! - Every provider sends HTTP only through a [`GuardedHttpClient`],
+//!   which enforces the egress policy before any socket opens. No
+//!   provider constructs its own HTTP client.
 //! - TLS via rustls only; plaintext HTTP is rejected except for loopback
 //!   endpoints explicitly specified by the user, which are logged clearly.
-//! - The API key comes only from the caller (the CLI reads `MIMINT_API_KEY`);
-//!   it is never written to any log or file. Logs record only key presence.
+//! - The API key comes only from the caller (via the vault); it is never
+//!   written to any log or file. Logs record only key presence.
 //! - No default model: the caller must always supply one.
 
+use crate::egress::{url_is_loopback, GuardedHttpClient};
 use crate::error::MimintError;
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
+use std::future::Future;
+use std::pin::Pin;
 
-/// A chat message (request and response shape).
+/// A chat message (request and response shape), in OpenAI-style form.
+/// This is the common in-memory shape: protocol adapters (Claude, ...)
+/// translate to and from their wire format at the boundary.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
@@ -75,6 +83,67 @@ pub struct FunctionCall {
     pub arguments: String,
 }
 
+/// One LLM backend behind the common chat interface.
+///
+/// The `chat` method returns a boxed future (instead of `async fn`) so
+/// the trait stays object-safe without an extra dependency: fallback
+/// chains hold `Box<dyn Provider>` over mixed backend types.
+pub trait Provider: Send + Sync {
+    /// Backend name from configuration (used in audit records and errors).
+    fn name(&self) -> &str;
+
+    /// Model name sent with every request.
+    fn model(&self) -> &str;
+
+    /// Full request URL. Contains no secret.
+    fn endpoint_url(&self) -> &str;
+
+    /// True when this backend bills per use: any non-loopback endpoint.
+    /// Loopback backends (Ollama, LM Studio, local gateways) are
+    /// classified free/local. This drives the P0-11 cost-cap lock.
+    fn is_paid(&self) -> bool;
+
+    /// One chat call with tool-calling enabled when tools exist.
+    fn chat<'a>(
+        &'a self,
+        messages: &'a [ChatMessage],
+        tools: &'a [serde_json::Value],
+    ) -> Pin<Box<dyn Future<Output = Result<ChatMessage, MimintError>> + Send + 'a>>;
+}
+
+/// Build the error for a non-success HTTP status. HTTP 429 and 5xx are
+/// transient (the fallback chain may retry them); anything else is a
+/// permanent provider error.
+pub(crate) fn http_status_error(status: reqwest::StatusCode, snippet: &str) -> MimintError {
+    let message = extract_error_message(snippet);
+    let text = format!("provider returned HTTP {status}: {message}");
+    if status.as_u16() == 429 || status.is_server_error() {
+        MimintError::ProviderTransient(text)
+    } else {
+        MimintError::Provider(text)
+    }
+}
+
+/// Pull a readable message out of a provider error body when possible.
+/// Understands `{"error": {"message": ...}}` (OpenAI) and
+/// `{"error": {"message": ...}}` (Anthropic); falls back to the raw body,
+/// truncated to 500 characters.
+pub(crate) fn extract_error_message(body: &str) -> String {
+    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(body) {
+        if let Some(message) = parsed
+            .get("error")
+            .and_then(|error| error.get("message"))
+            .and_then(serde_json::Value::as_str)
+        {
+            return message.chars().take(500).collect();
+        }
+        if let Some(message) = parsed.get("error").and_then(serde_json::Value::as_str) {
+            return message.chars().take(500).collect();
+        }
+    }
+    body.chars().take(500).collect()
+}
+
 #[derive(Debug, Deserialize)]
 struct ChatCompletionResponse {
     choices: Vec<Choice>,
@@ -87,10 +156,12 @@ struct Choice {
 
 /// Client for one OpenAI-compatible chat-completions endpoint.
 pub struct ProviderClient {
+    name: String,
     endpoint_url: String,
     model: String,
     api_key: Option<String>,
-    client: reqwest::Client,
+    http: GuardedHttpClient,
+    paid: bool,
 }
 
 impl ProviderClient {
@@ -98,11 +169,24 @@ impl ProviderClient {
     ///
     /// `base_url` may end with `/v1` (Ollama convention) or not; the
     /// chat-completions path is appended exactly once either way.
+    /// The endpoint is validated against the guarded client's egress
+    /// policy at construction, and again on every request.
     pub fn new(
         base_url: &str,
         model: &str,
         api_key: Option<String>,
-        timeout: Duration,
+        http: GuardedHttpClient,
+    ) -> Result<Self, MimintError> {
+        Self::new_named("openai-compatible", base_url, model, api_key, http)
+    }
+
+    /// Build a client with an explicit backend name (from configuration).
+    pub fn new_named(
+        name: &str,
+        base_url: &str,
+        model: &str,
+        api_key: Option<String>,
+        http: GuardedHttpClient,
     ) -> Result<Self, MimintError> {
         let base_url = base_url.trim().trim_end_matches('/');
         if base_url.is_empty() {
@@ -115,28 +199,23 @@ impl ProviderClient {
                 "empty model: pass --model or set MIMINT_MODEL (no default model)".to_string(),
             ));
         }
-        let (scheme, host) = split_endpoint(base_url)?;
-        let loopback = is_loopback_host(&host);
-        match scheme.as_str() {
-            "https" => {}
-            "http" if loopback => {
-                eprintln!("plaintext loopback endpoint (user-specified local): {base_url}");
-            }
-            "http" => {
-                return Err(MimintError::Config(format!(
-                    "refusing plaintext http endpoint for non-loopback host '{host}': use https or a loopback endpoint"
-                )));
-            }
-            other => {
-                return Err(MimintError::Config(format!(
-                    "unsupported URL scheme '{other}': use https (or http only for loopback)"
-                )));
-            }
+        let endpoint_url = if base_url.ends_with("/v1") {
+            format!("{base_url}/chat/completions")
+        } else {
+            format!("{base_url}/v1/chat/completions")
+        };
+        // Egress policy (including Privacy Mode) is enforced here, at
+        // construction, and again on every request inside the client.
+        http.validate(&endpoint_url)?;
+        let loopback = url_is_loopback(&endpoint_url)?;
+        let (scheme, _) = crate::egress::split_endpoint(&endpoint_url)?;
+        if scheme == "http" && loopback {
+            eprintln!("plaintext loopback endpoint (user-specified local): {base_url}");
         }
         let key = api_key.filter(|key| !key.trim().is_empty());
         if key.is_none() && !loopback {
             return Err(MimintError::Config(
-                "missing API key for remote endpoint: set MIMINT_API_KEY".to_string(),
+                "missing API key for remote endpoint: set MIMINT_API_KEY or configure key_env/key_file".to_string(),
             ));
         }
         // Never log the key value; only whether one is present.
@@ -144,26 +223,14 @@ impl ProviderClient {
             "provider endpoint: {base_url}; model: {model}; api key present: {}",
             if key.is_some() { "yes" } else { "no" }
         );
-        let endpoint_url = if base_url.ends_with("/v1") {
-            format!("{base_url}/chat/completions")
-        } else {
-            format!("{base_url}/v1/chat/completions")
-        };
-        let client = reqwest::Client::builder()
-            .timeout(timeout)
-            .build()
-            .map_err(|e| MimintError::Provider(format!("cannot build HTTP client: {e}")))?;
         Ok(Self {
+            name: name.to_string(),
             endpoint_url,
             model: model.to_string(),
             api_key: key,
-            client,
+            http,
+            paid: !loopback,
         })
-    }
-
-    /// Model name sent with every request.
-    pub fn model(&self) -> &str {
-        &self.model
     }
 
     /// Full chat-completions URL. Contains no secret.
@@ -171,8 +238,12 @@ impl ProviderClient {
         &self.endpoint_url
     }
 
-    /// One chat-completions call with tool-calling enabled when tools exist.
-    pub async fn chat(
+    /// Model name sent with every request.
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
+    async fn chat_inner(
         &self,
         messages: &[ChatMessage],
         tools: &[serde_json::Value],
@@ -185,18 +256,18 @@ impl ProviderClient {
             body["tools"] = serde_json::Value::Array(tools.to_vec());
             body["tool_choice"] = serde_json::Value::String("auto".to_string());
         }
-        let mut request = self.client.post(&self.endpoint_url).json(&body);
+        let mut headers: Vec<(String, String)> = Vec::new();
         if let Some(key) = &self.api_key {
-            request = request.bearer_auth(key);
+            headers.push(("Authorization".to_string(), format!("Bearer {key}")));
         }
-        let response = request.send().await?;
+        let response = self
+            .http
+            .post_json(&self.endpoint_url, &body, &headers)
+            .await?;
         let status = response.status();
         if !status.is_success() {
             let text = response.text().await.unwrap_or_default();
-            let snippet: String = text.chars().take(500).collect();
-            return Err(MimintError::Provider(format!(
-                "provider returned HTTP {status}: {snippet}"
-            )));
+            return Err(http_status_error(status, &text));
         }
         let parsed: ChatCompletionResponse = response
             .json()
@@ -211,61 +282,67 @@ impl ProviderClient {
     }
 }
 
-/// Split `scheme://authority/...` into a lowercase scheme and host (no port).
-fn split_endpoint(base_url: &str) -> Result<(String, String), MimintError> {
-    let Some((scheme, rest)) = base_url.split_once("://") else {
-        return Err(MimintError::Config(
-            "base URL must include a scheme, e.g. https://example.com".to_string(),
-        ));
-    };
-    let scheme = scheme.to_ascii_lowercase();
-    let authority = rest.split('/').next().unwrap_or("");
-    let authority = authority.split('?').next().unwrap_or(authority);
-    let hostport = authority.rsplit('@').next().unwrap_or(authority);
-    let host = if let Some(bracketed) = hostport.strip_prefix('[') {
-        match bracketed.find(']') {
-            Some(end) => &bracketed[..end],
-            None => {
-                return Err(MimintError::Config(
-                    "base URL has a malformed bracketed host".to_string(),
-                ));
-            }
-        }
-    } else if hostport.matches(':').count() == 1 {
-        hostport.split(':').next().unwrap_or(hostport)
-    } else {
-        hostport
-    };
-    if host.is_empty() {
-        return Err(MimintError::Config("base URL has no host".to_string()));
+impl Provider for ProviderClient {
+    fn name(&self) -> &str {
+        &self.name
     }
-    Ok((scheme, host.to_ascii_lowercase()))
-}
 
-/// Loopback hosts allowed for user-specified plaintext HTTP: exactly the
-/// three forms in the brief, nothing else (notably not `0.0.0.0`).
-fn is_loopback_host(host: &str) -> bool {
-    matches!(host, "127.0.0.1" | "localhost" | "::1")
+    fn model(&self) -> &str {
+        &self.model
+    }
+
+    fn endpoint_url(&self) -> &str {
+        &self.endpoint_url
+    }
+
+    fn is_paid(&self) -> bool {
+        self.paid
+    }
+
+    fn chat<'a>(
+        &'a self,
+        messages: &'a [ChatMessage],
+        tools: &'a [serde_json::Value],
+    ) -> Pin<Box<dyn Future<Output = Result<ChatMessage, MimintError>> + Send + 'a>> {
+        Box::pin(async move { self.chat_inner(messages, tools).await })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::egress::EgressPolicy;
+    use std::time::Duration;
+
+    fn http_off() -> GuardedHttpClient {
+        GuardedHttpClient::new(EgressPolicy::privacy_off(), Duration::from_secs(1))
+            .expect("build guarded client")
+    }
+
+    fn http_on() -> GuardedHttpClient {
+        GuardedHttpClient::new(EgressPolicy::privacy_on(), Duration::from_secs(1))
+            .expect("build guarded client")
+    }
 
     fn new_client(base_url: &str, key: Option<&str>) -> Result<ProviderClient, MimintError> {
-        ProviderClient::new(
-            base_url,
-            "test-model",
-            key.map(str::to_string),
-            Duration::from_secs(1),
-        )
+        ProviderClient::new(base_url, "test-model", key.map(str::to_string), http_off())
+    }
+
+    /// `expect_err` without a `Debug` bound on the success type: provider
+    /// clients deliberately do not implement `Debug` (they hold keys).
+    fn expect_error<T>(result: Result<T, MimintError>, what: &str) -> MimintError {
+        match result {
+            Ok(_) => panic!("expected error: {what}"),
+            Err(err) => err,
+        }
     }
 
     #[test]
     fn http_non_loopback_is_rejected() {
-        let err = new_client("http://example.com", Some("k"))
-            .err()
-            .expect("http non-loopback must fail");
+        let err = expect_error(
+            new_client("http://example.com", Some("k")),
+            "http non-loopback must fail",
+        );
         assert!(err.to_string().contains("plaintext"), "{err}");
     }
 
@@ -278,14 +355,16 @@ mod tests {
         ] {
             let client = new_client(base_url, None).expect("loopback without key");
             assert!(client.endpoint_url().ends_with("/v1/chat/completions"));
+            assert!(!client.is_paid(), "{base_url} must be free/local");
         }
     }
 
     #[test]
     fn https_remote_without_key_is_rejected() {
-        let err = new_client("https://example.com", None)
-            .err()
-            .expect("https remote without key must fail");
+        let err = expect_error(
+            new_client("https://example.com", None),
+            "https remote without key must fail",
+        );
         assert!(err.to_string().contains("MIMINT_API_KEY"), "{err}");
     }
 
@@ -297,6 +376,7 @@ mod tests {
             "https://example.com/v1/chat/completions"
         );
         assert_eq!(client.model(), "test-model");
+        assert!(client.is_paid());
     }
 
     #[test]
@@ -317,15 +397,44 @@ mod tests {
     fn unsupported_scheme_and_empty_model_are_rejected() {
         assert!(new_client("ftp://example.com", Some("k")).is_err());
         assert!(new_client("example.com", Some("k")).is_err());
-        assert!(ProviderClient::new(
-            "https://example.com",
-            "",
-            Some("k".to_string()),
-            Duration::from_secs(1)
-        )
-        .is_err());
         assert!(
-            ProviderClient::new("", "m", Some("k".to_string()), Duration::from_secs(1)).is_err()
+            ProviderClient::new("https://example.com", "", Some("k".to_string()), http_off())
+                .is_err()
         );
+        assert!(ProviderClient::new("", "m", Some("k".to_string()), http_off()).is_err());
+    }
+
+    #[test]
+    fn privacy_on_rejects_remote_at_construction() {
+        let err = expect_error(
+            ProviderClient::new("https://example.com", "m", Some("k".to_string()), http_on()),
+            "remote under Privacy Mode must fail at construction",
+        );
+        assert!(err.to_string().contains("Privacy Mode"), "{err}");
+        let client = ProviderClient::new("http://127.0.0.1:11434", "m", None, http_on())
+            .expect("loopback under Privacy Mode");
+        assert!(!client.is_paid());
+    }
+
+    #[test]
+    fn error_classification_429_and_5xx_are_transient() {
+        let transient = http_status_error(reqwest::StatusCode::TOO_MANY_REQUESTS, "slow down");
+        assert!(transient.is_transient());
+        let transient = http_status_error(reqwest::StatusCode::INTERNAL_SERVER_ERROR, "boom");
+        assert!(transient.is_transient());
+        let permanent = http_status_error(reqwest::StatusCode::UNAUTHORIZED, "bad key");
+        assert!(!permanent.is_transient());
+        let permanent = http_status_error(reqwest::StatusCode::NOT_FOUND, "no model");
+        assert!(!permanent.is_transient());
+    }
+
+    #[test]
+    fn error_message_extraction_prefers_provider_message() {
+        assert_eq!(
+            extract_error_message(r#"{"error":{"message":"bad key","type":"auth"}}"#),
+            "bad key"
+        );
+        assert_eq!(extract_error_message("plain failure"), "plain failure");
+        assert_eq!(extract_error_message(r#"{"error":"short"}"#), "short");
     }
 }

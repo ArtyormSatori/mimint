@@ -10,7 +10,7 @@ use crate::audit::AuditLog;
 use crate::error::MimintError;
 use crate::guards::{Approver, GuardedExecutor};
 use crate::notebook::Notebook;
-use crate::provider::{ChatMessage, ProviderClient};
+use crate::provider::{ChatMessage, Provider};
 use crate::tools::Registry;
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -36,8 +36,10 @@ struct PendingVerification {
 }
 
 /// One-turn brain loop over a provider, a tool registry, and a notebook.
+/// The provider is any [`Provider`] implementation: a single backend or
+/// a fallback chain. The loop itself is protocol-agnostic.
 pub struct Brain<'a> {
-    provider: &'a ProviderClient,
+    provider: &'a dyn Provider,
     registry: &'a Registry,
     approver: Option<&'a dyn Approver>,
     audit: &'a AuditLog,
@@ -49,7 +51,7 @@ pub struct Brain<'a> {
 impl<'a> Brain<'a> {
     /// New brain loop. `max_steps` must be at least 1.
     pub fn new(
-        provider: &'a ProviderClient,
+        provider: &'a dyn Provider,
         registry: &'a Registry,
         approver: Option<&'a dyn Approver>,
         audit: &'a AuditLog,

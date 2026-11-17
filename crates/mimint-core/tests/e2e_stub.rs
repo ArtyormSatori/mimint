@@ -5,7 +5,8 @@
 //! canned `notebook_add` tool call; the second returns canned final text.
 
 use mimint_core::{
-    default_registry, Approver, AuditLog, Brain, MimintError, Notebook, ProviderClient,
+    default_registry, Approver, AuditLog, Brain, EgressPolicy, GuardedHttpClient, MimintError,
+    Notebook, ProviderClient,
 };
 use serde_json::Value;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -120,7 +121,8 @@ async fn e2e_turn_through_stub() {
         &format!("http://127.0.0.1:{port}"),
         "stub-model",
         None,
-        Duration::from_secs(10),
+        GuardedHttpClient::new(EgressPolicy::privacy_on(), Duration::from_secs(10))
+            .expect("guarded client"),
     )
     .expect("provider");
     let approver = TestApprover;

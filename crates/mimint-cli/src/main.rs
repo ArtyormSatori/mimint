@@ -5,7 +5,8 @@
 //! a short summary. No REPL.
 
 use mimint_core::{
-    default_registry, Approver, AuditLog, Brain, MimintError, Notebook, ProviderClient,
+    default_registry, Approver, AuditLog, Brain, EgressPolicy, GuardedHttpClient, MimintError,
+    Notebook, ProviderClient,
 };
 use serde_json::Value;
 use std::env;
@@ -217,12 +218,13 @@ async fn run() -> Result<(), MimintError> {
     let notebook = Arc::new(Notebook::open(&args.db)?);
     let audit = AuditLog::open(&args.audit)?;
     let registry = default_registry(Arc::clone(&notebook));
-    let provider = ProviderClient::new(
-        &base_url,
-        &model,
-        api_key,
+    // Intermediate Phase 2 state: privacy-off preserves Phase 1 behavior
+    // until the CLI rewrite wires the policy through (later commit).
+    let http = GuardedHttpClient::new(
+        EgressPolicy::privacy_off(),
         Duration::from_secs(args.timeout_secs),
     )?;
+    let provider = ProviderClient::new(&base_url, &model, api_key, http)?;
     let turn_id = format!("turn-{}-{}", std::process::id(), now_ms());
     let stdin_approver = StdinApprover::new();
     let auto_approver = AutoApprover;
