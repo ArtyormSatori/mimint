@@ -10,6 +10,7 @@
 
 pub mod audit;
 pub mod brain;
+pub mod claude;
 pub mod egress;
 pub mod error;
 pub mod guards;
@@ -19,6 +20,7 @@ pub mod tools;
 
 pub use audit::{AuditLog, AuditRecord};
 pub use brain::{Brain, TurnOutcome};
+pub use claude::{ClaudeClient, ANTHROPIC_BASE_URL, ANTHROPIC_VERSION, DEFAULT_MAX_TOKENS};
 pub use egress::{EgressPolicy, GuardedHttpClient};
 pub use error::MimintError;
 pub use guards::{Approver, GuardedExecutor, Risk};
