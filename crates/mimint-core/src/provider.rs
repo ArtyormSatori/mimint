@@ -10,11 +10,68 @@
 //!   written to any log or file. Logs record only key presence.
 //! - No default model: the caller must always supply one.
 
+use crate::audit::AuditLog;
 use crate::egress::{url_is_loopback, GuardedHttpClient};
 use crate::error::MimintError;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::future::Future;
 use std::pin::Pin;
+use std::time::{Duration, Instant};
+use zeroize::Zeroizing;
+
+/// Boxed future type shared by every [`Provider`] implementation, so no
+/// impl repeats the `Pin<Box<dyn Future ...>>` shape by hand. The future
+/// must be `Send` and borrow only from the `&self` call.
+pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// Per-call context passed to [`Provider::chat`]. Audit state travels
+/// with the call, not in the provider: providers (including fallback
+/// chains) are stateless across turns and can be built once and reused.
+///
+/// - `turn_id`: the turn this call belongs to; audit records use it.
+/// - `audit`: where the fallback chain writes `provider_attempt` /
+///   `provider_failure` records, when attached. Leaf providers do not
+///   audit; the chain owns attempt records.
+/// - `deadline`: an outer wall-clock bound the caller may set. The
+///   fallback chain honors the earlier of this deadline and its own
+///   per-call `max_elapsed` budget. `None` means "no outer bound".
+///
+/// Cancellation (Ctrl-C) is NOT plumbed through providers yet: there is
+/// no cancel token in this struct on purpose, rather than a fake one.
+/// In-flight requests are bounded by the per-request timeout baked into
+/// each provider's guarded HTTP client.
+///
+/// No `Debug`: `AuditLog` deliberately has none (its path could leak
+/// into debug output), and a context carrying it must not either.
+#[derive(Clone, Copy)]
+pub struct CallContext<'a> {
+    pub turn_id: &'a str,
+    pub audit: Option<&'a AuditLog>,
+    pub deadline: Option<Instant>,
+}
+
+impl<'a> CallContext<'a> {
+    /// Context for one call: a turn id and an optional audit log. No
+    /// outer deadline.
+    pub fn new(turn_id: &'a str, audit: Option<&'a AuditLog>) -> Self {
+        Self {
+            turn_id,
+            audit,
+            deadline: None,
+        }
+    }
+
+    /// Context with an outer deadline. The fallback chain stops starting
+    /// new attempts once it passes.
+    pub fn with_deadline(turn_id: &'a str, audit: Option<&'a AuditLog>, deadline: Instant) -> Self {
+        Self {
+            turn_id,
+            audit,
+            deadline: Some(deadline),
+        }
+    }
+}
 
 /// A chat message (request and response shape), in OpenAI-style form.
 /// This is the common in-memory shape: protocol adapters (Claude, ...)
@@ -87,7 +144,18 @@ pub struct FunctionCall {
 ///
 /// The `chat` method returns a boxed future (instead of `async fn`) so
 /// the trait stays object-safe without an extra dependency: fallback
-/// chains hold `Box<dyn Provider>` over mixed backend types.
+/// chains hold `Box<dyn Provider>` over mixed backend types. This is the
+/// long-term shape: `async-trait` would generate exactly this form, and
+/// `async fn` in traits is not dyn-compatible on stable Rust.
+///
+/// Streaming contract (sketch, not implemented): streaming needs a
+/// separate method (for example `chat_stream` returning delta chunks)
+/// with a default impl that buffers into one full response. Retry and
+/// fallback are only valid BEFORE the first byte is emitted: once a
+/// delta has gone out, switching providers mid-stream would repeat or
+/// skew content. Per-chunk guards, per-chunk timeouts, cancellation,
+/// and reassembly of streamed tool-call JSON must be designed with that
+/// method; the shape must be settled before a fourth provider is added.
 pub trait Provider: Send + Sync {
     /// Backend name from configuration (used in audit records and errors).
     fn name(&self) -> &str;
@@ -103,22 +171,107 @@ pub trait Provider: Send + Sync {
     /// classified free/local. This drives the P0-11 cost-cap lock.
     fn is_paid(&self) -> bool;
 
-    /// One chat call with tool-calling enabled when tools exist.
+    /// One chat call with tool-calling enabled when tools exist. The
+    /// call context carries the turn id and audit log for this call;
+    /// providers must not retain it past the returned future.
     fn chat<'a>(
         &'a self,
+        ctx: &'a CallContext<'a>,
         messages: &'a [ChatMessage],
         tools: &'a [serde_json::Value],
-    ) -> Pin<Box<dyn Future<Output = Result<ChatMessage, MimintError>> + Send + 'a>>;
+    ) -> BoxFuture<'a, Result<ChatMessage, MimintError>>;
+}
+
+/// Tool-call arguments as a JSON object, never failing the caller.
+///
+/// Tool arguments arrive as a JSON-encoded string in the OpenAI-shaped
+/// history. That string may be invalid JSON (small local models do this
+/// regularly) or valid JSON that is not an object. Adapters that need an
+/// object (Claude's `tool_use.input`) must use this helper instead of
+/// parsing inline: invalid or non-object arguments are wrapped in
+/// `{"_mimint_invalid_args": ...}` so the request still goes out, the
+/// tool then fails argument validation, and the model sees a tool error
+/// it can correct — instead of one bad call poisoning every later call.
+/// Valid objects pass through unchanged.
+pub(crate) fn tool_args_as_object(arguments: &str) -> Value {
+    match serde_json::from_str::<Value>(arguments) {
+        Ok(Value::Object(map)) => Value::Object(map),
+        Ok(other) => serde_json::json!({"_mimint_invalid_args": other}),
+        Err(_) => serde_json::json!({"_mimint_invalid_args": arguments}),
+    }
+}
+
+/// Normalize one tool call's argument string at response intake, so the
+/// history never carries a value that breaks a later provider.
+///
+/// Valid JSON objects are returned byte-identical. Anything else is
+/// rewritten to the wrapped-object form (see [`tool_args_as_object`]).
+/// Providers call this on every tool call they parse out of a response,
+/// before the message enters the history.
+pub(crate) fn normalize_tool_call_args(arguments: &str) -> String {
+    match serde_json::from_str::<Value>(arguments) {
+        Ok(Value::Object(_)) => arguments.to_string(),
+        _ => serde_json::to_string(&tool_args_as_object(arguments))
+            .unwrap_or_else(|_| "{\"_mimint_invalid_args\":null}".to_string()),
+    }
+}
+
+/// Refuse to send an API key over plaintext HTTP to a loopback endpoint
+/// unless the backend explicitly opted in.
+///
+/// Any local process can bind an unused loopback port, so a key sent to
+/// `http://127.0.0.1:<port>` may reach an impostor service (confused
+/// deputy) instead of the intended local server. The opt-in lives on the
+/// backend (`allow_plaintext_auth`), never ambient: without it, a
+/// loopback backend with a key fails at construction with a clear error.
+pub(crate) fn check_plaintext_auth(
+    backend_name: &str,
+    base_url: &str,
+    scheme: &str,
+    loopback: bool,
+    key_present: bool,
+    allow_plaintext_auth: bool,
+) -> Result<(), MimintError> {
+    if scheme == "http" && loopback && key_present && !allow_plaintext_auth {
+        return Err(MimintError::Config(format!(
+            "refusing to send an API key over plaintext http to loopback backend '{backend_name}' ({base_url}): \
+             another local process could be listening on that port. Remove the key from this backend, \
+             or set allow_plaintext_auth = true on the backend to opt in explicitly"
+        )));
+    }
+    Ok(())
+}
+
+/// Parse a `Retry-After` header value (delay-seconds form only) into a
+/// wait duration. The HTTP-date form, negative values, and garbage are
+/// ignored (`None`): the caller falls back to exponential backoff.
+pub(crate) fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    let value = headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?;
+    let seconds: u64 = value.trim().parse().ok()?;
+    Some(Duration::from_secs(seconds))
 }
 
 /// Build the error for a non-success HTTP status. HTTP 429 and 5xx are
 /// transient (the fallback chain may retry them); anything else is a
-/// permanent provider error.
-pub(crate) fn http_status_error(status: reqwest::StatusCode, snippet: &str) -> MimintError {
+/// permanent provider error. HTTP 529 (Anthropic overloaded) is transient
+/// via the 5xx rule.
+/// Build a provider error from an HTTP status. Transient statuses (429,
+/// 5xx) produce a retryable error that also carries the provider's
+/// `Retry-After` wait when one was supplied, so the fallback chain
+/// honors it instead of guessing a backoff. Everything else is
+/// permanent: retrying cannot fix it.
+pub(crate) fn http_status_error_with_retry_after(
+    status: reqwest::StatusCode,
+    snippet: &str,
+    retry_after: Option<Duration>,
+) -> MimintError {
     let message = extract_error_message(snippet);
     let text = format!("provider returned HTTP {status}: {message}");
     if status.as_u16() == 429 || status.is_server_error() {
-        MimintError::ProviderTransient(text)
+        match retry_after {
+            Some(delay) => MimintError::ProviderTransientDelayed(text, delay),
+            None => MimintError::ProviderTransient(text),
+        }
     } else {
         MimintError::Provider(text)
     }
@@ -155,11 +308,16 @@ struct Choice {
 }
 
 /// Client for one OpenAI-compatible chat-completions endpoint.
+///
+/// The key is held in a [`Zeroizing`] wrapper so the stored copy is
+/// wiped when the client drops. Transient copies (the formatted
+/// `Authorization` header value, reqwest's internal buffers) are not
+/// wiped; that limit is stated, not hidden.
 pub struct ProviderClient {
     name: String,
     endpoint_url: String,
     model: String,
-    api_key: Option<String>,
+    api_key: Option<Zeroizing<String>>,
     http: GuardedHttpClient,
     paid: bool,
 }
@@ -171,21 +329,27 @@ impl ProviderClient {
     /// chat-completions path is appended exactly once either way.
     /// The endpoint is validated against the guarded client's egress
     /// policy at construction, and again on every request.
+    /// Plaintext loopback auth is NOT allowed: use [`Self::new_named`]
+    /// with an explicit opt-in for a keyed loopback backend.
     pub fn new(
         base_url: &str,
         model: &str,
-        api_key: Option<String>,
+        api_key: Option<Zeroizing<String>>,
         http: GuardedHttpClient,
     ) -> Result<Self, MimintError> {
-        Self::new_named("openai-compatible", base_url, model, api_key, http)
+        Self::new_named("openai-compatible", base_url, model, api_key, false, http)
     }
 
-    /// Build a client with an explicit backend name (from configuration).
+    /// Build a client with an explicit backend name (from configuration)
+    /// and an explicit plaintext-auth opt-in. `allow_plaintext_auth`
+    /// must be true to send a key over plaintext http to a loopback
+    /// endpoint; see [`check_plaintext_auth`].
     pub fn new_named(
         name: &str,
         base_url: &str,
         model: &str,
-        api_key: Option<String>,
+        api_key: Option<Zeroizing<String>>,
+        allow_plaintext_auth: bool,
         http: GuardedHttpClient,
     ) -> Result<Self, MimintError> {
         let base_url = base_url.trim().trim_end_matches('/');
@@ -217,6 +381,19 @@ impl ProviderClient {
             return Err(MimintError::Config(
                 "missing API key for remote endpoint: set MIMINT_API_KEY or configure key_env/key_file".to_string(),
             ));
+        }
+        check_plaintext_auth(
+            name,
+            base_url,
+            &scheme,
+            loopback,
+            key.is_some(),
+            allow_plaintext_auth,
+        )?;
+        if scheme == "http" && loopback && key.is_some() {
+            eprintln!(
+                "WARNING: sending an API key over plaintext http to loopback backend '{name}' (explicit allow_plaintext_auth opt-in)"
+            );
         }
         // Never log the key value; only whether one is present.
         eprintln!(
@@ -258,27 +435,46 @@ impl ProviderClient {
         }
         let mut headers: Vec<(String, String)> = Vec::new();
         if let Some(key) = &self.api_key {
-            headers.push(("Authorization".to_string(), format!("Bearer {key}")));
+            headers.push((
+                "Authorization".to_string(),
+                format!("Bearer {}", key.as_str()),
+            ));
         }
         let response = self
             .http
             .post_json(&self.endpoint_url, &body, &headers)
             .await?;
         let status = response.status();
+        // Read Retry-After before consuming the body: the body read
+        // below takes the response by value.
+        let retry_after = parse_retry_after(response.headers());
         if !status.is_success() {
             let text = response.text().await.unwrap_or_default();
-            return Err(http_status_error(status, &text));
+            return Err(http_status_error_with_retry_after(
+                status,
+                &text,
+                retry_after,
+            ));
         }
         let parsed: ChatCompletionResponse = response
             .json()
             .await
             .map_err(|e| MimintError::Provider(format!("cannot parse provider response: {e}")))?;
-        parsed
+        let mut message = parsed
             .choices
             .into_iter()
             .next()
             .map(|choice| choice.message)
-            .ok_or_else(|| MimintError::Provider("provider returned no choices".to_string()))
+            .ok_or_else(|| MimintError::Provider("provider returned no choices".to_string()))?;
+        // Normalize tool-call arguments at intake so the history never
+        // carries a value that breaks a later provider (see
+        // `normalize_tool_call_args`).
+        if let Some(calls) = &mut message.tool_calls {
+            for call in calls.iter_mut() {
+                call.function.arguments = normalize_tool_call_args(&call.function.arguments);
+            }
+        }
+        Ok(message)
     }
 }
 
@@ -301,9 +497,12 @@ impl Provider for ProviderClient {
 
     fn chat<'a>(
         &'a self,
+        _ctx: &'a CallContext<'a>,
         messages: &'a [ChatMessage],
         tools: &'a [serde_json::Value],
-    ) -> Pin<Box<dyn Future<Output = Result<ChatMessage, MimintError>> + Send + 'a>> {
+    ) -> BoxFuture<'a, Result<ChatMessage, MimintError>> {
+        // Leaf providers do not audit; the fallback chain owns attempt
+        // records, so the call context is intentionally unused here.
         Box::pin(async move { self.chat_inner(messages, tools).await })
     }
 }
@@ -325,7 +524,27 @@ mod tests {
     }
 
     fn new_client(base_url: &str, key: Option<&str>) -> Result<ProviderClient, MimintError> {
-        ProviderClient::new(base_url, "test-model", key.map(str::to_string), http_off())
+        ProviderClient::new(
+            base_url,
+            "test-model",
+            key.map(|k| Zeroizing::new(k.to_string())),
+            http_off(),
+        )
+    }
+
+    fn new_named_client(
+        base_url: &str,
+        key: Option<&str>,
+        allow_plaintext_auth: bool,
+    ) -> Result<ProviderClient, MimintError> {
+        ProviderClient::new_named(
+            "test",
+            base_url,
+            "test-model",
+            key.map(|k| Zeroizing::new(k.to_string())),
+            allow_plaintext_auth,
+            http_off(),
+        )
     }
 
     /// `expect_err` without a `Debug` bound on the success type: provider
@@ -397,17 +616,28 @@ mod tests {
     fn unsupported_scheme_and_empty_model_are_rejected() {
         assert!(new_client("ftp://example.com", Some("k")).is_err());
         assert!(new_client("example.com", Some("k")).is_err());
+        assert!(ProviderClient::new(
+            "https://example.com",
+            "",
+            Some(Zeroizing::new("k".to_string())),
+            http_off()
+        )
+        .is_err());
         assert!(
-            ProviderClient::new("https://example.com", "", Some("k".to_string()), http_off())
+            ProviderClient::new("", "m", Some(Zeroizing::new("k".to_string())), http_off())
                 .is_err()
         );
-        assert!(ProviderClient::new("", "m", Some("k".to_string()), http_off()).is_err());
     }
 
     #[test]
     fn privacy_on_rejects_remote_at_construction() {
         let err = expect_error(
-            ProviderClient::new("https://example.com", "m", Some("k".to_string()), http_on()),
+            ProviderClient::new(
+                "https://example.com",
+                "m",
+                Some(Zeroizing::new("k".to_string())),
+                http_on(),
+            ),
             "remote under Privacy Mode must fail at construction",
         );
         assert!(err.to_string().contains("Privacy Mode"), "{err}");
@@ -418,14 +648,104 @@ mod tests {
 
     #[test]
     fn error_classification_429_and_5xx_are_transient() {
-        let transient = http_status_error(reqwest::StatusCode::TOO_MANY_REQUESTS, "slow down");
+        let transient = http_status_error_with_retry_after(
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            "slow down",
+            None,
+        );
         assert!(transient.is_transient());
-        let transient = http_status_error(reqwest::StatusCode::INTERNAL_SERVER_ERROR, "boom");
+        let transient = http_status_error_with_retry_after(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            "boom",
+            None,
+        );
         assert!(transient.is_transient());
-        let permanent = http_status_error(reqwest::StatusCode::UNAUTHORIZED, "bad key");
+        // 529 (Anthropic overloaded) is transient via the 5xx rule.
+        let overloaded = reqwest::StatusCode::from_u16(529).unwrap();
+        let transient = http_status_error_with_retry_after(overloaded, "overloaded", None);
+        assert!(transient.is_transient());
+        assert!(transient.retry_after().is_none());
+        let permanent =
+            http_status_error_with_retry_after(reqwest::StatusCode::UNAUTHORIZED, "bad key", None);
         assert!(!permanent.is_transient());
-        let permanent = http_status_error(reqwest::StatusCode::NOT_FOUND, "no model");
+        let permanent =
+            http_status_error_with_retry_after(reqwest::StatusCode::NOT_FOUND, "no model", None);
         assert!(!permanent.is_transient());
+    }
+
+    #[test]
+    fn retry_after_is_carried_on_transient_errors_only() {
+        let err = http_status_error_with_retry_after(
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            "slow down",
+            Some(Duration::from_secs(7)),
+        );
+        assert!(err.is_transient());
+        assert_eq!(err.retry_after(), Some(Duration::from_secs(7)));
+        assert!(err.to_string().contains("7s"), "{err}");
+        // A Retry-After on a permanent error does not make it transient.
+        let err = http_status_error_with_retry_after(
+            reqwest::StatusCode::FORBIDDEN,
+            "nope",
+            Some(Duration::from_secs(7)),
+        );
+        assert!(!err.is_transient());
+        assert!(err.retry_after().is_none());
+    }
+
+    #[test]
+    fn retry_after_header_parsing_accepts_delay_seconds_only() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        assert_eq!(parse_retry_after(&headers), None);
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            reqwest::header::HeaderValue::from_static("2"),
+        );
+        assert_eq!(parse_retry_after(&headers), Some(Duration::from_secs(2)));
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            reqwest::header::HeaderValue::from_static("Wed, 21 Oct 2015 07:28:00 GMT"),
+        );
+        assert_eq!(parse_retry_after(&headers), None);
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            reqwest::header::HeaderValue::from_static("garbage"),
+        );
+        assert_eq!(parse_retry_after(&headers), None);
+    }
+
+    #[test]
+    fn tool_args_normalization_keeps_objects_and_wraps_the_rest() {
+        assert_eq!(
+            normalize_tool_call_args(r#"{"title":"Hi"}"#),
+            r#"{"title":"Hi"}"#
+        );
+        let wrapped = normalize_tool_call_args("not json {");
+        let parsed: Value = serde_json::from_str(&wrapped).unwrap();
+        assert_eq!(parsed["_mimint_invalid_args"], "not json {");
+        let wrapped = normalize_tool_call_args("[1, 2]");
+        let parsed: Value = serde_json::from_str(&wrapped).unwrap();
+        assert_eq!(parsed["_mimint_invalid_args"], serde_json::json!([1, 2]));
+        let wrapped = normalize_tool_call_args("");
+        let parsed: Value = serde_json::from_str(&wrapped).unwrap();
+        assert_eq!(parsed["_mimint_invalid_args"], "");
+        let object = tool_args_as_object(r#"{"a":1}"#);
+        assert_eq!(object, serde_json::json!({"a": 1}));
+    }
+
+    #[test]
+    fn plaintext_loopback_auth_requires_explicit_opt_in() {
+        let err = expect_error(
+            new_named_client("http://127.0.0.1:11434", Some("k"), false),
+            "key over plaintext loopback without opt-in must fail",
+        );
+        assert!(err.to_string().contains("allow_plaintext_auth"), "{err}");
+        assert!(err.to_string().contains("plaintext"), "{err}");
+        // Explicit opt-in builds; no key needs no opt-in.
+        assert!(new_named_client("http://127.0.0.1:11434", Some("k"), true).is_ok());
+        assert!(new_named_client("http://127.0.0.1:11434", None, false).is_ok());
+        // Remote https with a key needs no plaintext opt-in.
+        assert!(new_named_client("https://example.com", Some("k"), false).is_ok());
     }
 
     #[test]

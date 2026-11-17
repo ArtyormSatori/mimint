@@ -34,7 +34,9 @@ pub use fallback::{FallbackChain, RetryPolicy};
 pub use guards::{Approver, GuardedExecutor, Risk};
 pub use notebook::{Note, Notebook};
 pub use onboarding::{probe_local_backends, suggestion_text, LocalProbe};
-pub use provider::{ChatMessage, FunctionCall, Provider, ProviderClient, ToolCall};
+pub use provider::{
+    BoxFuture, CallContext, ChatMessage, FunctionCall, Provider, ProviderClient, ToolCall,
+};
 pub use registry::{
     build_chain, build_provider, default_vault, BackendKind, BackendSpec, CostCap, DEFAULT_KEY_ENV,
     DEFAULT_TIMEOUT_SECS, LM_STUDIO_BASE_URL, OLLAMA_BASE_URL,

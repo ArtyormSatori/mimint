@@ -15,14 +15,15 @@
 //! documented constant [`DEFAULT_MAX_TOKENS`], overridable per backend.
 //! The model name has no default, like every other backend.
 
-use crate::egress::{url_is_loopback, GuardedHttpClient};
+use crate::egress::{split_endpoint, url_is_loopback, GuardedHttpClient};
 use crate::error::MimintError;
 use crate::provider::{
-    extract_error_message, http_status_error, ChatMessage, FunctionCall, Provider, ToolCall,
+    check_plaintext_auth, extract_error_message, http_status_error_with_retry_after,
+    normalize_tool_call_args, parse_retry_after, tool_args_as_object, BoxFuture, CallContext,
+    ChatMessage, FunctionCall, Provider, ToolCall,
 };
 use serde_json::{json, Value};
-use std::future::Future;
-use std::pin::Pin;
+use zeroize::Zeroizing;
 
 /// Default Anthropic API root (no path suffix; `/v1/messages` is appended).
 pub const ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com";
@@ -31,15 +32,20 @@ pub const ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com";
 pub const ANTHROPIC_VERSION: &str = "2023-06-01";
 
 /// Default `max_tokens` when the backend does not set one. The Anthropic
-/// API requires this field; 1024 keeps one turn cheap and short.
-pub const DEFAULT_MAX_TOKENS: u32 = 1024;
+/// API requires this field; 4096 is the safe standard for tool use, where
+/// 1024 cut responses off mid-`tool_use` too easily. Overridable per
+/// backend via `max_tokens` in the config file.
+pub const DEFAULT_MAX_TOKENS: u32 = 4096;
 
 /// Client for one Anthropic Messages API endpoint.
+///
+/// The key is held in a [`Zeroizing`] wrapper so the stored copy is
+/// wiped when the client drops (see the same note on `ProviderClient`).
 pub struct ClaudeClient {
     name: String,
     endpoint_url: String,
     model: String,
-    api_key: Option<String>,
+    api_key: Option<Zeroizing<String>>,
     max_tokens: u32,
     http: GuardedHttpClient,
     paid: bool,
@@ -52,12 +58,15 @@ impl ClaudeClient {
     /// or neither; the messages path is appended exactly once. The
     /// endpoint is validated against the guarded client's egress policy
     /// at construction, and again on every request.
+    /// `allow_plaintext_auth` must be true to send a key over plaintext
+    /// http to a loopback endpoint; see [`check_plaintext_auth`].
     pub fn new(
         name: &str,
         base_url: &str,
         model: &str,
-        api_key: Option<String>,
+        api_key: Option<Zeroizing<String>>,
         max_tokens: u32,
+        allow_plaintext_auth: bool,
         http: GuardedHttpClient,
     ) -> Result<Self, MimintError> {
         let base_url = base_url.trim().trim_end_matches('/');
@@ -85,11 +94,25 @@ impl ClaudeClient {
         };
         http.validate(&endpoint_url)?;
         let loopback = url_is_loopback(&endpoint_url)?;
+        let (scheme, _) = split_endpoint(&endpoint_url)?;
         let key = api_key.filter(|key| !key.trim().is_empty());
         if key.is_none() && !loopback {
             return Err(MimintError::Config(
                 "missing API key for Claude backend: set ANTHROPIC_API_KEY/MIMINT_API_KEY or configure key_env/key_file".to_string(),
             ));
+        }
+        check_plaintext_auth(
+            name,
+            base_url,
+            &scheme,
+            loopback,
+            key.is_some(),
+            allow_plaintext_auth,
+        )?;
+        if scheme == "http" && loopback && key.is_some() {
+            eprintln!(
+                "WARNING: sending an API key over plaintext http to loopback backend '{name}' (explicit allow_plaintext_auth opt-in)"
+            );
         }
         // Never log the key value; only whether one is present.
         eprintln!(
@@ -118,16 +141,23 @@ impl ClaudeClient {
             ANTHROPIC_VERSION.to_string(),
         )];
         if let Some(key) = &self.api_key {
-            headers.push(("x-api-key".to_string(), key.clone()));
+            headers.push(("x-api-key".to_string(), key.as_str().to_string()));
         }
         let response = self
             .http
             .post_json(&self.endpoint_url, &body, &headers)
             .await?;
         let status = response.status();
+        // Read Retry-After before consuming the body: the body read
+        // below takes the response by value.
+        let retry_after = parse_retry_after(response.headers());
         if !status.is_success() {
             let text = response.text().await.unwrap_or_default();
-            return Err(http_status_error(status, &text));
+            return Err(http_status_error_with_retry_after(
+                status,
+                &text,
+                retry_after,
+            ));
         }
         let parsed: Value = response
             .json()
@@ -156,9 +186,12 @@ impl Provider for ClaudeClient {
 
     fn chat<'a>(
         &'a self,
+        _ctx: &'a CallContext<'a>,
         messages: &'a [ChatMessage],
         tools: &'a [Value],
-    ) -> Pin<Box<dyn Future<Output = Result<ChatMessage, MimintError>> + Send + 'a>> {
+    ) -> BoxFuture<'a, Result<ChatMessage, MimintError>> {
+        // Leaf providers do not audit; the fallback chain owns attempt
+        // records, so the call context is intentionally unused here.
         Box::pin(async move { self.chat_inner(messages, tools).await })
     }
 }
@@ -227,13 +260,12 @@ fn to_anthropic_request(
                         }
                     }
                     for call in calls {
-                        let input: Value =
-                            serde_json::from_str(&call.function.arguments).map_err(|err| {
-                                MimintError::Provider(format!(
-                                    "tool arguments for '{}' are not valid JSON: {err}",
-                                    call.function.name
-                                ))
-                            })?;
+                        // Never fail the whole request on one bad
+                        // argument string: invalid or non-object
+                        // arguments are wrapped (see
+                        // `tool_args_as_object`), so a bad call from a
+                        // previous provider cannot poison this one.
+                        let input = tool_args_as_object(&call.function.arguments);
                         blocks.push(json!({
                             "type": "tool_use",
                             "id": call.id,
@@ -301,12 +333,26 @@ fn convert_tool(tool: &Value) -> Result<Value, MimintError> {
 }
 
 /// Translate an Anthropic response body into one [`ChatMessage`].
+///
+/// A `stop_reason` of `max_tokens` is a truncation, not a success: the
+/// response may end mid-`tool_use` with cut-off JSON, so it is reported
+/// as a provider error (permanent: retrying with the same `max_tokens`
+/// would truncate again) telling the user to raise `max_tokens`. Other
+/// stop reasons (`end_turn`, `tool_use`, `stop_sequence`, ...) and a
+/// missing `stop_reason` (stubs) are accepted as normal responses.
 fn from_anthropic_response(body: &Value) -> Result<ChatMessage, MimintError> {
     if body.get("type").and_then(Value::as_str) == Some("error") {
         let detail = extract_error_message(&body.to_string());
         return Err(MimintError::Provider(format!(
             "Claude backend returned an error response: {detail}"
         )));
+    }
+    if body.get("stop_reason").and_then(Value::as_str) == Some("max_tokens") {
+        return Err(MimintError::Provider(
+            "Claude response was truncated (stop_reason=max_tokens): the reply may end mid-tool-call. \
+             Raise max_tokens for this backend (default 4096) and retry"
+                .to_string(),
+        ));
     }
     let content = body
         .get("content")
@@ -339,9 +385,13 @@ fn from_anthropic_response(body: &Value) -> Result<ChatMessage, MimintError> {
                     })?
                     .to_string();
                 let input = block.get("input").cloned().unwrap_or(Value::Null);
-                let arguments = serde_json::to_string(&input).map_err(|err| {
+                let encoded = serde_json::to_string(&input).map_err(|err| {
                     MimintError::Provider(format!("cannot encode tool input: {err}"))
                 })?;
+                // Normalize at intake, like the OpenAI-compatible
+                // provider: the history must never carry arguments that
+                // break a later translation.
+                let arguments = normalize_tool_call_args(&encoded);
                 tool_calls.push(ToolCall {
                     id,
                     kind: "function".to_string(),
@@ -381,6 +431,10 @@ mod tests {
             .expect("build guarded client")
     }
 
+    fn key(text: &str) -> Option<Zeroizing<String>> {
+        Some(Zeroizing::new(text.to_string()))
+    }
+
     #[test]
     fn endpoint_path_is_appended_exactly_once() {
         let cases = [
@@ -399,7 +453,9 @@ mod tests {
             ("http://127.0.0.1:9/", "http://127.0.0.1:9/v1/messages"),
         ];
         for (base, expected) in cases {
-            let client = ClaudeClient::new("c", base, "m", Some("k".into()), 10, http_off())
+            // Plaintext opt-in is on so the loopback case with a key
+            // builds; this test is about path appending, not the gate.
+            let client = ClaudeClient::new("c", base, "m", key("k"), 10, true, http_off())
                 .unwrap_or_else(|err| panic!("{base}: {err}"));
             assert_eq!(client.endpoint_url(), expected);
         }
@@ -407,18 +463,26 @@ mod tests {
 
     #[test]
     fn remote_requires_key_loopback_does_not() {
-        assert!(
-            ClaudeClient::new("c", "https://api.anthropic.com", "m", None, 10, http_off()).is_err()
-        );
-        let client = ClaudeClient::new("c", "http://127.0.0.1:9", "m", None, 10, http_off())
+        assert!(ClaudeClient::new(
+            "c",
+            "https://api.anthropic.com",
+            "m",
+            None,
+            10,
+            false,
+            http_off()
+        )
+        .is_err());
+        let client = ClaudeClient::new("c", "http://127.0.0.1:9", "m", None, 10, false, http_off())
             .expect("loopback without key");
         assert!(!client.is_paid());
         assert!(ClaudeClient::new(
             "c",
             "https://api.anthropic.com",
             "",
-            Some("k".into()),
+            key("k"),
             10,
+            false,
             http_off()
         )
         .is_err());
@@ -426,11 +490,37 @@ mod tests {
             "c",
             "https://api.anthropic.com",
             "m",
-            Some("k".into()),
+            key("k"),
             0,
+            false,
             http_off()
         )
         .is_err());
+    }
+
+    #[test]
+    fn plaintext_loopback_key_requires_opt_in() {
+        assert!(ClaudeClient::new(
+            "c",
+            "http://127.0.0.1:9",
+            "m",
+            key("k"),
+            10,
+            false,
+            http_off()
+        )
+        .is_err());
+        assert!(ClaudeClient::new(
+            "c",
+            "http://127.0.0.1:9",
+            "m",
+            key("k"),
+            10,
+            true,
+            http_off()
+        )
+        .is_ok());
+        assert_eq!(DEFAULT_MAX_TOKENS, 4096);
     }
 
     #[test]
@@ -525,5 +615,94 @@ mod tests {
         assert!(err.to_string().contains("bad key"), "{err}");
         let no_content = json!({"type": "message"});
         assert!(from_anthropic_response(&no_content).is_err());
+    }
+
+    #[test]
+    fn contract_fixtures_stop_reason_and_error_shapes() {
+        // Fixtures shaped after the Anthropic Messages API documentation:
+        // a truncated response, a refusal, and an error body. The
+        // truncation fixture ends mid-tool_use: it must fail loudly,
+        // never surface as a partial success.
+        let truncated = json!({
+            "id": "msg_trunc",
+            "type": "message",
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "Saving"},
+                {"type": "tool_use", "id": "toolu_cut", "name": "notebook_add", "input": {"title": "Cu"}},
+            ],
+            "stop_reason": "max_tokens",
+            "usage": {"input_tokens": 10, "output_tokens": 4096},
+        });
+        let err = from_anthropic_response(&truncated).expect_err("max_tokens must fail");
+        assert!(err.to_string().contains("max_tokens"), "{err}");
+        assert!(!err.is_transient(), "truncation is permanent, not retried");
+
+        let end_turn = json!({
+            "id": "msg_ok",
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "text", "text": "Done."}],
+            "stop_reason": "end_turn",
+        });
+        assert!(from_anthropic_response(&end_turn).is_ok());
+
+        let no_stop_reason = json!({
+            "id": "msg_stub",
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "text", "text": "Stub text."}],
+        });
+        assert!(from_anthropic_response(&no_stop_reason).is_ok());
+
+        // Error body with the documented shape: type=error, typed error
+        // object with a message.
+        let rate_limit = json!({
+            "type": "error",
+            "error": {"type": "rate_limit_error", "message": "Rate limited. Please try again."},
+        });
+        let err = from_anthropic_response(&rate_limit).expect_err("error body");
+        assert!(err.to_string().contains("Rate limited"), "{err}");
+    }
+
+    #[test]
+    fn request_translation_wraps_invalid_tool_args_instead_of_failing() {
+        // History from a previous provider (e.g. a small local model)
+        // carrying broken tool-call arguments must not kill the Claude
+        // call: the arguments are wrapped, the request goes out, and
+        // the tool fails validation so the model can self-correct.
+        let messages = vec![
+            ChatMessage::user("Save a note."),
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: None,
+                tool_calls: Some(vec![
+                    ToolCall {
+                        id: "call_broken".to_string(),
+                        kind: "function".to_string(),
+                        function: FunctionCall {
+                            name: "notebook_add".to_string(),
+                            arguments: "{broken json".to_string(),
+                        },
+                    },
+                    ToolCall {
+                        id: "call_array".to_string(),
+                        kind: "function".to_string(),
+                        function: FunctionCall {
+                            name: "notebook_search".to_string(),
+                            arguments: "[1, 2]".to_string(),
+                        },
+                    },
+                ]),
+                tool_call_id: None,
+            },
+        ];
+        let body = to_anthropic_request("claude-test", 42, &messages, &[]).expect("translate");
+        let converted = body["messages"].as_array().unwrap();
+        let blocks = converted[1]["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0]["type"], "tool_use");
+        assert_eq!(blocks[0]["input"]["_mimint_invalid_args"], "{broken json");
+        assert_eq!(blocks[1]["input"]["_mimint_invalid_args"], json!([1, 2]));
     }
 }

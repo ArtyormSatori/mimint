@@ -10,7 +10,7 @@ use crate::audit::AuditLog;
 use crate::error::MimintError;
 use crate::guards::{Approver, GuardedExecutor};
 use crate::notebook::Notebook;
-use crate::provider::{ChatMessage, Provider};
+use crate::provider::{CallContext, ChatMessage, Provider};
 use crate::tools::Registry;
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -112,10 +112,19 @@ impl<'a> Brain<'a> {
                 .log(&self.turn_id, "reflection", None, None, reflection.clone())?;
             messages.push(ChatMessage::system(format!("Reflection: {reflection}")));
 
-            let reply = self.provider.chat(&messages, &tool_schemas).await?;
+            let ctx = CallContext::new(&self.turn_id, Some(self.audit));
+            let reply = self.provider.chat(&ctx, &messages, &tool_schemas).await?;
             let calls = reply.tool_calls.clone().unwrap_or_default();
             if calls.is_empty() {
                 let text = reply.content.clone().unwrap_or_default();
+                // An empty reply (no text, no tool calls) is a provider
+                // malfunction, not an answer: failing loudly beats
+                // reporting silent success with nothing to show.
+                if text.trim().is_empty() {
+                    return Err(MimintError::Provider(
+                        "provider returned an empty response (no text, no tool calls)".to_string(),
+                    ));
+                }
                 messages.push(reply);
                 return Ok(TurnOutcome {
                     text,
@@ -254,5 +263,156 @@ impl<'a> Brain<'a> {
             )?;
             Ok(true)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::provider::{BoxFuture, CallContext};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// Provider that always returns the same canned message.
+    struct FixedProvider {
+        message: ChatMessage,
+    }
+
+    impl Provider for FixedProvider {
+        fn name(&self) -> &str {
+            "fixed"
+        }
+
+        fn model(&self) -> &str {
+            "fixed-model"
+        }
+
+        fn endpoint_url(&self) -> &str {
+            "http://127.0.0.1:1/v1/chat/completions"
+        }
+
+        fn is_paid(&self) -> bool {
+            false
+        }
+
+        fn chat<'a>(
+            &'a self,
+            _ctx: &'a CallContext<'a>,
+            _messages: &'a [ChatMessage],
+            _tools: &'a [Value],
+        ) -> BoxFuture<'a, Result<ChatMessage, MimintError>> {
+            let message = self.message.clone();
+            Box::pin(async move { Ok(message) })
+        }
+    }
+
+    fn temp_stem(tag: &str) -> String {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        format!(
+            "{}/mimint-brain-{}-{nanos}-{tag}",
+            std::env::temp_dir().display(),
+            std::process::id()
+        )
+    }
+
+    async fn run_with(
+        message: ChatMessage,
+        audit_path: &str,
+        db_path: &str,
+    ) -> Result<TurnOutcome, MimintError> {
+        let notebook = Arc::new(Notebook::open(db_path)?);
+        let audit = AuditLog::open(audit_path)?;
+        let registry = crate::tools::default_registry(Arc::clone(&notebook));
+        let provider = FixedProvider { message };
+        let brain = Brain::new(
+            &provider,
+            &registry,
+            None,
+            &audit,
+            Arc::clone(&notebook),
+            "turn-brain-test",
+            3,
+        )?;
+        brain.run("hello").await
+    }
+
+    #[tokio::test]
+    async fn empty_response_is_an_error_not_silent_success() {
+        let stem = temp_stem("empty");
+        let db_path = format!("{stem}.db");
+        let audit_path = format!("{stem}.jsonl");
+        let empty = ChatMessage {
+            role: "assistant".to_string(),
+            content: None,
+            tool_calls: None,
+            tool_call_id: None,
+        };
+        let err = run_with(empty, &audit_path, &db_path)
+            .await
+            .expect_err("empty reply must fail");
+        assert!(err.to_string().contains("empty response"), "{err}");
+
+        let blank = ChatMessage {
+            role: "assistant".to_string(),
+            content: Some("   ".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+        };
+        let err = run_with(blank, &audit_path, &db_path)
+            .await
+            .expect_err("whitespace-only reply must fail");
+        assert!(err.to_string().contains("empty response"), "{err}");
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(&audit_path);
+    }
+
+    #[tokio::test]
+    async fn text_response_still_succeeds() {
+        let stem = temp_stem("text");
+        let db_path = format!("{stem}.db");
+        let audit_path = format!("{stem}.jsonl");
+        let outcome = run_with(
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: Some("An answer.".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+            &audit_path,
+            &db_path,
+        )
+        .await
+        .expect("text reply succeeds");
+        assert_eq!(outcome.text, "An answer.");
+        assert!(!outcome.partial);
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(&audit_path);
+    }
+
+    /// Audit write failure fails the turn closed: the brain's first
+    /// reflection record cannot be written, so nothing runs. Linux-only:
+    /// `/dev/full` (writes fail with ENOSPC) does not exist elsewhere.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn audit_write_failure_fails_the_turn_closed() {
+        let stem = temp_stem("auditfail");
+        let db_path = format!("{stem}.db");
+        let err = run_with(
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: Some("An answer.".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+            "/dev/full",
+            &db_path,
+        )
+        .await
+        .expect_err("unwritable audit must fail the turn");
+        assert!(err.to_string().contains("audit"), "{err}");
+        let _ = std::fs::remove_file(&db_path);
     }
 }

@@ -1,32 +1,50 @@
 //! Fallback chain with bounded retry (Phase 2).
 //!
 //! Providers are tried in configuration order. Each provider is retried
-//! with exponential backoff, but only for transient failures (timeout,
-//! connection error, HTTP 429/5xx); permanent failures move to the next
-//! provider immediately. Three independent bounds prevent unbounded
-//! work: a per-provider attempt cap, a chain-wide wall-clock budget,
-//! and the per-provider request timeout baked into each provider's
-//! guarded HTTP client.
+//! with exponential backoff (with full jitter), but only for transient
+//! failures (timeout, connection error, HTTP 429/5xx); permanent
+//! failures move to the next provider immediately. Three independent
+//! bounds prevent unbounded work: a per-provider attempt cap, a
+//! per-`chat()`-call wall-clock budget, and the per-provider request
+//! timeout baked into each provider's guarded HTTP client.
 //!
-//! Every attempt is written to the audit log (when one is attached),
-//! with the provider name, attempt number, latency, and outcome — never
-//! with a key or request body.
+//! Budget scope, stated precisely: `max_elapsed` is measured PER
+//! `chat()` CALL, not per turn. The brain loop makes one `chat()` call
+//! per step, so each step gets a fresh budget; the turn as a whole is
+//! bounded by the brain's step cap, not by this chain. Attempt numbers
+//! in audit records restart at 1 for each provider on each call.
+//! `max_elapsed` is checked BETWEEN attempts; a request already in
+//! flight is bounded only by the per-request timeout, so a call may
+//! overrun the budget by up to one timeout.
+//!
+//! Every attempt is written to the audit log (when one is attached via
+//! the call context), with the provider name, attempt number, latency,
+//! whether the backend is paid/remote, and outcome — never with a key
+//! or request body. The chain itself holds no audit state: the turn id
+//! and audit log arrive with each call, so one chain can serve many
+//! turns safely.
+//!
+//! When a chain escalates from a local backend to a remote (paid)
+//! provider mid-call, the whole conversation history so far is sent to
+//! that remote provider. The first such escalation in a call prints one
+//! warning to stderr and is flagged in the audit record
+//! (`escalated_to_remote`); there is no separate opt-in per escalation
+//! beyond the cost-cap lock and Privacy Mode, which already gate
+//! whether a remote provider can be in the chain at all.
 
-use crate::audit::AuditLog;
 use crate::error::MimintError;
-use crate::provider::{ChatMessage, Provider};
+use crate::provider::{BoxFuture, CallContext, ChatMessage, Provider};
 use serde_json::{json, Value};
-use std::future::Future;
-use std::pin::Pin;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Bounded retry policy for the fallback chain.
 #[derive(Debug, Clone, Copy)]
 pub struct RetryPolicy {
     /// Maximum attempts per provider (at least 1).
     pub max_attempts: usize,
-    /// Maximum wall-clock time for the whole chain, including sleeps.
+    /// Maximum wall-clock time for one `chat()` call, including sleeps.
+    /// Each call gets a fresh budget; the turn total is bounded by the
+    /// brain's step cap, not by this value.
     pub max_elapsed: Duration,
     /// First backoff delay; doubled after each failed attempt.
     pub base_delay: Duration,
@@ -69,12 +87,25 @@ impl RetryPolicy {
 
     /// Backoff delay before retry number `attempt` (1-based: the delay
     /// after the first failure is `base_delay`). Exponential, capped at
-    /// `max_delay`, saturating so it can never overflow.
+    /// `max_delay`, saturating so it can never overflow. Deterministic:
+    /// the chain applies jitter on top via [`Self::jittered_delay`].
     pub fn delay_for(&self, attempt: usize) -> Duration {
         let shift = attempt.saturating_sub(1).min(31) as u32;
         let multiplier = 1u32 << shift;
         let delay = self.base_delay.saturating_mul(multiplier);
         delay.min(self.max_delay)
+    }
+
+    /// Full-jitter delay: a uniform fraction of [`Self::delay_for`] in
+    /// `[0, delay]`, driven by the caller's `random` input. Jitter
+    /// spreads retries from concurrent processes so they do not all
+    /// hammer a recovering provider at the same instant (thundering
+    /// herd). Deterministic in `random` so tests can pin the bounds;
+    /// the chain supplies non-cryptographic entropy from the clock.
+    pub fn jittered_delay(&self, attempt: usize, random: u64) -> Duration {
+        let base = self.delay_for(attempt);
+        let fraction = (random % 1000) as f64 / 1000.0;
+        base.mul_f64(fraction)
     }
 }
 
@@ -91,23 +122,21 @@ impl Default for RetryPolicy {
 
 /// An ordered chain of providers behind the [`Provider`] trait, so the
 /// brain loop sees one provider and the chain handles failover.
+///
+/// The chain holds no per-turn state: audit context arrives with each
+/// `chat()` call, so one chain can be built once and reused for many
+/// turns. Reuse is safe precisely because nothing about a turn is
+/// baked into the chain.
 pub struct FallbackChain {
     name: String,
     providers: Vec<Box<dyn Provider>>,
     retry: RetryPolicy,
-    audit: Option<Arc<AuditLog>>,
-    turn_id: String,
 }
 
 impl FallbackChain {
     /// Build a chain. At least one provider is required, and the retry
     /// policy must validate.
-    pub fn new(
-        providers: Vec<Box<dyn Provider>>,
-        retry: RetryPolicy,
-        audit: Option<Arc<AuditLog>>,
-        turn_id: impl Into<String>,
-    ) -> Result<Self, MimintError> {
+    pub fn new(providers: Vec<Box<dyn Provider>>, retry: RetryPolicy) -> Result<Self, MimintError> {
         if providers.is_empty() {
             return Err(MimintError::Config(
                 "fallback chain needs at least one provider".to_string(),
@@ -119,8 +148,6 @@ impl FallbackChain {
             name: format!("fallback[{}]", names.join(",")),
             providers,
             retry,
-            audit,
-            turn_id: turn_id.into(),
         })
     }
 
@@ -136,12 +163,14 @@ impl FallbackChain {
 
     fn audit_attempt(
         &self,
+        ctx: &CallContext<'_>,
         provider: &dyn Provider,
         attempt: usize,
         latency: Duration,
+        escalated_to_remote: bool,
         result: &Result<ChatMessage, MimintError>,
     ) -> Result<(), MimintError> {
-        let Some(audit) = &self.audit else {
+        let Some(audit) = ctx.audit else {
             return Ok(());
         };
         let (decision, detail) = match result {
@@ -151,8 +180,10 @@ impl FallbackChain {
                     "provider": provider.name(),
                     "model": provider.model(),
                     "endpoint": provider.endpoint_url(),
+                    "paid": provider.is_paid(),
                     "attempt": attempt,
                     "latency_ms": latency.as_millis() as u64,
+                    "escalated_to_remote": escalated_to_remote,
                 }),
             ),
             Err(err) => (
@@ -165,15 +196,17 @@ impl FallbackChain {
                     "provider": provider.name(),
                     "model": provider.model(),
                     "endpoint": provider.endpoint_url(),
+                    "paid": provider.is_paid(),
                     "attempt": attempt,
                     "latency_ms": latency.as_millis() as u64,
+                    "escalated_to_remote": escalated_to_remote,
                     "transient": err.is_transient(),
                     "error": err.to_string(),
                 }),
             ),
         };
         audit.log(
-            &self.turn_id,
+            ctx.turn_id,
             "provider_attempt",
             None,
             Some(decision),
@@ -183,13 +216,22 @@ impl FallbackChain {
 
     async fn chat_inner(
         &self,
+        ctx: &CallContext<'_>,
         messages: &[ChatMessage],
         tools: &[Value],
     ) -> Result<ChatMessage, MimintError> {
-        let deadline = Instant::now() + self.retry.max_elapsed;
+        // Per-call budget: each chat() call gets a fresh max_elapsed.
+        // An outer deadline from the caller can only shorten it.
+        let own_deadline = Instant::now() + self.retry.max_elapsed;
+        let deadline = ctx
+            .deadline
+            .map(|outer| outer.min(own_deadline))
+            .unwrap_or(own_deadline);
         let mut failures: Vec<String> = Vec::new();
         let mut attempted_any = false;
         let mut budget_exhausted = false;
+        let mut saw_local = false;
+        let mut warned_escalation = false;
 
         'providers: for provider in &self.providers {
             for attempt in 1..=self.retry.max_attempts {
@@ -200,12 +242,32 @@ impl FallbackChain {
                     break 'providers;
                 }
                 attempted_any = true;
+                // Local -> remote escalation inside one call: the whole
+                // history so far leaves the machine. Warn once per call.
+                let escalating = provider.is_paid() && saw_local;
+                if escalating && !warned_escalation {
+                    warned_escalation = true;
+                    eprintln!(
+                        "WARNING: fallback chain is escalating from a local backend to remote (paid) provider '{}'; conversation history will be sent to it.",
+                        provider.name()
+                    );
+                }
+                if !provider.is_paid() {
+                    saw_local = true;
+                }
                 let started = Instant::now();
-                let result = provider.chat(messages, tools).await;
+                let result = provider.chat(ctx, messages, tools).await;
                 let latency = started.elapsed();
                 // Audit failures fail closed, like guard decisions: an
                 // attempt that cannot be recorded fails the turn.
-                self.audit_attempt(provider.as_ref(), attempt, latency, &result)?;
+                self.audit_attempt(
+                    ctx,
+                    provider.as_ref(),
+                    attempt,
+                    latency,
+                    escalating,
+                    &result,
+                )?;
                 match result {
                     Ok(message) => return Ok(message),
                     Err(err) => {
@@ -221,16 +283,27 @@ impl FallbackChain {
                             budget_exhausted = true;
                             break 'providers;
                         }
-                        let delay = self.retry.delay_for(attempt).min(remaining);
+                        // Wait the jittered backoff, but never less than
+                        // a Retry-After the provider asked for. When the
+                        // wait itself would eat the remaining budget,
+                        // stop instead of sleeping pointlessly.
+                        let mut delay = self.retry.jittered_delay(attempt, jitter_entropy(attempt));
+                        if let Some(hint) = err.retry_after() {
+                            delay = delay.max(hint);
+                        }
+                        if delay >= remaining {
+                            budget_exhausted = true;
+                            break 'providers;
+                        }
                         tokio::time::sleep(delay).await;
                     }
                 }
             }
         }
 
-        if let Some(audit) = &self.audit {
+        if let Some(audit) = ctx.audit {
             audit.log(
-                &self.turn_id,
+                ctx.turn_id,
                 "provider_failure",
                 None,
                 Some("all_failed"),
@@ -254,6 +327,21 @@ impl FallbackChain {
     }
 }
 
+/// Non-cryptographic entropy for retry jitter: clock nanos mixed with
+/// the attempt number through one xorshift round. Only used to spread
+/// retries; never for security decisions.
+fn jitter_entropy(attempt: usize) -> u64 {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64)
+        .unwrap_or(0);
+    let mut x = nanos ^ (attempt as u64).wrapping_mul(0x9E3779B97F4A7C15) ^ 0xA0761D6478BD642F;
+    x ^= x >> 32;
+    x = x.wrapping_mul(0xE7037ED1A0B428DB);
+    x ^= x >> 32;
+    x
+}
+
 impl Provider for FallbackChain {
     fn name(&self) -> &str {
         &self.name
@@ -275,10 +363,11 @@ impl Provider for FallbackChain {
 
     fn chat<'a>(
         &'a self,
+        ctx: &'a CallContext<'a>,
         messages: &'a [ChatMessage],
         tools: &'a [Value],
-    ) -> Pin<Box<dyn Future<Output = Result<ChatMessage, MimintError>> + Send + 'a>> {
-        Box::pin(async move { self.chat_inner(messages, tools).await })
+    ) -> BoxFuture<'a, Result<ChatMessage, MimintError>> {
+        Box::pin(async move { self.chat_inner(ctx, messages, tools).await })
     }
 }
 
@@ -301,6 +390,28 @@ mod tests {
     }
 
     #[test]
+    fn jittered_delay_stays_within_the_base_schedule() {
+        let policy = RetryPolicy {
+            max_attempts: 5,
+            max_elapsed: Duration::from_secs(60),
+            base_delay: Duration::from_millis(200),
+            max_delay: Duration::from_millis(500),
+        };
+        for attempt in [1usize, 2, 3, 10] {
+            let base = policy.delay_for(attempt);
+            for random in [0u64, 1, 499, 500, 999, 1000, u64::MAX] {
+                let jittered = policy.jittered_delay(attempt, random);
+                assert!(
+                    jittered <= base,
+                    "jitter must not exceed base: {jittered:?} > {base:?}"
+                );
+            }
+            assert_eq!(policy.jittered_delay(attempt, 0), Duration::ZERO);
+            assert_eq!(policy.jittered_delay(attempt, 999), base.mul_f64(0.999));
+        }
+    }
+
+    #[test]
     fn policy_validation_rejects_zero_attempts_budget_and_inverted_delays() {
         let mut policy = RetryPolicy::default();
         assert!(policy.validate().is_ok());
@@ -316,7 +427,7 @@ mod tests {
 
     #[test]
     fn empty_chain_is_rejected() {
-        let err = match FallbackChain::new(vec![], RetryPolicy::default(), None, "t") {
+        let err = match FallbackChain::new(vec![], RetryPolicy::default()) {
             Ok(_) => panic!("empty chain must fail"),
             Err(err) => err,
         };

@@ -156,6 +156,23 @@ mod tests {
     }
 
     #[test]
+    fn suggestion_distinguishes_server_up_but_no_models() {
+        // Three tiers, not two: not-detected (None), detected with no
+        // models (Some([])), and detected with models (Some([..])).
+        // The middle tier must say the server answered but no model is
+        // installed, not "not detected".
+        let probe = LocalProbe {
+            ollama_models: Some(vec![]),
+            lm_studio_models: None,
+        };
+        let text = suggestion_text(&probe, "config.toml");
+        assert!(text.contains("Ollama was detected"), "{text}");
+        assert!(text.contains("no models installed"), "{text}");
+        assert!(text.contains("ollama pull"), "{text}");
+        assert!(!text.contains("No local backend was detected"), "{text}");
+    }
+
+    #[test]
     fn suggestion_prefers_ollama_when_both_answer() {
         let probe = LocalProbe {
             ollama_models: Some(vec!["a".to_string()]),

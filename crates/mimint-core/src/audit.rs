@@ -3,6 +3,12 @@
 //! Every record is one JSON object per line. The file is opened in append
 //! mode and never truncated or overwritten by this module.
 //!
+//! Audit writes FAIL CLOSED: every caller propagates the `Result` with
+//! `?`, so a record that cannot be written fails the turn, the guard
+//! decision, or the provider attempt it belongs to. Nothing runs
+//! unrecorded. This is load-bearing for the guard and egress guarantees,
+//! not a logging nicety.
+//!
 //! TODO (Phase 8): hash-chain each record to the previous one (P0-22).
 //! Deliberately not done here; no hashing dependency is added in Phase 1.
 
@@ -100,4 +106,22 @@ pub fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Writes to `/dev/full` always fail (ENOSPC): the audit log must
+    /// surface that as an error, never swallow it. Linux-only: `/dev/full`
+    /// does not exist on other platforms.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn record_fails_closed_when_the_device_refuses_writes() {
+        let audit = AuditLog::open("/dev/full").expect("open /dev/full");
+        let err = audit
+            .log("t", "decision", None, Some("allow"), serde_json::json!({}))
+            .expect_err("write to /dev/full must fail");
+        assert!(err.to_string().contains("audit"), "{err}");
+    }
 }

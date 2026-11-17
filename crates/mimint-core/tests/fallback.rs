@@ -3,8 +3,8 @@
 //! wall-clock budget bound. Every attempt must appear in the audit log.
 
 use mimint_core::{
-    AuditLog, ChatMessage, EgressPolicy, FallbackChain, GuardedHttpClient, MimintError, Provider,
-    ProviderClient, RetryPolicy,
+    AuditLog, CallContext, ChatMessage, EgressPolicy, FallbackChain, GuardedHttpClient,
+    MimintError, Provider, ProviderClient, RetryPolicy,
 };
 use serde_json::{json, Value};
 use std::collections::VecDeque;
@@ -13,6 +13,7 @@ use std::net::TcpListener;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use zeroize::Zeroizing;
 
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -161,7 +162,9 @@ fn provider_for(name: &str, port: u16, timeout: Duration, key: Option<&str>) -> 
         name,
         &format!("http://127.0.0.1:{port}"),
         "stub-model",
-        key.map(str::to_string),
+        key.map(|k| Zeroizing::new(k.to_string())),
+        // Tests send keys to loopback stubs over http: explicit opt-in.
+        true,
         GuardedHttpClient::new(EgressPolicy::privacy_on(), timeout).expect("guarded client"),
     )
     .expect("provider");
@@ -221,12 +224,11 @@ async fn retry_500_then_timeout_then_success() {
             None,
         )],
         fast_retry(3),
-        Some(Arc::clone(&audit)),
-        "turn-retry",
     )
     .expect("chain");
+    let ctx = CallContext::new("turn-retry", Some(audit.as_ref()));
     let message = chain
-        .chat(&[ChatMessage::user("hi")], &[])
+        .chat(&ctx, &[ChatMessage::user("hi")], &[])
         .await
         .expect("third attempt succeeds");
     assert_eq!(message.content.as_deref(), Some("Fallback success."));
@@ -239,6 +241,8 @@ async fn retry_500_then_timeout_then_success() {
     assert_eq!(tries[1]["decision"], "transient_error");
     assert_eq!(tries[2]["decision"], "success");
     assert!(tries.iter().all(|r| r["detail"]["provider"] == "only"));
+    assert!(tries.iter().all(|r| r["detail"]["paid"] == false));
+    assert!(tries.iter().all(|r| r["turn_id"] == "turn-retry"));
     let _ = std::fs::remove_file(&audit_path);
 }
 
@@ -262,12 +266,11 @@ async fn all_providers_fail_with_clear_error_and_full_audit() {
             provider_for("second", second.port, Duration::from_secs(5), None),
         ],
         fast_retry(2),
-        Some(Arc::clone(&audit)),
-        "turn-allfail",
     )
     .expect("chain");
+    let ctx = CallContext::new("turn-allfail", Some(audit.as_ref()));
     let err = chain
-        .chat(&[ChatMessage::user("hi")], &[])
+        .chat(&ctx, &[ChatMessage::user("hi")], &[])
         .await
         .expect_err("all providers must fail");
     let text = err.to_string();
@@ -303,12 +306,11 @@ async fn permanent_error_skips_retry_and_moves_on() {
             provider_for("good", good.port, Duration::from_secs(5), None),
         ],
         fast_retry(3),
-        None,
-        "turn-permanent",
     )
     .expect("chain");
+    let ctx = CallContext::new("turn-permanent", None);
     let message = chain
-        .chat(&[ChatMessage::user("hi")], &[])
+        .chat(&ctx, &[ChatMessage::user("hi")], &[])
         .await
         .expect("second provider succeeds");
     assert_eq!(message.content.as_deref(), Some("Second provider wins."));
@@ -337,13 +339,12 @@ async fn wall_clock_budget_bounds_total_time() {
             base_delay: Duration::from_millis(10),
             max_delay: Duration::from_millis(10),
         },
-        None,
-        "turn-budget",
     )
     .expect("chain");
+    let ctx = CallContext::new("turn-budget", None);
     let started = Instant::now();
     let err = chain
-        .chat(&[ChatMessage::user("hi")], &[])
+        .chat(&ctx, &[ChatMessage::user("hi")], &[])
         .await
         .expect_err("budget must eventually fail");
     assert!(
@@ -375,12 +376,11 @@ async fn key_value_never_appears_in_audit() {
             Some("CANARY-KEY-9f8e7d6c"),
         )],
         fast_retry(1),
-        Some(Arc::clone(&audit)),
-        "turn-canary",
     )
     .expect("chain");
+    let ctx = CallContext::new("turn-canary", Some(audit.as_ref()));
     chain
-        .chat(&[ChatMessage::user("hi")], &[])
+        .chat(&ctx, &[ChatMessage::user("hi")], &[])
         .await
         .expect("turn succeeds");
     drop(chain);
@@ -391,6 +391,59 @@ async fn key_value_never_appears_in_audit() {
         "audit log must never contain a key value"
     );
     assert!(text.contains("provider_attempt"), "{text}");
+    let _ = std::fs::remove_file(&audit_path);
+}
+
+#[tokio::test]
+async fn chain_is_reusable_across_turns_with_fresh_budget() {
+    // Scripted [500, 200]: with max_attempts=1 the first call fails
+    // consuming the 500, the second call gets a fresh budget and the
+    // 200. The same chain serves two turns with different turn ids.
+    let stub = start_stub(vec![
+        Behavior {
+            status: 500,
+            delay: Duration::ZERO,
+            body: "first boom".to_string(),
+        },
+        Behavior {
+            status: 200,
+            delay: Duration::ZERO,
+            body: success_body("Second turn wins."),
+        },
+    ]);
+    let audit_path = format!("{}.jsonl", temp_stem("reuse"));
+    let audit = Arc::new(AuditLog::open(&audit_path).expect("open audit"));
+    let chain = FallbackChain::new(
+        vec![provider_for(
+            "only",
+            stub.port,
+            Duration::from_secs(5),
+            None,
+        )],
+        fast_retry(1),
+    )
+    .expect("chain");
+
+    let ctx1 = CallContext::new("turn-reuse-1", Some(audit.as_ref()));
+    let err = chain
+        .chat(&ctx1, &[ChatMessage::user("hi")], &[])
+        .await
+        .expect_err("first call fails on the 500");
+    assert!(err.to_string().contains("all 1 provider"), "{err}");
+
+    let ctx2 = CallContext::new("turn-reuse-2", Some(audit.as_ref()));
+    let message = chain
+        .chat(&ctx2, &[ChatMessage::user("hi")], &[])
+        .await
+        .expect("second call succeeds with fresh budget");
+    assert_eq!(message.content.as_deref(), Some("Second turn wins."));
+    assert_eq!(stub.count.load(Ordering::SeqCst), 2);
+
+    let records = read_audit(&audit_path);
+    let tries = attempts(&records);
+    assert_eq!(tries.len(), 2);
+    assert_eq!(tries[0]["turn_id"], "turn-reuse-1");
+    assert_eq!(tries[1]["turn_id"], "turn-reuse-2");
     let _ = std::fs::remove_file(&audit_path);
 }
 

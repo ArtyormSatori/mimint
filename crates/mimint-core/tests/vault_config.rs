@@ -39,7 +39,12 @@ fn remote_spec(name: &str) -> BackendSpec {
         key_file: None,
         timeout: Duration::from_secs(30),
         max_tokens: None,
+        allow_plaintext_auth: false,
     }
+}
+
+fn paid_cap() -> CostCap {
+    CostCap::new(Some(5.0)).unwrap()
 }
 
 #[test]
@@ -49,14 +54,14 @@ fn key_env_resolves_and_missing_key_fails_clearly() {
     let mut spec = remote_spec("cloud");
     spec.key_env = Some(var.clone());
     // Absent: provider construction must fail naming the key.
-    let err = match build_provider(&spec, &vault, EgressPolicy::privacy_off(), CostCap::none()) {
+    let err = match build_provider(&spec, &vault, EgressPolicy::privacy_off(), paid_cap()) {
         Ok(_) => panic!("missing key must fail"),
         Err(err) => err,
     };
     assert!(err.to_string().contains("API key"), "{err}");
     // Present: construction succeeds.
     std::env::set_var(&var, "test-key-from-env");
-    let provider = build_provider(&spec, &vault, EgressPolicy::privacy_off(), CostCap::none())
+    let provider = build_provider(&spec, &vault, EgressPolicy::privacy_off(), paid_cap())
         .expect("key from env");
     assert!(provider.is_paid());
     std::env::remove_var(&var);
@@ -71,13 +76,13 @@ fn key_file_resolves_and_too_open_file_is_refused() {
     assert_eq!(created.path(), path.as_path());
     let mut spec = remote_spec("cloud");
     spec.key_file = Some(path.clone());
-    let provider = build_provider(&spec, &vault, EgressPolicy::privacy_off(), CostCap::none())
+    let provider = build_provider(&spec, &vault, EgressPolicy::privacy_off(), paid_cap())
         .expect("key from file");
     assert!(provider.is_paid());
 
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-    let err = match build_provider(&spec, &vault, EgressPolicy::privacy_off(), CostCap::none()) {
+    let err = match build_provider(&spec, &vault, EgressPolicy::privacy_off(), paid_cap()) {
         Ok(_) => panic!("too-open key file must fail"),
         Err(err) => err,
     };
@@ -97,6 +102,7 @@ fn claude_spec_builds_against_loopback_override() {
         key_file: None,
         timeout: Duration::from_secs(5),
         max_tokens: Some(77),
+        allow_plaintext_auth: false,
     };
     let provider = build_provider(&spec, &vault, EgressPolicy::privacy_on(), CostCap::none())
         .expect("claude loopback build");
@@ -176,6 +182,48 @@ chain = ["local", "cloud"]
         resolved.cost_cap,
     )
     .expect("local-only chain under cap 0");
+    assert_eq!(local_only.len(), 1);
+}
+
+#[test]
+fn absent_cost_section_locks_paid_chain_but_allows_local() {
+    let vault = EnvVault;
+    // No [cost] section at all: paid backends are locked (opt-in).
+    let text = r#"
+[[backend]]
+name = "local"
+kind = "ollama"
+model = "m"
+[[backend]]
+name = "cloud"
+kind = "openai"
+model = "m"
+base_url = "https://example.com/v1"
+[fallback]
+chain = ["local", "cloud"]
+"#;
+    let resolved = FileConfig::parse(text).unwrap().validate().unwrap();
+    assert_eq!(resolved.cost_cap.cap_usd, None);
+    let err = match build_chain(
+        &resolved.backends,
+        &resolved.chain,
+        &vault,
+        EgressPolicy::privacy_off(),
+        resolved.cost_cap,
+    ) {
+        Ok(_) => panic!("absent cap must lock the paid member"),
+        Err(err) => err,
+    };
+    assert!(err.to_string().contains("explicit opt-in"), "{err}");
+
+    let local_only = build_chain(
+        &resolved.backends,
+        &["local".to_string()],
+        &vault,
+        EgressPolicy::privacy_on(),
+        resolved.cost_cap,
+    )
+    .expect("local-only chain under absent cap");
     assert_eq!(local_only.len(), 1);
 }
 

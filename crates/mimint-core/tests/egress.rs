@@ -4,7 +4,8 @@
 //! reachable endpoint is a loopback stub in this process.
 
 use mimint_core::{
-    default_registry, Approver, AuditLog, Brain, EgressPolicy, GuardedHttpClient, MimintError,
+    build_provider, default_registry, Approver, AuditLog, BackendKind, BackendSpec, Brain,
+    CallContext, ChatMessage, CostCap, EgressPolicy, EnvVault, GuardedHttpClient, MimintError,
     Notebook, Provider, ProviderClient,
 };
 use serde_json::{json, Value};
@@ -13,6 +14,7 @@ use std::net::TcpListener;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use zeroize::Zeroizing;
 
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -218,8 +220,9 @@ async fn redirect_to_external_url_is_not_followed() {
         guarded_on(Duration::from_secs(5)),
     )
     .expect("provider");
+    let ctx = CallContext::new("turn-egress-redirect", None);
     let err = provider
-        .chat(&[mimint_core::ChatMessage::user("hi")], &[])
+        .chat(&ctx, &[ChatMessage::user("hi")], &[])
         .await
         .expect_err("redirect must surface as an error, not a follow");
     // The client returned the 302 itself instead of following it.
@@ -259,9 +262,8 @@ async fn proxy_environment_is_ignored() {
             guarded_on(Duration::from_secs(5)),
         )
         .expect("provider");
-        provider
-            .chat(&[mimint_core::ChatMessage::user("hi")], &[])
-            .await
+        let ctx = CallContext::new("turn-egress-proxy", None);
+        provider.chat(&ctx, &[ChatMessage::user("hi")], &[]).await
     }
     .await;
     for (name, original) in saved {
@@ -341,7 +343,7 @@ fn remote_provider_cannot_be_constructed_under_privacy_on() {
     let err = match ProviderClient::new(
         "https://example.com",
         "m",
-        Some("k".to_string()),
+        Some(Zeroizing::new("k".to_string())),
         guarded_on(Duration::from_secs(1)),
     ) {
         Ok(_) => panic!("remote construction under Privacy Mode must fail"),
@@ -349,4 +351,136 @@ fn remote_provider_cannot_be_constructed_under_privacy_on() {
     };
     assert!(err.to_string().contains("Privacy Mode"), "{err}");
     assert!(!err.is_transient());
+}
+
+#[tokio::test]
+async fn localhost_url_reaches_the_loopback_stub_under_privacy_on() {
+    // The request goes to `localhost`, not an IP literal: the custom
+    // resolver short-circuits it to 127.0.0.1 and the stub (bound to
+    // 127.0.0.1) answers. Proves the resolver is installed and the
+    // URL port survives resolution.
+    let stub = start_stub(Arc::new(|_, _| StubResponse {
+        status: 200,
+        reason: "OK",
+        extra_headers: vec![],
+        body: chat_completion_text("via localhost"),
+    }));
+    let provider = ProviderClient::new(
+        &format!("http://localhost:{}", stub.port),
+        "stub-model",
+        None,
+        guarded_on(Duration::from_secs(5)),
+    )
+    .expect("provider");
+    let ctx = CallContext::new("turn-egress-localhost", None);
+    let message = provider
+        .chat(&ctx, &[ChatMessage::user("hi")], &[])
+        .await
+        .expect("localhost request must reach the stub");
+    assert_eq!(message.content.as_deref(), Some("via localhost"));
+    assert_eq!(stub.requests.lock().unwrap().len(), 1);
+}
+
+fn stub_spec(port: u16, key_env: Option<String>, allow_plaintext_auth: bool) -> BackendSpec {
+    BackendSpec {
+        name: "ollama-stub".to_string(),
+        kind: BackendKind::Ollama,
+        model: "stub-model".to_string(),
+        base_url: Some(format!("http://127.0.0.1:{port}")),
+        key_env,
+        key_file: None,
+        timeout: Duration::from_secs(5),
+        max_tokens: None,
+        allow_plaintext_auth,
+    }
+}
+
+fn has_authorization(request: &RecordedRequest) -> Option<String> {
+    request
+        .headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+        .map(|(_, value)| value.clone())
+}
+
+#[tokio::test]
+async fn ambient_key_is_never_sent_to_a_loopback_backend() {
+    let stub = start_stub(Arc::new(|_, _| StubResponse {
+        status: 200,
+        reason: "OK",
+        extra_headers: vec![],
+        body: chat_completion_text("no key sent"),
+    }));
+    // A stray ambient MIMINT_API_KEY must NOT be picked up for a
+    // loopback backend that declares no key source.
+    let saved = std::env::var("MIMINT_API_KEY").ok();
+    std::env::set_var("MIMINT_API_KEY", "AMBIENT-KEY-MUST-NOT-LEAK");
+    let outcome = async {
+        let provider = build_provider(
+            &stub_spec(stub.port, None, false),
+            &EnvVault,
+            EgressPolicy::privacy_on(),
+            CostCap::none(),
+        )
+        .expect("loopback build without declared key");
+        let ctx = CallContext::new("turn-egress-ambient", None);
+        provider.chat(&ctx, &[ChatMessage::user("hi")], &[]).await
+    }
+    .await;
+    match saved {
+        Some(value) => std::env::set_var("MIMINT_API_KEY", value),
+        None => std::env::remove_var("MIMINT_API_KEY"),
+    }
+    let message = outcome.expect("turn succeeds without a key");
+    assert_eq!(message.content.as_deref(), Some("no key sent"));
+    let requests = stub.requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(has_authorization(&requests[0]), None);
+}
+
+#[tokio::test]
+async fn explicit_loopback_key_needs_opt_in_and_then_is_sent() {
+    let var = format!("MIMINT_TEST_EGRESS_EXPLICIT_{}", std::process::id());
+    std::env::set_var(&var, "explicit-loopback-key");
+
+    // Without the opt-in, construction fails naming it.
+    let stub = start_stub(Arc::new(|_, _| StubResponse {
+        status: 200,
+        reason: "OK",
+        extra_headers: vec![],
+        body: chat_completion_text("with key"),
+    }));
+    let err = match build_provider(
+        &stub_spec(stub.port, Some(var.clone()), false),
+        &EnvVault,
+        EgressPolicy::privacy_on(),
+        CostCap::none(),
+    ) {
+        Ok(_) => panic!("explicit key over plaintext loopback needs opt-in"),
+        Err(err) => err,
+    };
+    assert!(err.to_string().contains("allow_plaintext_auth"), "{err}");
+    assert_eq!(stub.requests.lock().unwrap().len(), 0);
+
+    // With the opt-in, the key is sent as a Bearer header.
+    let provider = build_provider(
+        &stub_spec(stub.port, Some(var.clone()), true),
+        &EnvVault,
+        EgressPolicy::privacy_on(),
+        CostCap::none(),
+    )
+    .expect("opt-in build");
+    let ctx = CallContext::new("turn-egress-explicit", None);
+    let message = provider
+        .chat(&ctx, &[ChatMessage::user("hi")], &[])
+        .await
+        .expect("turn succeeds with opt-in key");
+    assert_eq!(message.content.as_deref(), Some("with key"));
+    let requests = stub.requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        has_authorization(&requests[0]).as_deref(),
+        Some("Bearer explicit-loopback-key")
+    );
+    std::env::remove_var(&var);
 }

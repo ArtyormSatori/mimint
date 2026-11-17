@@ -4,8 +4,8 @@
 //! translation can be asserted in both directions.
 
 use mimint_core::{
-    default_registry, Approver, AuditLog, Brain, ChatMessage, ClaudeClient, EgressPolicy,
-    GuardedHttpClient, MimintError, Notebook, Provider,
+    default_registry, Approver, AuditLog, Brain, CallContext, ChatMessage, ClaudeClient,
+    EgressPolicy, GuardedHttpClient, MimintError, Notebook, Provider,
 };
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -13,6 +13,7 @@ use std::net::TcpListener;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use zeroize::Zeroizing;
 
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -64,15 +65,36 @@ fn anthropic_text_response(text: &str) -> String {
     .to_string()
 }
 
+fn anthropic_truncated_response() -> String {
+    json!({
+        "id": "msg_stub_3",
+        "type": "message",
+        "role": "assistant",
+        "content": [
+            {"type": "text", "text": "Partial answer that ran out of"},
+            {"type": "tool_use", "id": "toolu_stub_9", "name": "notebook_add",
+             "input": {"title": "Truncated"}},
+        ],
+        "model": "stub",
+        "stop_reason": "max_tokens",
+        "usage": {"input_tokens": 10, "output_tokens": 5},
+    })
+    .to_string()
+}
+
 struct Stub {
     port: u16,
     requests: Arc<Mutex<Vec<RecordedRequest>>>,
 }
 
+/// One scripted response: status, body, and extra response headers
+/// (e.g. `Retry-After`) to send before the standard headers.
+type Scripted = (u16, String, Vec<(String, String)>);
+
 fn run_stub(
     listener: TcpListener,
     requests: Arc<Mutex<Vec<RecordedRequest>>>,
-    script: Arc<Mutex<Vec<(u16, String)>>>,
+    script: Arc<Mutex<Vec<Scripted>>>,
 ) {
     let counter = Arc::new(AtomicUsize::new(0));
     for stream in listener.incoming() {
@@ -136,7 +158,7 @@ fn run_stub(
             headers,
             body: parsed,
         });
-        let (status, payload) = {
+        let (status, payload, extra_headers) = {
             let mut script = script.lock().unwrap();
             if script.len() > 1 {
                 script.remove(0)
@@ -145,8 +167,12 @@ fn run_stub(
             }
         };
         let reason = if status == 200 { "OK" } else { "Error" };
+        let mut extra = String::new();
+        for (name, value) in &extra_headers {
+            extra.push_str(&format!("{name}: {value}\r\n"));
+        }
         let response = format!(
-            "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+            "HTTP/1.1 {status} {reason}\r\n{extra}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
             payload.len()
         );
         let _ = stream.write_all(response.as_bytes());
@@ -154,7 +180,7 @@ fn run_stub(
     }
 }
 
-fn start_stub(script: Vec<(u16, String)>) -> Stub {
+fn start_stub(script: Vec<Scripted>) -> Stub {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub");
     let port = listener.local_addr().expect("stub addr").port();
     let requests = Arc::new(Mutex::new(Vec::new()));
@@ -182,8 +208,10 @@ fn claude_client(port: u16, key: Option<&str>) -> ClaudeClient {
         "claude-stub",
         &format!("http://127.0.0.1:{port}"),
         "stub-model",
-        key.map(str::to_string),
+        key.map(|k| Zeroizing::new(k.to_string())),
         64,
+        // Tests send a key to a loopback stub over http: explicit opt-in.
+        true,
         GuardedHttpClient::new(EgressPolicy::privacy_on(), Duration::from_secs(10))
             .expect("guarded client"),
     )
@@ -201,8 +229,12 @@ fn header<'a>(request: &'a RecordedRequest, name: &str) -> Option<&'a str> {
 #[tokio::test]
 async fn claude_turn_through_anthropic_stub() {
     let stub = start_stub(vec![
-        (200, anthropic_tool_use_response()),
-        (200, anthropic_text_response("Stub done: note saved.")),
+        (200, anthropic_tool_use_response(), vec![]),
+        (
+            200,
+            anthropic_text_response("Stub done: note saved."),
+            vec![],
+        ),
     ]);
     let stem = temp_stem("turn");
     let db_path = format!("{stem}.db");
@@ -291,10 +323,11 @@ async fn claude_turn_through_anthropic_stub() {
 
 #[tokio::test]
 async fn claude_error_mapping_transient_and_permanent() {
-    let stub_500 = start_stub(vec![(500, "boom".to_string())]);
+    let stub_500 = start_stub(vec![(500, "boom".to_string(), vec![])]);
     let provider = claude_client(stub_500.port, None);
+    let ctx = CallContext::new("turn-claude-err", None);
     let err = provider
-        .chat(&[ChatMessage::user("hi")], &[])
+        .chat(&ctx, &[ChatMessage::user("hi")], &[])
         .await
         .expect_err("500 must fail");
     assert!(err.is_transient(), "{err}");
@@ -302,10 +335,11 @@ async fn claude_error_mapping_transient_and_permanent() {
     let stub_401 = start_stub(vec![(
         401,
         json!({"type": "error", "error": {"type": "authentication_error", "message": "invalid x-api-key"}}).to_string(),
+        vec![],
     )]);
     let provider = claude_client(stub_401.port, Some("bad"));
     let err = provider
-        .chat(&[ChatMessage::user("hi")], &[])
+        .chat(&ctx, &[ChatMessage::user("hi")], &[])
         .await
         .expect_err("401 must fail");
     assert!(!err.is_transient(), "{err}");
@@ -313,11 +347,43 @@ async fn claude_error_mapping_transient_and_permanent() {
 }
 
 #[tokio::test]
+async fn claude_retry_after_header_is_carried_on_transient_errors() {
+    let stub = start_stub(vec![(
+        429,
+        json!({"type": "error", "error": {"type": "rate_limit_error", "message": "slow down"}})
+            .to_string(),
+        vec![("Retry-After".to_string(), "2".to_string())],
+    )]);
+    let provider = claude_client(stub.port, Some("test-key"));
+    let ctx = CallContext::new("turn-claude-retry-after", None);
+    let err = provider
+        .chat(&ctx, &[ChatMessage::user("hi")], &[])
+        .await
+        .expect_err("429 must fail");
+    assert!(err.is_transient(), "{err}");
+    assert_eq!(err.retry_after(), Some(Duration::from_secs(2)), "{err}");
+}
+
+#[tokio::test]
+async fn claude_max_tokens_truncation_is_an_error_not_success() {
+    let stub = start_stub(vec![(200, anthropic_truncated_response(), vec![])]);
+    let provider = claude_client(stub.port, Some("test-key"));
+    let ctx = CallContext::new("turn-claude-truncated", None);
+    let err = provider
+        .chat(&ctx, &[ChatMessage::user("hi")], &[])
+        .await
+        .expect_err("max_tokens stop_reason must fail");
+    assert!(!err.is_transient(), "{err}");
+    assert!(err.to_string().contains("max_tokens"), "{err}");
+}
+
+#[tokio::test]
 async fn claude_text_only_response_has_no_tool_calls() {
-    let stub = start_stub(vec![(200, anthropic_text_response("Just text."))]);
+    let stub = start_stub(vec![(200, anthropic_text_response("Just text."), vec![])]);
     let provider = claude_client(stub.port, None);
+    let ctx = CallContext::new("turn-claude-text", None);
     let message = provider
-        .chat(&[ChatMessage::user("hi")], &[])
+        .chat(&ctx, &[ChatMessage::user("hi")], &[])
         .await
         .expect("text response");
     assert_eq!(message.content.as_deref(), Some("Just text."));

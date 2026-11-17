@@ -1,0 +1,10 @@
+# Clippy configuration. The disallowed-methods list is the automated
+# enforcement of the egress design: `GuardedHttpClient::new` in
+# crates/mimint-core/src/egress.rs is the ONLY place a reqwest client
+# may be constructed. Any other call site fails `cargo clippy -D warnings`.
+# The single allowed site carries #[allow(clippy::disallowed_methods)].
+
+disallowed-methods = [
+    { path = "reqwest::Client::builder", reason = "HTTP clients must be built only in GuardedHttpClient::new (crates/mimint-core/src/egress.rs), with the egress policy, no redirects, no proxy, and the loopback-guarding DNS resolver" },
+    { path = "reqwest::Client::new", reason = "HTTP clients must be built only in GuardedHttpClient::new (crates/mimint-core/src/egress.rs), with the egress policy, no redirects, no proxy, and the loopback-guarding DNS resolver" },
+]

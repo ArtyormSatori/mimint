@@ -4,6 +4,7 @@
 //! dependency tree minimal.
 
 use std::fmt;
+use std::time::Duration;
 
 /// Errors produced by Mimint core.
 #[derive(Debug)]
@@ -17,6 +18,12 @@ pub enum MimintError {
     /// error, HTTP 429, or HTTP 5xx. The fallback chain retries only
     /// these (and only within its bounded budget).
     ProviderTransient(String),
+    /// Like [`Self::ProviderTransient`], but the provider asked for a
+    /// minimum wait via `Retry-After`. The chain waits at least this
+    /// long (and never longer than its remaining budget) before the
+    /// next attempt. Only the delay-seconds form of `Retry-After` is
+    /// honored; the HTTP-date form falls back to plain backoff.
+    ProviderTransientDelayed(String, Duration),
     /// Guard denial or guard failure.
     Guard(String),
     /// Tool execution failure.
@@ -34,7 +41,19 @@ impl MimintError {
     /// Configuration errors (including egress denials) are never
     /// transient: retrying them cannot help.
     pub fn is_transient(&self) -> bool {
-        matches!(self, Self::ProviderTransient(_))
+        matches!(
+            self,
+            Self::ProviderTransient(_) | Self::ProviderTransientDelayed(_, _)
+        )
+    }
+
+    /// Minimum wait the provider asked for via `Retry-After`, when this
+    /// error carries one. `None` means plain exponential backoff.
+    pub fn retry_after(&self) -> Option<Duration> {
+        match self {
+            Self::ProviderTransientDelayed(_, delay) => Some(*delay),
+            _ => None,
+        }
     }
 
     /// The inner message without the kind prefix, for wrapping an error
@@ -44,6 +63,7 @@ impl MimintError {
             Self::Config(msg)
             | Self::Provider(msg)
             | Self::ProviderTransient(msg)
+            | Self::ProviderTransientDelayed(msg, _)
             | Self::Guard(msg)
             | Self::Tool(msg)
             | Self::Notebook(msg)
@@ -59,6 +79,11 @@ impl fmt::Display for MimintError {
             Self::Config(msg) => write!(f, "config error: {msg}"),
             Self::Provider(msg) => write!(f, "provider error: {msg}"),
             Self::ProviderTransient(msg) => write!(f, "provider transient error: {msg}"),
+            Self::ProviderTransientDelayed(msg, delay) => write!(
+                f,
+                "provider transient error: {msg} (provider asked to wait {}s)",
+                delay.as_secs()
+            ),
             Self::Guard(msg) => write!(f, "guard denied: {msg}"),
             Self::Tool(msg) => write!(f, "tool error: {msg}"),
             Self::Notebook(msg) => write!(f, "notebook error: {msg}"),

@@ -15,7 +15,7 @@
 //! enabled = true          # default when absent: true
 //!
 //! [cost]
-//! cap_usd = 0.0           # 0 locks paid backends; absent = no cap
+//! cap_usd = 0.0           # 0 locks paid backends; absent locks too (opt-in)
 //!
 //! [[backend]]
 //! name = "local"
@@ -98,11 +98,13 @@ impl Default for PrivacySection {
     }
 }
 
-/// Cost section (P0-11). Absent section means no cap configured.
+/// Cost section (P0-11). Absent section means paid backends are locked
+/// (opt-in required); only `cap_usd > 0` allows them.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CostSection {
-    /// Monthly cap in USD. 0 locks paid backends. Absent = no cap.
+    /// Monthly cap in USD. 0 locks paid backends. Absent locks too.
+    /// The value is an opt-in gate, not spending metering.
     pub cap_usd: Option<f64>,
 }
 
@@ -115,7 +117,7 @@ pub struct FallbackSection {
     pub chain: Option<Vec<String>>,
     /// Attempts per provider. Default: [`RetryPolicy::DEFAULT_MAX_ATTEMPTS`].
     pub max_attempts: Option<usize>,
-    /// Chain-wide budget in seconds. Default: [`RetryPolicy::DEFAULT_MAX_ELAPSED_SECS`].
+    /// Per-call budget in seconds (fresh per `chat()` call). Default: [`RetryPolicy::DEFAULT_MAX_ELAPSED_SECS`].
     pub max_elapsed_secs: Option<u64>,
     /// First backoff delay in milliseconds. Default: [`RetryPolicy::DEFAULT_BASE_DELAY_MS`].
     pub base_delay_ms: Option<u64>,
@@ -141,8 +143,11 @@ pub struct BackendEntry {
     pub key_file: Option<String>,
     /// Per-request timeout in seconds. Default: 30.
     pub timeout_secs: Option<u64>,
-    /// Claude-only `max_tokens`. Default: 1024 (see [`crate::claude`]).
+    /// Claude-only `max_tokens`. Default: 4096 (see [`crate::claude`]).
     pub max_tokens: Option<u32>,
+    /// Opt-in to send this backend's key over plaintext http to a
+    /// loopback endpoint. Default: false.
+    pub allow_plaintext_auth: Option<bool>,
 }
 
 /// Whole config file as parsed from TOML.
@@ -152,7 +157,7 @@ pub struct FileConfig {
     /// Privacy section; default ON when absent.
     #[serde(default)]
     pub privacy: PrivacySection,
-    /// Cost section; no cap when absent.
+    /// Cost section; paid locked when absent.
     #[serde(default)]
     pub cost: CostSection,
     /// Backend used when no fallback chain is set.
@@ -182,8 +187,8 @@ pub struct ResolvedConfig {
 }
 
 impl FileConfig {
-    /// An empty configuration: Privacy ON, no cap, no backends. Used
-    /// when no config file exists.
+    /// An empty configuration: Privacy ON, paid locked, no backends.
+    /// Used when no config file exists.
     pub fn empty() -> Self {
         Self::default()
     }
@@ -212,6 +217,7 @@ impl FileConfig {
                 key_file: entry.key_file.clone().map(PathBuf::from),
                 timeout: Duration::from_secs(entry.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS)),
                 max_tokens: entry.max_tokens,
+                allow_plaintext_auth: entry.allow_plaintext_auth.unwrap_or(false),
             };
             spec.validate()?;
             if backends.iter().any(|other| other.name == spec.name) {
@@ -498,6 +504,30 @@ model = "m"
         assert!(FileConfig::parse(bad_cap).unwrap().validate().is_err());
         let bad_retry = "default_backend = \"a\"\n[[backend]]\nname = \"a\"\nkind = \"ollama\"\nmodel = \"m\"\n[fallback]\nmax_attempts = 0\n";
         assert!(FileConfig::parse(bad_retry).unwrap().validate().is_err());
+    }
+
+    #[test]
+    fn allow_plaintext_auth_parses_and_defaults_false() {
+        let text = r#"
+default_backend = "local"
+[[backend]]
+name = "local"
+kind = "ollama"
+model = "m"
+key_env = "MIMINT_TEST_KEY"
+allow_plaintext_auth = true
+"#;
+        let resolved = FileConfig::parse(text).unwrap().validate().unwrap();
+        assert!(resolved.backends[0].allow_plaintext_auth);
+        let text = r#"
+default_backend = "local"
+[[backend]]
+name = "local"
+kind = "ollama"
+model = "m"
+"#;
+        let resolved = FileConfig::parse(text).unwrap().validate().unwrap();
+        assert!(!resolved.backends[0].allow_plaintext_auth);
     }
 
     #[test]

@@ -17,12 +17,14 @@
 //!   `http://127.0.0.1:1234/v1`.
 //!
 //! Paid vs free/local (P0-11): a backend is paid when its resolved
-//! endpoint host is not loopback. When the configured cost cap is
-//! exactly 0, paid backends are refused at build time with an error
-//! that points at local backends. A missing cap means "no cap
-//! configured": paid backends are allowed. Spend metering (token usage
-//! to dollars) is not implemented in Phase 2; the cap is a lock, not a
-//! meter — see the Phase 2 report.
+//! endpoint host is not loopback. Paid backends are LOCKED unless the
+//! configuration opts in with `[cost] cap_usd > 0`: a missing cap locks
+//! paid backends exactly like a zero cap. The lock is decided before any
+//! secret is read. Spend metering (token usage to dollars) is not
+//! implemented; the cap is an opt-in gate, not a meter — see the Phase 2
+//! report and `docs/privacy-and-cost.md`. The field keeps the name
+//! `cap_usd` for schema compatibility; a rename to an explicit
+//! allow-paid flag is planned for a later version.
 
 use crate::claude::{ClaudeClient, ANTHROPIC_BASE_URL, DEFAULT_MAX_TOKENS};
 use crate::egress::{url_is_loopback, EgressPolicy, GuardedHttpClient};
@@ -31,6 +33,7 @@ use crate::provider::{Provider, ProviderClient};
 use crate::vault::{EnvVault, FileVault, Vault};
 use std::path::PathBuf;
 use std::time::Duration;
+use zeroize::Zeroizing;
 
 /// Default per-request timeout for a backend (seconds).
 pub const DEFAULT_TIMEOUT_SECS: u64 = 30;
@@ -106,7 +109,9 @@ impl BackendKind {
 }
 
 /// Cost cap from configuration (P0-11). `None` means no cap was
-/// configured; `Some(0.0)` locks all paid backends.
+/// configured, which LOCKS paid backends (opt-in required); `Some(0.0)`
+/// locks them too. Only `Some(cap)` with `cap > 0` allows paid backends,
+/// and the value is an opt-in gate, not a spending meter.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CostCap {
     /// Monthly cap in USD, when configured. Must be >= 0.
@@ -114,7 +119,8 @@ pub struct CostCap {
 }
 
 impl CostCap {
-    /// No cap configured: paid backends are allowed.
+    /// No cap configured: paid backends are locked until the user opts
+    /// in with `[cost] cap_usd > 0`.
     pub fn none() -> Self {
         Self { cap_usd: None }
     }
@@ -132,9 +138,11 @@ impl CostCap {
         Ok(Self { cap_usd })
     }
 
-    /// False only when the cap is configured and exactly 0.
+    /// True only when the cap is configured and greater than 0. A
+    /// missing cap locks paid backends: paying for a provider must be
+    /// an explicit choice, matching the local-first default.
     pub fn allows_paid(&self) -> bool {
-        self.cap_usd.map(|cap| cap > 0.0).unwrap_or(true)
+        self.cap_usd.map(|cap| cap > 0.0).unwrap_or(false)
     }
 }
 
@@ -165,6 +173,11 @@ pub struct BackendSpec {
     pub timeout: Duration,
     /// Claude-only `max_tokens`. Must be `None` for other kinds.
     pub max_tokens: Option<u32>,
+    /// Explicit opt-in to send this backend's key over plaintext http
+    /// to a loopback endpoint. Default false: without it, a keyed
+    /// plaintext-loopback backend fails at construction (confused
+    /// deputy). Only meaningful for loopback `http://` endpoints.
+    pub allow_plaintext_auth: bool,
 }
 
 impl BackendSpec {
@@ -240,7 +253,19 @@ impl BackendSpec {
 /// Order: `key_file` (0600-checked file) > `key_env` (named variable) >
 /// `MIMINT_API_KEY` (default variable). Absent everywhere means `None`;
 /// whether a key is required is decided by the provider constructor.
-fn resolve_key(spec: &BackendSpec, vault: &dyn Vault) -> Result<Option<String>, MimintError> {
+///
+/// Exception: for LOOPBACK endpoints, the default-variable fallback does
+/// NOT apply. A loopback backend only gets a key when the backend
+/// explicitly declares `key_env`/`key_file`, so a stray ambient
+/// `MIMINT_API_KEY` is never sent to a local port (where any process
+/// could be listening). Explicitly declared keys for plaintext loopback
+/// endpoints additionally require `allow_plaintext_auth` (enforced by
+/// the provider constructors).
+fn resolve_key(
+    spec: &BackendSpec,
+    vault: &dyn Vault,
+    loopback: bool,
+) -> Result<Option<Zeroizing<String>>, MimintError> {
     if let Some(path) = &spec.key_file {
         let file_vault = FileVault::open(path).map_err(|err| {
             MimintError::Config(format!("backend '{}': {}", spec.name, err.message()))
@@ -249,6 +274,9 @@ fn resolve_key(spec: &BackendSpec, vault: &dyn Vault) -> Result<Option<String>, 
     }
     if let Some(var) = &spec.key_env {
         return vault.get(var);
+    }
+    if loopback {
+        return Ok(None);
     }
     vault.get(DEFAULT_KEY_ENV)
 }
@@ -274,27 +302,48 @@ pub fn build_provider(
         MimintError::Config(format!("backend '{}': {}", spec.name, err.message()))
     })?;
     if !loopback && !cost_cap.allows_paid() {
+        let reason = match cost_cap.cap_usd {
+            None => "no [cost] section is configured (paid backends require explicit opt-in)"
+                .to_string(),
+            Some(_) => "cost cap is 0".to_string(),
+        };
         return Err(MimintError::Config(format!(
-            "cost cap is 0: paid backend '{}' (kind={}, endpoint {base_url}) is locked. \
-             Set [cost] cap_usd > 0 to allow paid backends, or use a local backend (Ollama/LM Studio)",
+            "paid backend '{}' (kind={}, endpoint {base_url}) is locked: {reason}. \
+             Set [cost] cap_usd > 0 to allow paid backends, or use a local backend (Ollama/LM Studio). \
+             WARNING: cap_usd is an opt-in gate, not spending metering — actual spend is not measured",
             spec.name,
             spec.kind.label()
         )));
     }
-    let key = resolve_key(spec, vault)?;
+    let key = resolve_key(spec, vault, loopback)?;
     let http = GuardedHttpClient::new(policy, spec.timeout)?;
     if spec.kind == BackendKind::Claude {
         let max_tokens = spec.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
-        let client = ClaudeClient::new(&spec.name, &base_url, &spec.model, key, max_tokens, http)
-            .map_err(|err| {
+        let client = ClaudeClient::new(
+            &spec.name,
+            &base_url,
+            &spec.model,
+            key,
+            max_tokens,
+            spec.allow_plaintext_auth,
+            http,
+        )
+        .map_err(|err| {
             MimintError::Config(format!("backend '{}': {}", spec.name, err.message()))
         })?;
         Ok(Box::new(client))
     } else {
-        let client = ProviderClient::new_named(&spec.name, &base_url, &spec.model, key, http)
-            .map_err(|err| {
-                MimintError::Config(format!("backend '{}': {}", spec.name, err.message()))
-            })?;
+        let client = ProviderClient::new_named(
+            &spec.name,
+            &base_url,
+            &spec.model,
+            key,
+            spec.allow_plaintext_auth,
+            http,
+        )
+        .map_err(|err| {
+            MimintError::Config(format!("backend '{}': {}", spec.name, err.message()))
+        })?;
         Ok(Box::new(client))
     }
 }
@@ -354,6 +403,7 @@ mod tests {
             key_file: None,
             timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS),
             max_tokens: None,
+            allow_plaintext_auth: false,
         }
     }
 
@@ -424,7 +474,8 @@ mod tests {
         let vault = EnvVault;
         let cap_zero = CostCap::new(Some(0.0)).unwrap();
         assert!(!cap_zero.allows_paid());
-        assert!(CostCap::none().allows_paid());
+        // A missing cap locks paid backends too: opt-in is required.
+        assert!(!CostCap::none().allows_paid());
         assert!(CostCap::new(Some(5.0)).unwrap().allows_paid());
         assert!(CostCap::new(Some(-1.0)).is_err());
         assert!(CostCap::new(Some(f64::NAN)).is_err());
@@ -437,11 +488,63 @@ mod tests {
         };
         assert!(err.to_string().contains("cost cap is 0"), "{err}");
         assert!(err.to_string().contains("Ollama"), "{err}");
+        assert!(err.to_string().contains("not spending metering"), "{err}");
 
         let local = spec("local", BackendKind::Ollama, "m");
         let provider = build_provider(&local, &vault, EgressPolicy::privacy_on(), cap_zero)
             .expect("cap 0 must allow loopback");
         assert!(!provider.is_paid());
+    }
+
+    #[test]
+    fn absent_cost_cap_locks_paid_backends() {
+        let vault = EnvVault;
+        let mut remote = spec("cloud", BackendKind::OpenAi, "m");
+        remote.base_url = Some("https://example.com/v1".to_string());
+        let err = match build_provider(
+            &remote,
+            &vault,
+            EgressPolicy::privacy_off(),
+            CostCap::none(),
+        ) {
+            Ok(_) => panic!("absent cap must lock paid backend"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("explicit opt-in"), "{err}");
+        assert!(err.to_string().contains("cap_usd"), "{err}");
+
+        // Opting in with cap > 0 unlocks (construction then fails only
+        // on the missing key, proving the lock itself passed).
+        let err = match build_provider(
+            &remote,
+            &vault,
+            EgressPolicy::privacy_off(),
+            CostCap::new(Some(5.0)).unwrap(),
+        ) {
+            Ok(_) => panic!("missing key must still fail"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("API key"), "{err}");
+    }
+
+    #[test]
+    fn loopback_backend_with_explicit_key_needs_plaintext_opt_in() {
+        let vault = EnvVault;
+        let var = "MIMINT_TEST_REGISTRY_PLAINTEXT_KEY";
+        std::env::set_var(var, "explicit-key");
+        let mut local = spec("local", BackendKind::Ollama, "m");
+        local.key_env = Some(var.to_string());
+        let err = match build_provider(&local, &vault, EgressPolicy::privacy_on(), CostCap::none())
+        {
+            Ok(_) => panic!("explicit key over plaintext loopback needs opt-in"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("allow_plaintext_auth"), "{err}");
+        local.allow_plaintext_auth = true;
+        let provider = build_provider(&local, &vault, EgressPolicy::privacy_on(), CostCap::none())
+            .expect("opt-in builds");
+        assert!(!provider.is_paid());
+        std::env::remove_var(var);
     }
 
     #[test]

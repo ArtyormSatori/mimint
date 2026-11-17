@@ -509,12 +509,14 @@ dependencies = [
 name = "mimint-core"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "reqwest",
  "rusqlite",
  "serde",
  "serde_json",
  "tokio",
  "toml",
+ "zeroize",
 ]
 
 [[package]]

@@ -16,7 +16,10 @@
 //!
 //! Privacy Mode defaults to ON (config file, then `--privacy-mode`
 //! flag, override it). The cost cap from the config file applies in
-//! every mode: flags select a backend, they never bypass policy.
+//! every mode: flags select a backend, they never bypass policy. An
+//! absent `[cost]` section locks paid backends (opt-in required);
+//! only `cap_usd > 0` unlocks them, and the value is an opt-in gate,
+//! not spending metering.
 
 use mimint_core::{
     build_chain, default_config_path, default_vault, load_config_file, probe_local_backends,
@@ -30,7 +33,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const USAGE: &str = "mimint-cli: run one Mimint turn (Phase 2).\n\nUsage:\n  mimint-cli [options] <prompt...>\n\nOptions:\n  --base-url URL     Ad-hoc OpenAI-compatible base URL, or env MIMINT_BASE_URL\n  --model MODEL      Ad-hoc model name, or env MIMINT_MODEL (required, no default)\n  --backend NAME     Use one backend from the config file (not with --base-url/--model)\n  --config PATH      Config file (default: $XDG_CONFIG_HOME/mimint/config.toml or ~/.config/mimint/config.toml)\n  --key-file PATH    Key file for the ad-hoc backend (0600-checked; config backends use key_env/key_file)\n  --privacy-mode on|off  Privacy Mode: ON allows loopback backends only (default: on)\n  --db PATH          Notebook SQLite path (default: mimint.db)\n  --audit PATH       Audit JSONL path (default: mimint-audit.jsonl)\n  --auto-approve     Approve consequential tools automatically (test mode only; recorded in audit)\n  --max-steps N      Max brain steps (default: 5)\n  --timeout SECONDS  Per-request timeout, overriding backend timeouts (default: 30 ad-hoc, else per backend)\n  --help             Show this help\n\nThe API key comes from the vault: env MIMINT_API_KEY by default, or the backend's key_env/key_file.\nKeys are never printed or written to the audit log.\n";
+const USAGE: &str = "mimint-cli: run one Mimint turn (Phase 2).\n\nUsage:\n  mimint-cli [options] <prompt...>\n\nBackend selection (first match wins):\n  1. --base-url / --model flags (missing piece filled from env MIMINT_BASE_URL / MIMINT_MODEL)\n  2. --backend NAME (one backend from the config file)\n  3. Config file: fallback.chain, else default_backend\n  4. Env MIMINT_BASE_URL + MIMINT_MODEL (both set)\n  5. Nothing configured: probe Ollama/LM Studio on loopback and print a\n     configuration suggestion. Nothing is changed. Exit code 1 means\n     \"not ready to run\", not a crash.\n\nOptions:\n  --base-url URL     Ad-hoc OpenAI-compatible base URL, or env MIMINT_BASE_URL\n  --model MODEL      Ad-hoc model name, or env MIMINT_MODEL (required, no default)\n  --backend NAME     Use one backend from the config file (not with --base-url/--model/--key-file/--allow-plaintext-auth)\n  --config PATH      Config file (default: $XDG_CONFIG_HOME/mimint/config.toml or ~/.config/mimint/config.toml; MIMINT_CONFIG is not read)\n  --key-file PATH    Key file for the ad-hoc backend (0600-checked; config backends use key_env/key_file in the file)\n  --allow-plaintext-auth  Ad-hoc only: allow sending the key over plaintext http to a loopback endpoint (default: refused; config backends set allow_plaintext_auth in the file)\n  --privacy-mode on|off  Privacy Mode: ON allows loopback backends only (127.0.0.1, localhost, ::1; LAN addresses like 192.168.x.x are blocked too) (default: on)\n  --db PATH          Notebook SQLite path (default: mimint.db)\n  --audit PATH       Audit JSONL path (default: mimint-audit.jsonl)\n  --auto-approve     Approve consequential tools automatically (test mode only; recorded in audit)\n  --max-steps N      Max brain steps (default: 5)\n  --timeout SECONDS  Per-request timeout, overriding backend timeouts (default: 30 ad-hoc, else per backend)\n  --help             Show this help (works anywhere on the command line)\n\nPrivacy Mode: ON means this process only talks to loopback backends. Turn it\nOFF only when you trust the configured endpoint: remote providers receive\nyour prompts and conversation data. Privacy Mode covers this process only;\nit cannot stop a local proxy or another process from forwarding traffic.\n\nCost gate: paid backends (any non-loopback endpoint) are LOCKED unless the\nconfig file opts in with [cost] cap_usd > 0. A missing [cost] section locks\npaid backends too. cap_usd is an opt-in gate, not spending metering: actual\nspend is not measured. The gate applies to ad-hoc backends as well.\n\nThe API key comes from the vault: env MIMINT_API_KEY by default for remote\nbackends, or the backend's key_env/key_file. A loopback backend only gets a\nkey when it explicitly declares key_env/key_file; an ambient MIMINT_API_KEY\nis never sent to a local port. Keys are never printed or written to the audit log.\n";
 
 struct CliArgs {
     base_url: Option<String>,
@@ -38,6 +41,7 @@ struct CliArgs {
     backend: Option<String>,
     config: Option<PathBuf>,
     key_file: Option<PathBuf>,
+    allow_plaintext_auth: bool,
     privacy_mode: Option<bool>,
     db: PathBuf,
     audit: PathBuf,
@@ -47,12 +51,80 @@ struct CliArgs {
     prompt: String,
 }
 
+/// Flags that consume the following argv element as their value. Shared
+/// by the parser and the `--help` pre-scan so the two agree on what is
+/// a value and what is a flag.
+const VALUE_FLAGS: [&str; 10] = [
+    "--base-url",
+    "--model",
+    "--backend",
+    "--config",
+    "--key-file",
+    "--privacy-mode",
+    "--db",
+    "--audit",
+    "--max-steps",
+    "--timeout",
+];
+
+/// True when `--help`/`-h` appears as a flag anywhere on the command
+/// line: after positional words, but not after `--` (where it is a
+/// prompt word) and not as the value of a value-taking flag.
+fn wants_help(argv: &[String]) -> bool {
+    let mut index = 0usize;
+    while index < argv.len() {
+        let arg = &argv[index];
+        if arg == "--" {
+            return false;
+        }
+        if arg == "--help" || arg == "-h" {
+            return true;
+        }
+        let flag = arg.split_once('=').map(|(flag, _)| flag).unwrap_or(arg);
+        if VALUE_FLAGS.contains(&flag) && !arg.contains('=') {
+            index += 2;
+            continue;
+        }
+        index += 1;
+    }
+    false
+}
+
+/// Reject flag combinations that would silently ignore a flag:
+/// `--backend` selects a backend from the config file, so ad-hoc-only
+/// flags (`--base-url`/`--model`, `--key-file`, `--allow-plaintext-auth`)
+/// have no meaning with it and must fail loudly instead of being dropped.
+fn validate_flag_combination(args: &CliArgs) -> Result<(), MimintError> {
+    if args.backend.is_some() {
+        if args.base_url.is_some() || args.model.is_some() {
+            return Err(MimintError::Config(
+                "cannot combine --backend with --base-url/--model: pick one backend source"
+                    .to_string(),
+            ));
+        }
+        if args.key_file.is_some() {
+            return Err(MimintError::Config(
+                "cannot combine --backend with --key-file: set key_env/key_file in the backend's config entry"
+                    .to_string(),
+            ));
+        }
+        if args.allow_plaintext_auth {
+            return Err(MimintError::Config(
+                "cannot combine --backend with --allow-plaintext-auth: set allow_plaintext_auth in the backend's config entry"
+                    .to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn parse_args(argv: Vec<String>) -> Result<CliArgs, MimintError> {
     let mut base_url = None;
     let mut model = None;
     let mut backend = None;
     let mut config = None;
     let mut key_file = None;
+    let mut allow_plaintext_auth = false;
     let mut privacy_mode = None;
     let mut db = PathBuf::from("mimint.db");
     let mut audit = PathBuf::from("mimint-audit.jsonl");
@@ -79,23 +151,16 @@ fn parse_args(argv: Vec<String>) -> Result<CliArgs, MimintError> {
             index += 1;
             continue;
         }
+        if arg == "--allow-plaintext-auth" {
+            allow_plaintext_auth = true;
+            index += 1;
+            continue;
+        }
         let (flag, inline_value) = match arg.split_once('=') {
             Some((flag, value)) => (flag, Some(value.to_string())),
             None => (arg.as_str(), None),
         };
-        let takes_value = matches!(
-            flag,
-            "--base-url"
-                | "--model"
-                | "--backend"
-                | "--config"
-                | "--key-file"
-                | "--privacy-mode"
-                | "--db"
-                | "--audit"
-                | "--max-steps"
-                | "--timeout"
-        );
+        let takes_value = VALUE_FLAGS.contains(&flag);
         if !takes_value {
             if flag.starts_with('-') && flag.len() > 1 {
                 return Err(MimintError::Config(format!("unknown argument: {arg}")));
@@ -167,6 +232,7 @@ fn parse_args(argv: Vec<String>) -> Result<CliArgs, MimintError> {
         backend,
         config,
         key_file,
+        allow_plaintext_auth,
         privacy_mode,
         db,
         audit,
@@ -246,6 +312,7 @@ fn adhoc_spec(
     base_url: String,
     model: String,
     key_file: Option<PathBuf>,
+    allow_plaintext_auth: bool,
     timeout_secs: Option<u64>,
 ) -> BackendSpec {
     BackendSpec {
@@ -257,24 +324,18 @@ fn adhoc_spec(
         key_file,
         timeout: Duration::from_secs(timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS)),
         max_tokens: None,
+        allow_plaintext_auth,
     }
 }
 
 async fn run() -> Result<(), MimintError> {
     let argv: Vec<String> = env::args().skip(1).collect();
-    if argv
-        .first()
-        .is_some_and(|arg| arg == "--help" || arg == "-h")
-    {
+    if wants_help(&argv) {
         print!("{USAGE}");
         return Ok(());
     }
     let args = parse_args(argv)?;
-    if args.backend.is_some() && (args.base_url.is_some() || args.model.is_some()) {
-        return Err(MimintError::Config(
-            "cannot combine --backend with --base-url/--model: pick one backend source".to_string(),
-        ));
-    }
+    validate_flag_combination(&args)?;
 
     // Config file: explicit --config is required; the default path is
     // optional (absent file means an empty configuration).
@@ -303,7 +364,9 @@ async fn run() -> Result<(), MimintError> {
             "Privacy Mode: ON (source: {privacy_source}); only loopback backends are reachable."
         );
     } else {
-        eprintln!("Privacy Mode: OFF (source: {privacy_source}); remote endpoints are reachable.");
+        eprintln!(
+            "WARNING: Privacy Mode is OFF (source: {privacy_source}). Remote providers may receive your prompts and conversation data. Only continue if you trust the configured endpoint."
+        );
     }
 
     let notebook = Arc::new(Notebook::open(&args.db)?);
@@ -324,6 +387,7 @@ async fn run() -> Result<(), MimintError> {
     // Backend selection (see the module docs for the order).
     let mut specs: Vec<BackendSpec>;
     let order: Vec<String>;
+    let backend_source: &str;
     if args.base_url.is_some() || args.model.is_some() {
         let base_url = nonempty(args.base_url)
             .or_else(|| nonempty(env::var("MIMINT_BASE_URL").ok()))
@@ -344,9 +408,11 @@ async fn run() -> Result<(), MimintError> {
             base_url,
             model,
             args.key_file,
+            args.allow_plaintext_auth,
             args.timeout_secs,
         )];
         order = vec!["adhoc".to_string()];
+        backend_source = "flags";
     } else if let Some(name) = &args.backend {
         if resolved.backends.is_empty() {
             return Err(MimintError::Config(format!(
@@ -366,9 +432,11 @@ async fn run() -> Result<(), MimintError> {
         }
         specs = resolved.backends.clone();
         order = vec![name.clone()];
+        backend_source = "--backend";
     } else if !resolved.backends.is_empty() {
         specs = resolved.backends.clone();
         order = resolved.chain.clone();
+        backend_source = "config file";
     } else if let (Some(base_url), Some(model)) = (
         nonempty(env::var("MIMINT_BASE_URL").ok()),
         nonempty(env::var("MIMINT_MODEL").ok()),
@@ -377,9 +445,11 @@ async fn run() -> Result<(), MimintError> {
             base_url,
             model,
             args.key_file,
+            args.allow_plaintext_auth,
             args.timeout_secs,
         )];
         order = vec!["adhoc".to_string()];
+        backend_source = "environment";
     } else {
         // Onboarding: suggest, never change anything.
         let probe = probe_local_backends(policy).await;
@@ -404,15 +474,34 @@ async fn run() -> Result<(), MimintError> {
         .iter()
         .map(|provider| provider.name().to_string())
         .collect();
+    eprintln!(
+        "Backend: {} (source: {backend_source})",
+        chain_names.join(" -> ")
+    );
+    // When env selection variables are set but a higher-precedence
+    // source won, say so: otherwise the user wonders why their env
+    // backend was ignored.
+    let env_has_both = nonempty(env::var("MIMINT_BASE_URL").ok()).is_some()
+        && nonempty(env::var("MIMINT_MODEL").ok()).is_some();
+    if env_has_both && matches!(backend_source, "--backend" | "config file") {
+        eprintln!(
+            "Note: MIMINT_BASE_URL/MIMINT_MODEL are set but ignored: the {backend_source} backend selection takes precedence (see --help)."
+        );
+    }
+    // Paid backends are an explicit opt-in: warn on every run, and say
+    // plainly that the cap does not measure spend.
+    if providers.iter().any(|provider| provider.is_paid()) {
+        let cap_text = cost_cap
+            .cap_usd
+            .map(|cap| format!("${cap}"))
+            .unwrap_or_else(|| "(unset)".to_string());
+        eprintln!(
+            "WARNING: paid backend(s) enabled (cost cap: {cap_text}). cap_usd is an opt-in gate, not spending metering: actual spend is not measured."
+        );
+    }
 
-    let turn_id_for_chain = turn_id.clone();
     let registry = mimint_core::default_registry(Arc::clone(&notebook));
-    let chain = FallbackChain::new(
-        providers,
-        resolved.retry,
-        Some(Arc::clone(&audit)),
-        turn_id_for_chain,
-    )?;
+    let chain = FallbackChain::new(providers, resolved.retry)?;
     let stdin_approver = StdinApprover::new();
     let auto_approver = AutoApprover;
     let approver: &dyn Approver = if args.auto_approve {
@@ -536,6 +625,75 @@ mod tests {
     fn separator_keeps_dash_prompt_positional() {
         let args = parse_args(argv(&["--", "--not-a-flag", "x"])).unwrap();
         assert_eq!(args.prompt, "--not-a-flag x");
+    }
+
+    #[test]
+    fn allow_plaintext_auth_flag_parses() {
+        let args = parse_args(argv(&[
+            "--base-url",
+            "http://127.0.0.1:9",
+            "--model",
+            "m",
+            "--allow-plaintext-auth",
+            "hi",
+        ]))
+        .unwrap();
+        assert!(args.allow_plaintext_auth);
+        let args = parse_args(argv(&["hi"])).unwrap();
+        assert!(!args.allow_plaintext_auth);
+    }
+
+    #[test]
+    fn help_flag_works_anywhere_except_after_separator_or_as_value() {
+        assert!(wants_help(&argv(&["--help"])));
+        assert!(wants_help(&argv(&["hello", "--help"])));
+        assert!(wants_help(&argv(&["hello", "world", "-h"])));
+        assert!(wants_help(&argv(&["--model", "m", "--help", "hi"])));
+        assert!(!wants_help(&argv(&["--", "--help"])));
+        assert!(!wants_help(&argv(&["--model", "--help", "hi"])));
+        assert!(!wants_help(&argv(&["--model=--help", "hi"])));
+        assert!(!wants_help(&argv(&["hello"])));
+        assert!(!wants_help(&argv(&[])));
+    }
+
+    #[test]
+    fn backend_flag_combination_validation() {
+        let ok = parse_args(argv(&["--backend", "local", "hi"])).unwrap();
+        assert!(validate_flag_combination(&ok).is_ok());
+
+        let with_flags = parse_args(argv(&[
+            "--backend",
+            "local",
+            "--base-url",
+            "http://127.0.0.1:9",
+            "hi",
+        ]))
+        .unwrap();
+        let err = validate_flag_combination(&with_flags).expect_err("backend + base-url");
+        assert!(err.to_string().contains("--base-url"), "{err}");
+
+        let with_key = parse_args(argv(&[
+            "--backend",
+            "local",
+            "--key-file",
+            "/tmp/k.key",
+            "hi",
+        ]))
+        .unwrap();
+        let err = validate_flag_combination(&with_key).expect_err("backend + key-file");
+        assert!(err.to_string().contains("--key-file"), "{err}");
+        assert!(err.to_string().contains("config entry"), "{err}");
+
+        let with_plain = parse_args(argv(&[
+            "--backend",
+            "local",
+            "--allow-plaintext-auth",
+            "hi",
+        ]))
+        .unwrap();
+        let err =
+            validate_flag_combination(&with_plain).expect_err("backend + allow-plaintext-auth");
+        assert!(err.to_string().contains("--allow-plaintext-auth"), "{err}");
     }
 
     #[test]
