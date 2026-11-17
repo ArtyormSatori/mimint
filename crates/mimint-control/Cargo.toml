@@ -15,6 +15,9 @@ ring = "0.17"
 # PNG encoding for golden-task input hashing (already in the
 # lockfile via egui: 0 new packages).
 png = "0.18"
+# Async runtime for the golden/safety gate binaries (already in
+# the lockfile: 0 new packages).
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

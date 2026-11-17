@@ -26,6 +26,8 @@
 //! [`build_chain`]: mimint_core::build_chain
 
 use crate::approver::{ApprovalJob, RepaintSignal, TokenSlot, UiApprover};
+use mimint_body::StopFlag;
+use mimint_control::{register_body_tools, BodyActor, BodyStepVerifier, FrameStore, PrivacyFlag};
 use mimint_core::audit::now_ms;
 use mimint_core::{
     default_registry, default_vault, AuditLog, BackendSpec, Brain, CancelToken, CostCap,
@@ -33,6 +35,7 @@ use mimint_core::{
 };
 use serde_json::json;
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
 use std::time::Duration;
@@ -126,6 +129,12 @@ pub enum WorkerEvent {
     /// The worker thread caught a panic inside a turn. The loop
     /// keeps serving; the UI shows the control error state.
     WorkerFault { error: String },
+    /// The body's emergency-stop flag tripped (global hotkey, or
+    /// an input attempt while an approval card waited). The stop
+    /// slot is already cancelled; the UI shows the stopped state
+    /// and the reason. The flag latches: only a restart clears
+    /// the body stop.
+    StopTripped { reason: String },
 }
 
 /// What a rebuild needs: the specs to build from, the retry policy,
@@ -137,6 +146,18 @@ pub struct RebuildConfig {
 }
 
 /// Everything the worker thread owns.
+/// The body stack, built by the caller when `--body` is on
+/// (Phase 4). The worker registers the body tools, verifies each
+/// step through the body, purges privacy-tainted frames on
+/// rebuild and before each turn, and bridges the stop flag into
+/// the stop slot.
+pub struct BodyStack {
+    pub actor: BodyActor,
+    pub frames: Arc<FrameStore>,
+    pub privacy: PrivacyFlag,
+    pub stop_flag: Arc<StopFlag>,
+}
+
 pub struct WorkerDeps {
     /// Providers for the initial chain (built by the caller, so the
     /// caller decides the initial Privacy Mode and cost cap).
@@ -156,6 +177,12 @@ pub struct WorkerDeps {
     pub repaint: Arc<RepaintSignal>,
     /// How long an approval card may wait before timing out.
     pub approval_timeout: Duration,
+    /// Body stack for `--body` mode. `None` means no body tools:
+    /// the brain cannot touch the screen.
+    pub body: Option<BodyStack>,
+    /// Shared approval-pending flag: the SAME `Arc<AtomicBool>`
+    /// the body guard consults. Set while a card waits.
+    pub approval_pending: Option<Arc<AtomicBool>>,
 }
 
 /// Handle for the UI thread: send requests, poll events, trip the
@@ -266,12 +293,48 @@ fn worker_loop(
         turn_slot,
         repaint,
         approval_timeout,
+        body,
+        approval_pending,
     } = deps;
-    let registry = default_registry(Arc::clone(&notebook));
-    let approver = UiApprover::new(approval_tx)
+    let mut registry = default_registry(Arc::clone(&notebook));
+    if let Some(stack) = &body {
+        register_body_tools(
+            &mut registry,
+            stack.actor.clone(),
+            Arc::clone(&stack.frames),
+            stack.privacy.clone(),
+        );
+    }
+    let mut approver = UiApprover::new(approval_tx)
         .with_timeout(approval_timeout)
         .with_slots(Arc::clone(&stop_slot), Arc::clone(&turn_slot))
         .with_repaint(repaint);
+    if let Some(flag) = approval_pending {
+        approver = approver.with_pending_flag(flag);
+    }
+    // Stop bridge: when the body's stop flag trips (hotkey or
+    // approval-pending trip), cancel the stop slot so the running
+    // turn aborts, and tell the UI. Fires once; the flag latches.
+    let bridge_exit = Arc::new(AtomicBool::new(false));
+    let bridge = body.as_ref().map(|stack| {
+        let flag = Arc::clone(&stack.stop_flag);
+        let slot = Arc::clone(&stop_slot);
+        let tx = event_tx.clone();
+        let exit = Arc::clone(&bridge_exit);
+        std::thread::spawn(move || {
+            while !exit.load(Ordering::SeqCst) {
+                if flag.is_tripped() {
+                    slot.cancel_current();
+                    let _ = tx.send(WorkerEvent::StopTripped {
+                        reason: "emergency stop tripped (global hotkey or input while an approval card waited)"
+                            .to_string(),
+                    });
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        })
+    });
     let mut chain = match FallbackChain::new(initial_providers, retry) {
         Ok(mut chain) => {
             attach_progress_hook(&mut chain, &event_tx);
@@ -302,6 +365,7 @@ fn worker_loop(
                     max_steps,
                     stop_slot: &stop_slot,
                     turn_slot: &turn_slot,
+                    body: body.as_ref(),
                 };
                 // A panic in a turn must not kill the worker or
                 // leave the UI stuck on "thinking": catch it,
@@ -326,6 +390,15 @@ fn worker_loop(
                 }
             }
             WorkerRequest::Rebuild { privacy_on, order } => {
+                // Privacy discipline (P4.6.6): the new mode takes
+                // effect for the body tools immediately, and
+                // tainted frames are purged even if the chain
+                // rebuild fails — a failed rebuild must not leave
+                // privacy-ON screenshots lying around.
+                if let Some(stack) = &body {
+                    stack.privacy.set(privacy_on);
+                    stack.frames.purge_tainted();
+                }
                 let event =
                     rebuild_chain(&mut chain, &rebuild, &audit, &event_tx, privacy_on, &order);
                 if event_tx.send(event).is_err() {
@@ -333,6 +406,10 @@ fn worker_loop(
                 }
             }
         }
+    }
+    bridge_exit.store(true, Ordering::SeqCst);
+    if let Some(thread) = bridge {
+        let _ = thread.join();
     }
 }
 
@@ -345,6 +422,7 @@ struct TurnCtx<'a> {
     max_steps: usize,
     stop_slot: &'a Arc<TokenSlot>,
     turn_slot: &'a Arc<TokenSlot>,
+    body: Option<&'a BodyStack>,
 }
 
 fn run_one_turn(
@@ -383,6 +461,15 @@ fn run_one_turn(
     };
     brain.add_cancel_token(turn_token);
     brain.add_cancel_token(ctx.stop_slot.get());
+    if let Some(stack) = ctx.body {
+        // Privacy discipline (P4.6.6): tainted frames from
+        // earlier turns never survive into a new turn.
+        stack.frames.purge_tainted();
+        brain.set_step_verifier(Arc::new(BodyStepVerifier::new(
+            stack.actor.clone(),
+            Arc::clone(&stack.frames),
+        )));
+    }
     match runtime.block_on(brain.run(prompt)) {
         Ok(outcome) => WorkerEvent::TurnDone {
             text: outcome.text,
@@ -574,6 +661,8 @@ mod tests {
             turn_slot: TokenSlot::new(),
             repaint: RepaintSignal::new(),
             approval_timeout: Duration::from_secs(120),
+            body: None,
+            approval_pending: None,
         };
         (spawn_worker(deps), approval_rx, dir)
     }

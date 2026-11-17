@@ -32,9 +32,10 @@ use crate::face::{breath_scale, is_blinking, EyeShape, FaceMachine, MouthShape};
 use crate::motion::{MotionController, MotionTier};
 use crate::worker::{FailureKind, WorkerEvent, WorkerHandle};
 use egui::{Color32, Pos2, Rect, Stroke, Vec2};
+use mimint_body::ScreenRect;
 use mimint_core::ApprovalDecision;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 /// Mint green body.
@@ -78,6 +79,10 @@ pub struct AppOptions {
     pub onboarding_text: Option<String>,
     /// Wake-up flag the worker pokes when an approval job arrives.
     pub repaint: Arc<RepaintSignal>,
+    /// Shared self-exclusion list (`--body` mode only): the app
+    /// writes its window rectangle here every frame, and the body
+    /// guard refuses clicks inside it. `None` without `--body`.
+    pub shared_exclusion: Option<Arc<RwLock<Vec<ScreenRect>>>>,
 }
 
 pub struct MimintApp {
@@ -117,6 +122,10 @@ pub struct MimintApp {
     event_log: Option<PathBuf>,
     last_input_rect: Option<Rect>,
     repaint: Arc<RepaintSignal>,
+    shared_exclusion: Option<Arc<RwLock<Vec<ScreenRect>>>>,
+    /// Last exclusion rect written, so the shared list is only
+    /// rewritten when the window actually moved or resized.
+    last_exclusion: Option<ScreenRect>,
 }
 
 impl MimintApp {
@@ -164,6 +173,37 @@ impl MimintApp {
             event_log: options.event_log,
             last_input_rect: None,
             repaint: options.repaint,
+            shared_exclusion: options.shared_exclusion,
+            last_exclusion: None,
+        }
+    }
+
+    /// Publish the app window rectangle (in framebuffer pixels)
+    /// to the shared self-exclusion list, so the body guard
+    /// refuses clicks into this window. Runs every frame; writes
+    /// only when the rect actually changed. The OUTER rect
+    /// (including title bar and decorations) is the exclusion:
+    /// input into the decorations is input into this app.
+    fn publish_exclusion(&mut self, ctx: &egui::Context) {
+        let Some(shared) = &self.shared_exclusion else {
+            return;
+        };
+        let points = ctx
+            .input(|i| i.viewport().outer_rect)
+            .unwrap_or_else(|| ctx.viewport_rect());
+        let ppp = ctx.pixels_per_point();
+        // Round outward: a partially covered pixel is covered.
+        let x = (points.min.x * ppp).floor() as i32;
+        let y = (points.min.y * ppp).floor() as i32;
+        let max_x = (points.max.x * ppp).ceil() as i32;
+        let max_y = (points.max.y * ppp).ceil() as i32;
+        let rect = ScreenRect::new(x, y, (max_x - x).max(0) as u32, (max_y - y).max(0) as u32);
+        if self.last_exclusion == Some(rect) {
+            return;
+        }
+        if let Ok(mut list) = shared.write() {
+            *list = vec![rect];
+            self.last_exclusion = Some(rect);
         }
     }
 
@@ -241,6 +281,20 @@ impl MimintApp {
                             self.onboarding_shown = true;
                         }
                     }
+                }
+                WorkerEvent::StopTripped { reason } => {
+                    // The body's emergency stop latched: the lamp
+                    // shows Stopped, turns block, and only a
+                    // restart clears it. The running turn reports
+                    // its own cancellation separately.
+                    self.chat.request_body_stop();
+                    self.chat.on_cancelled();
+                    self.chat.add_system(format!(
+                        "Đã DỪNG KHẨN CẤP — phiên điều khiển đã dừng và sẽ không chạy tiếp. Khởi động lại ứng dụng để điều khiển tiếp. ({reason})"
+                    ));
+                    self.face.on_error(now);
+                    self.state_since = now;
+                    self.clear_stale_card();
                 }
             }
         }
@@ -379,6 +433,7 @@ impl eframe::App for MimintApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let now = Instant::now();
         self.frames += 1;
+        self.publish_exclusion(ui.ctx());
         if self.first_frame {
             self.first_frame = false;
             self.log_event("window_ready");
@@ -470,7 +525,14 @@ impl eframe::App for MimintApp {
                 if !minimal {
                     ui.label(state.label());
                 }
-                if self.chat.stopped {
+                if self.chat.body_stopped {
+                    // A body stop only clears on restart: offering
+                    // "Tiếp tục" would lie (the body flag stays
+                    // tripped). Say so, plainly.
+                    if !minimal {
+                        ui.label("Khởi động lại ứng dụng để điều khiển tiếp.");
+                    }
+                } else if self.chat.stopped {
                     if ui.button("Tiếp tục").clicked() {
                         self.worker.resume();
                         self.chat.resume();

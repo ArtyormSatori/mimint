@@ -187,13 +187,18 @@ impl<'a> GuardedExecutor<'a> {
         };
         match tool.risk() {
             Risk::ReadOnly => {
+                // Read-only tools need no approval, but they still
+                // get a request id: the execution entry binds to
+                // the decision entry by id, uniformly, so the
+                // audit trail can pair them without guessing.
+                let request_id = self.next_request_id.fetch_add(1, Ordering::SeqCst);
                 if let Err(err) = self.check_cancelled() {
                     self.audit.log(
                         &self.turn_id,
                         "decision",
                         Some(tool_name),
                         Some("cancelled"),
-                        json!({"reason": "cancelled_before_execution", "args": args}),
+                        json!({"reason": "cancelled_before_execution", "request_id": request_id, "args": args}),
                     )?;
                     return Err(err);
                 }
@@ -202,9 +207,9 @@ impl<'a> GuardedExecutor<'a> {
                     "decision",
                     Some(tool_name),
                     Some("allow"),
-                    json!({"reason": "read_only_no_approval_required", "args": args}),
+                    json!({"reason": "read_only_no_approval_required", "request_id": request_id, "args": args}),
                 )?;
-                self.run_and_audit(tool_name, tool, args)
+                self.run_and_audit(tool_name, tool, args, request_id)
             }
             Risk::Consequential => {
                 let Some(approver) = self.approver else {
@@ -275,7 +280,7 @@ impl<'a> GuardedExecutor<'a> {
                                 Some("allow"),
                                 json!({"reason": "approved", "request_id": request_id, "approver": approver.label(), "args": args}),
                             )?;
-                            self.run_and_audit(tool_name, tool, args)
+                            self.run_and_audit(tool_name, tool, args, request_id)
                         }
                         ApprovalDecision::Deny => {
                             self.audit.log(
@@ -334,6 +339,7 @@ impl<'a> GuardedExecutor<'a> {
         tool_name: &str,
         tool: &dyn Tool,
         args: &Value,
+        request_id: u64,
     ) -> Result<Value, MimintError> {
         match tool.execute(args) {
             Ok(output) => {
@@ -342,7 +348,7 @@ impl<'a> GuardedExecutor<'a> {
                     "execution",
                     Some(tool_name),
                     Some("executed"),
-                    json!({"args": args, "output": output}),
+                    json!({"request_id": request_id, "args": args, "output": output}),
                 )?;
                 Ok(output)
             }
@@ -352,7 +358,7 @@ impl<'a> GuardedExecutor<'a> {
                     "execution",
                     Some(tool_name),
                     Some("error"),
-                    json!({"args": args, "error": err.to_string()}),
+                    json!({"request_id": request_id, "args": args, "error": err.to_string()}),
                 )?;
                 Err(err)
             }

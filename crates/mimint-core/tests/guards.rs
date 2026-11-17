@@ -378,14 +378,27 @@ fn request_ids_increase_across_requests() {
         .execute("notebook_add", &json!({"title": "c", "body": "d"}))
         .unwrap();
     let records = audit_records(&audit_path);
-    let ids: Vec<u64> = records
+    let decision_ids: Vec<u64> = records
         .iter()
+        .filter(|r| r["kind"].as_str() == Some("decision"))
         .filter_map(|r| r["detail"]["request_id"].as_u64())
         .collect();
     assert_eq!(
-        ids,
+        decision_ids,
         vec![1, 2],
-        "request ids must be 1, 2 in order: {ids:?}"
+        "decision request ids must be 1, 2 in order: {decision_ids:?}"
+    );
+    // Execution entries bind to their decision's id (Phase 4):
+    // the trail pairs decision↔execution without guessing.
+    let execution_ids: Vec<u64> = records
+        .iter()
+        .filter(|r| r["kind"].as_str() == Some("execution"))
+        .filter_map(|r| r["detail"]["request_id"].as_u64())
+        .collect();
+    assert_eq!(
+        execution_ids,
+        vec![1, 2],
+        "execution entries must carry their decision's request id: {execution_ids:?}"
     );
     cleanup(&db_path, &audit_path);
 }

@@ -7,12 +7,10 @@
 //! executor will run, so "what you see" cannot drift from "what
 //! runs".
 //!
-//! Only three tools exist in Phase 3 (`notebook_search`,
-//! `notebook_read`, `notebook_add`); the body-action shapes
-//! (screenshot/click/type/delete/send/config) are rendered
-//! generically from an `action` field so the Phase 4 body tool can
-//! reuse this module without a rewrite. Nothing here claims a body
-//! tool exists today.
+//! Phase 4 adds explicit cards for the ten `body_*` tools: each
+//! card names the action, the exact coordinates/text/key that will
+//! run, and the consequence. Unknown tools fall back to the generic
+//! rendering, which lists every argument — never hidden.
 
 use serde_json::Value;
 
@@ -28,6 +26,17 @@ pub struct ApprovalDetail {
 
 fn arg_str<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
     args.get(key)?.as_str()
+}
+
+fn arg_int(args: &Value, key: &str) -> Option<i64> {
+    args.get(key)?.as_i64()
+}
+
+fn point_row(args: &Value) -> (String, String) {
+    match (arg_int(args, "x"), arg_int(args, "y")) {
+        (Some(x), Some(y)) => ("Vị trí".to_string(), format!("({x}, {y})")),
+        _ => ("Vị trí".to_string(), "(không rõ)".to_string()),
+    }
 }
 
 fn truncate(text: &str, max_chars: usize) -> String {
@@ -90,6 +99,127 @@ pub fn approval_detail(tool: &str, args: &Value) -> ApprovalDetail {
                 ),
             ],
             reversible: "Chỉ đọc — không có gì để hoàn tác.".to_string(),
+        },
+        "body_screenshot" => ApprovalDetail {
+            title: "Chụp màn hình".to_string(),
+            rows: vec![(
+                "Phạm vi".to_string(),
+                "Toàn màn hình chính; ảnh chỉ dùng cho lượt này, không gửi đi đâu.".to_string(),
+            )],
+            reversible: "Chỉ đọc — không có gì để hoàn tác.".to_string(),
+        },
+        "body_click" => ApprovalDetail {
+            title: "Nhấn chuột".to_string(),
+            rows: vec![
+                point_row(args),
+                (
+                    "Hậu quả".to_string(),
+                    "Con trỏ sẽ nhấn tại vị trí đã cho, như một cú nhấn chuột thật.".to_string(),
+                ),
+            ],
+            reversible: "Không hoàn tác được — cú nhấn có thể mở hoặc kích hoạt thứ gì đó."
+                .to_string(),
+        },
+        "body_move" => ApprovalDetail {
+            title: "Di chuyển con trỏ".to_string(),
+            rows: vec![point_row(args)],
+            reversible: "Chỉ di chuyển — không nhấn, không thay đổi gì.".to_string(),
+        },
+        "body_type_text" => {
+            let text = arg_str(args, "text").unwrap_or("");
+            ApprovalDetail {
+                title: "Gõ văn bản".to_string(),
+                rows: vec![
+                    (
+                        "Văn bản".to_string(),
+                        truncate(text, 200).replace('\n', " "),
+                    ),
+                    ("Số ký tự".to_string(), text.chars().count().to_string()),
+                    (
+                        "Nơi gõ".to_string(),
+                        "Nơi đang được chọn (cửa sổ đang có focus).".to_string(),
+                    ),
+                ],
+                reversible: "Có thể xóa văn bản đã gõ, nhưng không tự động hoàn tác.".to_string(),
+            }
+        }
+        "body_key" => ApprovalDetail {
+            title: "Nhấn phím".to_string(),
+            rows: vec![(
+                "Phím".to_string(),
+                arg_str(args, "key").unwrap_or("(không rõ)").to_string(),
+            )],
+            reversible: "Một lần nhấn phím — có thể kích hoạt phím tắt.".to_string(),
+        },
+        "body_scroll" => {
+            let dx = arg_int(args, "dx").unwrap_or(0);
+            let dy = arg_int(args, "dy").unwrap_or(0);
+            let vertical = if dy > 0 {
+                format!("xuống {dy} nấc")
+            } else if dy < 0 {
+                format!("lên {} nấc", -dy)
+            } else {
+                "không cuộn dọc".to_string()
+            };
+            let horizontal = if dx > 0 {
+                format!("phải {dx} nấc")
+            } else if dx < 0 {
+                format!("trái {} nấc", -dx)
+            } else {
+                "không cuộn ngang".to_string()
+            };
+            ApprovalDetail {
+                title: "Cuộn".to_string(),
+                rows: vec![
+                    point_row(args),
+                    ("Dọc".to_string(), vertical),
+                    ("Ngang".to_string(), horizontal),
+                ],
+                reversible: "Chỉ cuộn nội dung — không thay đổi gì.".to_string(),
+            }
+        }
+        "body_drag" => {
+            let from = match (arg_int(args, "from_x"), arg_int(args, "from_y")) {
+                (Some(x), Some(y)) => format!("({x}, {y})"),
+                _ => "(không rõ)".to_string(),
+            };
+            let to = match (arg_int(args, "to_x"), arg_int(args, "to_y")) {
+                (Some(x), Some(y)) => format!("({x}, {y})"),
+                _ => "(không rõ)".to_string(),
+            };
+            ApprovalDetail {
+                title: "Kéo chuột".to_string(),
+                rows: vec![("Từ".to_string(), from), ("Đến".to_string(), to)],
+                reversible: "Không hoàn tác được — có thể di chuyển hoặc chọn thứ gì đó."
+                    .to_string(),
+            }
+        }
+        "body_double_click" => ApprovalDetail {
+            title: "Nhấn đúp chuột".to_string(),
+            rows: vec![point_row(args)],
+            reversible: "Không hoàn tác được — nhấn đúp có thể mở thứ gì đó.".to_string(),
+        },
+        "body_right_click" => ApprovalDetail {
+            title: "Nhấn chuột phải".to_string(),
+            rows: vec![point_row(args)],
+            reversible: "Thường mở menu ngữ cảnh — không thay đổi gì cho tới khi chọn.".to_string(),
+        },
+        "body_hold_key" => ApprovalDetail {
+            title: "Giữ phím".to_string(),
+            rows: vec![
+                (
+                    "Phím".to_string(),
+                    arg_str(args, "key").unwrap_or("(không rõ)").to_string(),
+                ),
+                (
+                    "Thời gian".to_string(),
+                    match arg_int(args, "millis") {
+                        Some(millis) => format!("{millis} ms"),
+                        None => "(không rõ)".to_string(),
+                    },
+                ),
+            ],
+            reversible: "Phím được giữ rồi nhả — có thể kích hoạt phím tắt giữ phím.".to_string(),
         },
         _ => body_action_detail(tool, args),
     }
@@ -215,5 +345,69 @@ mod tests {
     fn unknown_args_are_listed_not_hidden() {
         let detail = approval_detail("mystery_tool", &json!({"frobnicate": true}));
         assert!(detail.rows.iter().any(|(k, _)| k == "frobnicate"));
+    }
+
+    #[test]
+    fn body_click_card_shows_the_exact_point() {
+        let detail = approval_detail("body_click", &json!({"x": 260, "y": 80}));
+        assert_eq!(detail.title, "Nhấn chuột");
+        assert!(detail
+            .rows
+            .iter()
+            .any(|(k, v)| k == "Vị trí" && v == "(260, 80)"));
+        assert!(detail.reversible.contains("Không hoàn tác"));
+    }
+
+    #[test]
+    fn body_type_text_card_shows_the_actual_text() {
+        let detail = approval_detail("body_type_text", &json!({"text": "Xin chào"}));
+        assert_eq!(detail.title, "Gõ văn bản");
+        assert!(detail
+            .rows
+            .iter()
+            .any(|(k, v)| k == "Văn bản" && v == "Xin chào"));
+        assert!(detail.rows.iter().any(|(k, v)| k == "Số ký tự" && v == "8"));
+    }
+
+    #[test]
+    fn body_scroll_card_names_the_directions() {
+        let detail = approval_detail("body_scroll", &json!({"x": 1, "y": 2, "dx": -1, "dy": 3}));
+        assert_eq!(detail.title, "Cuộn");
+        assert!(detail
+            .rows
+            .iter()
+            .any(|(k, v)| k == "Dọc" && v == "xuống 3 nấc"));
+        assert!(detail
+            .rows
+            .iter()
+            .any(|(k, v)| k == "Ngang" && v == "trái 1 nấc"));
+    }
+
+    #[test]
+    fn body_hold_key_card_shows_key_and_duration() {
+        let detail = approval_detail("body_hold_key", &json!({"key": "f5", "millis": 150}));
+        assert_eq!(detail.title, "Giữ phím");
+        assert!(detail.rows.iter().any(|(k, v)| k == "Phím" && v == "f5"));
+        assert!(detail
+            .rows
+            .iter()
+            .any(|(k, v)| k == "Thời gian" && v == "150 ms"));
+    }
+
+    #[test]
+    fn body_drag_card_shows_both_ends() {
+        let detail = approval_detail(
+            "body_drag",
+            &json!({"from_x": 10, "from_y": 20, "to_x": 30, "to_y": 40}),
+        );
+        assert_eq!(detail.title, "Kéo chuột");
+        assert!(detail
+            .rows
+            .iter()
+            .any(|(k, v)| k == "Từ" && v == "(10, 20)"));
+        assert!(detail
+            .rows
+            .iter()
+            .any(|(k, v)| k == "Đến" && v == "(30, 40)"));
     }
 }

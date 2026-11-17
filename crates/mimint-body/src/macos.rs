@@ -69,7 +69,7 @@ use crate::body::{Body, Framebuffer, PermissionState, Permissions, ScreenRect};
 use crate::error::BodyError;
 use core_graphics::display::CGDisplay;
 use core_graphics::event::{
-    CGEvent, CGEventTapLocation, CGEventType, CGMouseButton, CGScrollEventUnit, EventField,
+    CGEvent, CGEventTapLocation, CGEventType, CGMouseButton, EventField, ScrollEventUnit,
 };
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use core_graphics::geometry::CGPoint;
@@ -292,7 +292,7 @@ impl MacOsBody {
     fn post_scroll(&self, dx: i32, dy: i32) -> Result<(), BodyError> {
         let event = CGEvent::new_scroll_event(
             Self::event_source()?,
-            CGScrollEventUnit::LINE,
+            ScrollEventUnit::LINE,
             2,
             -dy,
             -dx,

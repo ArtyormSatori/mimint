@@ -24,6 +24,10 @@ path = "src/bin/conformance.rs"
 name = "testwin"
 path = "src/bin/testwin.rs"
 
+[[bin]]
+name = "evalharness"
+path = "src/bin/evalharness.rs"
+
 [dependencies]
 serde_json = "1"
 # Android protocol v2 (P4.3): all already in the workspace
@@ -35,9 +39,17 @@ rustls-pki-types = "1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 x11rb = { version = "0.13", features = ["xtest"] }
+# evalharness text rendering (P4.1): already in the workspace
+# lockfile via egui/epaint — 0 new packages. (tiny-skia was
+# considered and rejected: it would pull png 0.17 as a new
+# package; the canvas rasterizer is hand-rolled instead.)
+ab_glyph = "0.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
-core-graphics = "0.25"
+# "highsierra" gates CGEvent::new_scroll_event (Phase 4 scroll
+# action); the reference machine runs Monterey, newer than High
+# Sierra, so the API exists at runtime — still runtime-unverified.
+core-graphics = { version = "0.25", features = ["highsierra"] }
 core-foundation = "0.10"
 
 [target.'cfg(target_os = "windows")'.dependencies]

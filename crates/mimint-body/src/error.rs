@@ -73,6 +73,11 @@ pub enum BodyError {
     /// window, not a point, so it carries no coordinates. Nothing
     /// was executed.
     ForbiddenWindow { reason: String },
+    /// An approval card is waiting for the user's decision, so no
+    /// input action may run: input now could click the card
+    /// itself. The refusal also trips the emergency stop (see
+    /// `GuardedBody`). Nothing was executed.
+    ApprovalPending,
 }
 
 impl BodyError {
@@ -92,6 +97,7 @@ impl BodyError {
             BodyError::SessionExpired { .. } => "session_expired",
             BodyError::InvalidArgument { .. } => "invalid_argument",
             BodyError::ForbiddenWindow { .. } => "forbidden_window",
+            BodyError::ApprovalPending => "approval_pending",
         }
     }
 
@@ -137,6 +143,9 @@ impl BodyError {
             }
             BodyError::ForbiddenWindow { reason } => {
                 format!("active window is forbidden: {reason}")
+            }
+            BodyError::ApprovalPending => {
+                "an approval card is waiting: refusing input until the user decides".to_string()
             }
         }
     }

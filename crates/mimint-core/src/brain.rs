@@ -209,6 +209,21 @@ impl<'a> Brain<'a> {
                     ));
                 }
                 messages.push(reply);
+                // Every turn ends with a turn_end record — the
+                // cancellation and step-budget paths already audit
+                // one; the success path must too, or the trail
+                // cannot tell a finished turn from an interrupted
+                // one.
+                self.audit.log(
+                    &self.turn_id,
+                    "turn_end",
+                    None,
+                    Some("done"),
+                    json!({
+                        "steps": step + 1,
+                        "tools_used": tools_used.clone(),
+                    }),
+                )?;
                 return Ok(TurnOutcome {
                     text,
                     steps: step + 1,

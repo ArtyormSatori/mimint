@@ -129,6 +129,10 @@ pub struct UiApprover {
     stop_slot: Option<Arc<TokenSlot>>,
     turn_slot: Option<Arc<TokenSlot>>,
     repaint: Option<Arc<RepaintSignal>>,
+    /// Set while a card waits, cleared on every exit path. The
+    /// body guard shares this flag: input while it is set trips
+    /// the emergency stop (self-approval defense, D-FIX3-2).
+    pending_flag: Option<Arc<AtomicBool>>,
 }
 
 impl UiApprover {
@@ -139,6 +143,7 @@ impl UiApprover {
             stop_slot: None,
             turn_slot: None,
             repaint: None,
+            pending_flag: None,
         }
     }
 
@@ -155,6 +160,16 @@ impl UiApprover {
 
     pub fn with_repaint(mut self, repaint: Arc<RepaintSignal>) -> Self {
         self.repaint = Some(repaint);
+        self
+    }
+
+    /// Share the approval-pending flag with the body guard: the
+    /// SAME `Arc<AtomicBool>` the guard consults. While a card
+    /// waits, the flag is set; it clears when the request
+    /// resolves, on every path (allow/deny/timeout/cancelled/
+    /// disconnected).
+    pub fn with_pending_flag(mut self, flag: Arc<AtomicBool>) -> Self {
+        self.pending_flag = Some(flag);
         self
     }
 
@@ -193,6 +208,12 @@ impl Approver for UiApprover {
     }
 
     fn approve_request(&self, request: &ApprovalRequest) -> Result<ApprovalOutcome, MimintError> {
+        // Set the pending flag for the whole wait; the guard
+        // clears it on every exit path, including early errors.
+        let _pending = self
+            .pending_flag
+            .as_ref()
+            .map(|flag| PendingGuard::new(flag));
         let (reply_tx, reply_rx) = std::sync::mpsc::channel();
         let deadline = Instant::now() + self.timeout;
         let job = ApprovalJob {
@@ -237,6 +258,26 @@ impl Approver for UiApprover {
 
     fn label(&self) -> &'static str {
         "desktop approval card"
+    }
+}
+
+/// Sets the shared pending flag on creation, clears it on drop —
+/// so the flag is set for exactly the duration of one approval
+/// wait, on every exit path.
+struct PendingGuard<'a> {
+    flag: &'a AtomicBool,
+}
+
+impl<'a> PendingGuard<'a> {
+    fn new(flag: &'a AtomicBool) -> Self {
+        flag.store(true, Ordering::SeqCst);
+        Self { flag }
+    }
+}
+
+impl Drop for PendingGuard<'_> {
+    fn drop(&mut self) {
+        self.flag.store(false, Ordering::SeqCst);
     }
 }
 
@@ -369,5 +410,47 @@ mod tests {
             .unwrap()
             .expect_err("dropped reply must fail the approval");
         assert!(err.to_string().contains("disconnected"), "{err}");
+    }
+
+    #[test]
+    fn pending_flag_is_set_while_a_card_waits() {
+        let (tx, rx) = approval_channel();
+        let flag = Arc::new(AtomicBool::new(false));
+        let approver = UiApprover::new(tx).with_pending_flag(Arc::clone(&flag));
+        let flag_seen = Arc::clone(&flag);
+        let handle = thread::spawn(move || {
+            approver.approve_request(&ApprovalRequest {
+                id: 9,
+                tool: "body_click".to_string(),
+                args: json!({"x": 1, "y": 2}),
+            })
+        });
+        let job = rx.recv().unwrap();
+        // The job arrived: the wait is in progress, so the flag
+        // the body guard consults must be set RIGHT NOW.
+        assert!(flag_seen.load(Ordering::SeqCst));
+        job.reply.send(ApprovalDecision::Deny).unwrap();
+        let outcome = handle.join().unwrap().unwrap();
+        assert_eq!(outcome.decision, ApprovalDecision::Deny);
+        // Resolved: the flag clears.
+        assert!(!flag.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn pending_flag_clears_on_timeout() {
+        let (tx, _rx) = approval_channel();
+        let flag = Arc::new(AtomicBool::new(false));
+        let approver = UiApprover::new(tx)
+            .with_timeout(Duration::from_millis(50))
+            .with_pending_flag(Arc::clone(&flag));
+        let outcome = approver
+            .approve_request(&ApprovalRequest {
+                id: 10,
+                tool: "body_click".to_string(),
+                args: json!({"x": 1, "y": 2}),
+            })
+            .unwrap();
+        assert_eq!(outcome.decision, ApprovalDecision::Timeout);
+        assert!(!flag.load(Ordering::SeqCst));
     }
 }

@@ -106,6 +106,11 @@ pub struct ChatState {
     /// STOP NOW latch: set until the user actively resumes. Blocks
     /// new turns while set.
     pub stopped: bool,
+    /// The BODY's emergency stop tripped (hotkey or input while a
+    /// card waited). Unlike `stopped`, this does NOT clear on
+    /// resume: the body's flag latches until the app restarts.
+    /// Blocks new turns while set, same as `stopped`.
+    pub body_stopped: bool,
     /// A control/worker fault is showing (lamp Error state).
     pub control_error: bool,
     /// Last turn error, shown until the next submit.
@@ -129,7 +134,7 @@ impl ChatState {
     pub fn control_state(&self) -> ControlState {
         if self.control_error {
             ControlState::Error
-        } else if self.stopped {
+        } else if self.stopped || self.body_stopped {
             ControlState::Stopped
         } else if self.pending_approval.is_some() {
             ControlState::AwaitingApproval
@@ -146,7 +151,7 @@ impl ChatState {
     /// non-empty input, no turn running, no approval pending, not
     /// stopped. The input is cleared and a user message is appended.
     pub fn submit_input(&mut self) -> Option<String> {
-        if self.busy || self.pending_approval.is_some() || self.stopped {
+        if self.busy || self.pending_approval.is_some() || self.stopped || self.body_stopped {
             return None;
         }
         let prompt = self.input.trim().to_string();
@@ -286,7 +291,17 @@ impl ChatState {
         self.stop_requested = true;
     }
 
-    /// The user actively re-enables after STOP NOW.
+    /// The body's emergency stop tripped. Latches like STOP NOW,
+    /// but resume does NOT clear it: the body's flag only clears
+    /// on restart.
+    pub fn request_body_stop(&mut self) {
+        self.stopped = true;
+        self.body_stopped = true;
+    }
+
+    /// The user actively re-enables after STOP NOW. A body stop
+    /// is NOT cleared here: only a restart clears the body's
+    /// latched flag.
     pub fn resume(&mut self) {
         self.stopped = false;
         self.stop_requested = false;
@@ -385,6 +400,20 @@ mod tests {
         chat.resume();
         assert_eq!(chat.control_state(), ControlState::Idle);
         assert_eq!(chat.submit_input().as_deref(), Some("hi"));
+    }
+
+    #[test]
+    fn body_stop_latches_through_resume() {
+        let mut chat = ChatState::new();
+        chat.request_body_stop();
+        assert_eq!(chat.control_state(), ControlState::Stopped);
+        chat.input = "hi".to_string();
+        assert_eq!(chat.submit_input(), None);
+        // Resume clears the UI latch but NOT the body latch: the
+        // lamp stays Stopped and turns stay blocked until restart.
+        chat.resume();
+        assert_eq!(chat.control_state(), ControlState::Stopped);
+        assert_eq!(chat.submit_input(), None);
     }
 
     #[test]

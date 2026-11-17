@@ -2041,6 +2041,7 @@ dependencies = [
 name = "mimint-body"
 version = "0.1.0"
 dependencies = [
+ "ab_glyph",
  "core-foundation 0.10.1",
  "core-graphics 0.25.0",
  "ring",
@@ -2093,6 +2094,8 @@ version = "0.1.0"
 dependencies = [
  "eframe",
  "egui",
+ "mimint-body",
+ "mimint-control",
  "mimint-core",
  "serde_json",
  "tokio",

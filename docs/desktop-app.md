@@ -20,8 +20,20 @@ only `crates/mimint-ui/src/app.rs` touches eframe.
 ## Running
 
 ```sh
-cargo run -p mimint-ui --bin mimint-app -- [--config PATH] [--db PATH] [--audit PATH] [--max-steps N] [--degraded]
+cargo run -p mimint-ui --bin mimint-app -- [--config PATH] [--db PATH] [--audit PATH] [--max-steps N] [--degraded] [--body]
 ```
+
+`--body` (Phase 4, Linux/X11 only) wires the REAL body through
+the worker: the brain gets the `body_*` tools, guarded by the
+approval card, the self-exclusion zone (this window, published
+live every frame), the rate limits, the per-action timeout, and
+the global STOP hotkey (Ctrl+Alt+Shift+Escape). Without `--body`
+the brain cannot touch the screen: no body tools are registered
+at all. On non-Linux platforms `--body` fails at startup with a
+plain message instead of silently running without a body. See
+`docs/body-tools.md` for the full wiring and
+`docs/stop-and-approval.md` for the stop semantics (including
+why a body stop latches until restart).
 
 Config semantics match the CLI (see `docs/configuration.md`): an
 explicit `--config` is required, the default path is optional,
@@ -49,14 +61,19 @@ above the chat, approval card + status + input + mic + send below.
   connection is Phase 7 work.
 - **Control lamp (6 states)**: Chưa điều khiển thiết bị / Chờ xác
   nhận / Đang điều khiển / Đang dừng / Đã dừng / Lỗi — text +
-  icon, always visible. In Phase 3 no body-driving code exists,
-  so the lamp honestly shows "Chưa điều khiển thiết bị" until a
-  card waits (Chờ xác nhận) or the user stops (Đã dừng).
+  icon, always visible. Without `--body` no body-driving code
+  runs, so the lamp honestly shows "Chưa điều khiển thiết bị"
+  until a card waits (Chờ xác nhận) or the user stops (Đã dừng).
+  In `--body` mode a body stop (hotkey or input-while-card-waits)
+  also shows Đã dừng, with a message saying a restart is needed.
 - **DỪNG NGAY / Tiếp tục**: STOP is enabled while a turn runs, a
   card waits, or a session is active. It trips the latching stop
   token (see `docs/stop-and-approval.md`): new turns are blocked
   until the user presses "Tiếp tục". "Hủy lượt" cancels only the
-  running turn and is distinct from STOP.
+  running turn and is distinct from STOP. After a BODY stop the
+  "Tiếp tục" button is NOT shown — the body's flag latches until
+  restart, and offering resume would lie; the UI says to restart
+  instead.
 - **Backend picker + Privacy toggle**: switching to a known-remote
   backend asks first (a warning bar: the question would leave
   this machine). Tooltips describe the real behavior; no
@@ -139,7 +156,10 @@ always forces a 500ms repaint while a card is on screen.
   construction, so a rebuild is the only way to change it). A
   failed rebuild keeps the old chain. Every toggle writes a
   `privacy_mode` audit record before rebuilding; a failed audit
-  write fails the rebuild.
+  write fails the rebuild. In `--body` mode the rebuild ALSO
+  flips the body tools' Privacy flag and purges privacy-tainted
+  screenshot frames — even when the chain rebuild fails (see
+  `docs/body-tools.md`).
 - Worker durability: a panic inside a turn is caught, reported as
   a control fault, and the worker keeps serving — the UI never
   sticks on "thinking" because the worker died silently.

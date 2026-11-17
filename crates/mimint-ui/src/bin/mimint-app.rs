@@ -1,8 +1,14 @@
-//! `mimint-app`: the Mimint desktop app (Phase 3).
+//! `mimint-app`: the Mimint desktop app (Phase 3 UI, Phase 4 body).
 //!
 //! Usage:
 //!   mimint-app [--config PATH] [--db PATH] [--audit PATH]
-//!              [--max-steps N] [--degraded]
+//!              [--max-steps N] [--degraded] [--body]
+//!
+//! `--body` (Linux/X11 only) wires the real body through the
+//! worker: the brain gets the `body_*` tools, guarded by the
+//! approval card, the self-exclusion zone (this window), the
+//! rate limits, and the global STOP hotkey (Ctrl+Alt+Shift+
+//! Escape). Without `--body` the brain cannot touch the screen.
 //!
 //! Config semantics match the CLI: an explicit `--config` file is
 //! required, the default path is optional (absent means an empty
@@ -20,6 +26,7 @@
 //! - `MIMINT_UI_PIXELS_PER_POINT=<f>`: UI scale (demo gate
 //!   screenshots at 125%/150%).
 
+use mimint_body::ScreenRect;
 use mimint_core::{
     build_chain, default_config_path, default_vault, egress::url_is_loopback, load_config_file,
     probe_local_backends, suggestion_text, AuditLog, EgressPolicy, FileConfig, MimintError,
@@ -27,16 +34,17 @@ use mimint_core::{
 };
 use mimint_ui::app::{AppOptions, BackendInfo};
 use mimint_ui::approver::{approval_channel, RepaintSignal, TokenSlot, DEFAULT_APPROVAL_TIMEOUT};
-use mimint_ui::worker::{RebuildConfig, WorkerDeps};
+use mimint_ui::worker::{BodyStack, RebuildConfig, WorkerDeps};
 use mimint_ui::MimintApp;
 use serde_json::json;
 use std::env;
 use std::path::PathBuf;
 use std::process::exit;
-use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-const USAGE: &str = "mimint-app: the Mimint desktop app (Phase 3).\n\nUsage:\n  mimint-app [--config PATH] [--db PATH] [--audit PATH] [--max-steps N] [--degraded]\n\n  --config PATH     Config file (default: $XDG_CONFIG_HOME/mimint/config.toml or ~/.config/mimint/config.toml)\n  --db PATH         Notebook SQLite path (default: mimint.db)\n  --audit PATH      Audit JSONL path (default: mimint-audit.jsonl)\n  --max-steps N     Max brain steps per turn (default: 5)\n  --degraded        Static face + visible simple-mode label (weak machines)\n  --help            Show this help\n";
+const USAGE: &str = "mimint-app: the Mimint desktop app.\n\nUsage:\n  mimint-app [--config PATH] [--db PATH] [--audit PATH] [--max-steps N] [--degraded] [--body]\n\n  --config PATH     Config file (default: $XDG_CONFIG_HOME/mimint/config.toml or ~/.config/mimint/config.toml)\n  --db PATH         Notebook SQLite path (default: mimint.db)\n  --audit PATH      Audit JSONL path (default: mimint-audit.jsonl)\n  --max-steps N     Max brain steps per turn (default: 5)\n  --degraded        Static face + visible simple-mode label (weak machines)\n  --body            Wire the real body (Linux/X11 only): brain gets body_* tools + STOP hotkey\n  --help            Show this help\n";
 
 struct Args {
     config: Option<PathBuf>,
@@ -44,6 +52,7 @@ struct Args {
     audit: PathBuf,
     max_steps: usize,
     degraded: bool,
+    body: bool,
 }
 
 fn parse_args(argv: &[String]) -> Result<Args, String> {
@@ -52,6 +61,7 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
     let mut audit = PathBuf::from("mimint-audit.jsonl");
     let mut max_steps = 5usize;
     let mut degraded = false;
+    let mut body = false;
     let mut i = 1;
     while i < argv.len() {
         let arg = &argv[i];
@@ -78,6 +88,7 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
                 }
             }
             "--degraded" => degraded = true,
+            "--body" => body = true,
             other => return Err(format!("unknown argument: {other}\n{USAGE}")),
         }
         i += 1;
@@ -88,7 +99,47 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
         audit,
         max_steps,
         degraded,
+        body,
     })
+}
+
+/// What `--body` mode builds: the worker's body stack, the live
+/// exclusion list the app publishes to, and the approval-pending
+/// flag the approver sets and the guard consults.
+type BodyShares = (BodyStack, Arc<RwLock<Vec<ScreenRect>>>, Arc<AtomicBool>);
+
+/// Build the body stack for `--body` mode (Linux/X11 only): the
+/// X11 body behind the guards, sharing the stop flag, the
+/// approval-pending flag, and the live exclusion list with the
+/// UI. Returns the stack plus the two shares the app/worker need.
+#[cfg(target_os = "linux")]
+fn build_body_stack(privacy_on: bool) -> Result<BodyShares, MimintError> {
+    use mimint_body::{GuardedBody, RateLimits, StopFlag, X11Body};
+    use mimint_control::{BodyActor, FrameStore, PrivacyFlag};
+    let stop_flag = StopFlag::new();
+    let pending = Arc::new(AtomicBool::new(false));
+    let shared = Arc::new(RwLock::new(Vec::new()));
+    let body = X11Body::connect()
+        .map_err(|err| MimintError::Config(format!("cannot connect the X11 body: {err}")))?;
+    let guarded = GuardedBody::new(body, RateLimits::default())
+        .with_stop_flag(Arc::clone(&stop_flag))
+        .with_approval_pending(Arc::clone(&pending))
+        .with_shared_exclusion(Arc::clone(&shared));
+    let actor = BodyActor::spawn(Box::new(guarded), Arc::clone(&stop_flag));
+    let stack = BodyStack {
+        actor,
+        frames: Arc::new(FrameStore::new()),
+        privacy: PrivacyFlag::new(privacy_on),
+        stop_flag,
+    };
+    Ok((stack, shared, pending))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn build_body_stack(_privacy_on: bool) -> Result<BodyShares, MimintError> {
+    Err(MimintError::Config(
+        "--body is only available on Linux (X11) in this build: no real body exists for this platform yet".to_string(),
+    ))
 }
 
 fn main() {
@@ -168,6 +219,28 @@ fn run() -> Result<(), MimintError> {
         })
         .collect();
 
+    // `--body`: build the real body stack before the worker
+    // starts, so the worker registers the body tools and the app
+    // shares the exclusion list + pending flag with the guard.
+    let (body_stack, shared_exclusion, approval_pending) = if args.body {
+        let (stack, shared, pending) = build_body_stack(privacy_on)?;
+        (Some(stack), Some(shared), Some(pending))
+    } else {
+        (None, None, None)
+    };
+    // Global STOP hotkey (Linux/X11 only): kept alive for the
+    // whole run; dropping it ungrabs the key and joins the
+    // listener thread.
+    #[cfg(target_os = "linux")]
+    let _hotkey_listener = match &body_stack {
+        Some(stack) => Some(
+            mimint_body::HotkeyListener::start(Arc::clone(&stack.stop_flag)).map_err(|err| {
+                MimintError::Config(format!("cannot start the STOP hotkey listener: {err}"))
+            })?,
+        ),
+        None => None,
+    };
+
     let (approval_tx, approval_rx) = approval_channel();
     let approval_timeout = env::var("MIMINT_APPROVAL_TIMEOUT_SECS")
         .ok()
@@ -191,6 +264,8 @@ fn run() -> Result<(), MimintError> {
         turn_slot: TokenSlot::new(),
         repaint: Arc::clone(&repaint),
         approval_timeout,
+        body: body_stack,
+        approval_pending,
     };
     let worker = mimint_ui::worker::spawn_worker(deps);
 
@@ -207,6 +282,7 @@ fn run() -> Result<(), MimintError> {
         event_log: env::var("MIMINT_UI_EVENT_LOG").ok().map(PathBuf::from),
         onboarding_text,
         repaint,
+        shared_exclusion,
     };
     let app = MimintApp::new(worker, approval_rx, options);
     let pixels_per_point = env::var("MIMINT_UI_PIXELS_PER_POINT")

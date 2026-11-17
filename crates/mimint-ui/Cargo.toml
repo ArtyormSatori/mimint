@@ -8,5 +8,9 @@ description = "Mimint desktop app: ball avatar + chat UI over the Phase 1/2 brai
 eframe = "=0.37.0"
 egui = "=0.37.0"
 mimint-core = { path = "../mimint-core" }
+# Phase 4: the safety gate binary drives the body tools through
+# the brain (path deps only: 0 new third-party packages).
+mimint-body = { path = "../mimint-body" }
+mimint-control = { path = "../mimint-control" }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread"] }

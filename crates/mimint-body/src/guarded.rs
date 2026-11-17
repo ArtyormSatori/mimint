@@ -28,18 +28,21 @@
 //! work; the wrapper exists now so the CLI and harness paths — the
 //! ones that bypass the brain — are already guarded.
 //!
-//! Wiring note: the approval-pending flag is shared with the UI only
-//! in Phase 4 (no body tool exists in Phase 3, so nothing wires the
-//! real card state yet). The mechanism — flag in, latch out — is
-//! implemented and tested here; the wiring is a one-line share of
-//! the same `Arc<AtomicBool>` when the body tool lands.
+//! Wiring (Phase 4): the approval-pending flag is the SAME
+//! `Arc<AtomicBool>` the `UiApprover` in `mimint-ui` sets while a
+//! card waits, and the shared exclusion list is the
+//! SAME `Arc<RwLock<Vec<ScreenRect>>>` the app updates every frame
+//! from its window rectangle — so the guard always sees the live
+//! app window, not a stale copy. Both shares are one-line
+//! `with_*` calls; the mechanism — flag in, latch out — is
+//! implemented and tested here.
 
 use crate::action::Key;
 use crate::body::{Body, Framebuffer, FramebufferPool, Permissions, ScreenRect};
 use crate::error::BodyError;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 /// A shared, latching stop flag. The UI (Phase 4) and the wrapper
@@ -156,6 +159,10 @@ pub struct GuardedBody<B: Body> {
     repeat_count: usize,
     stop_flag: Option<Arc<StopFlag>>,
     approval_pending: Option<Arc<AtomicBool>>,
+    /// Live exclusion list shared with the UI thread (the app
+    /// window rectangle, updated every frame). Consulted by
+    /// `check_target` alongside the owned list.
+    shared_excluded: Option<Arc<RwLock<Vec<ScreenRect>>>>,
 }
 
 impl<B: Body> GuardedBody<B> {
@@ -170,6 +177,7 @@ impl<B: Body> GuardedBody<B> {
             repeat_count: 0,
             stop_flag: None,
             approval_pending: None,
+            shared_excluded: None,
         }
     }
 
@@ -186,6 +194,18 @@ impl<B: Body> GuardedBody<B> {
     /// is also shared) and is refused.
     pub fn with_approval_pending(mut self, flag: Arc<AtomicBool>) -> Self {
         self.approval_pending = Some(flag);
+        self
+    }
+
+    /// Share the live exclusion list: the UI thread writes the app
+    /// window rectangle here every frame, and `check_target`
+    /// refuses points inside it. A poisoned lock fails open to the
+    /// owned list only (the lock is only ever written by the UI
+    /// thread with a plain rectangle, so poisoning means the UI
+    /// thread panicked while holding it — and then the app is
+    /// already going down).
+    pub fn with_shared_exclusion(mut self, rects: Arc<RwLock<Vec<ScreenRect>>>) -> Self {
+        self.shared_excluded = Some(rects);
         self
     }
 
@@ -224,11 +244,7 @@ impl<B: Body> GuardedBody<B> {
         }
         if consequential && self.approval_is_pending() {
             self.trip_stop();
-            return Err(BodyError::ForbiddenTarget {
-                x: -1,
-                y: -1,
-                reason: "an approval card is waiting for a human decision; body input is refused and the session is stopped".to_string(),
-            });
+            return Err(BodyError::ApprovalPending);
         }
         if self.actions_in_session >= self.limits.max_per_session {
             return Err(BodyError::RateLimited {
@@ -358,6 +374,41 @@ impl<B: Body> Body for GuardedBody<B> {
 
     fn permissions(&mut self) -> Permissions {
         self.inner.permissions()
+    }
+
+    fn check_target(&self, x: i32, y: i32) -> Result<(), BodyError> {
+        // Owned list: the same rule as the trait default.
+        for rect in &self.excluded {
+            if rect.contains(x, y) {
+                return Err(BodyError::ForbiddenTarget {
+                    x,
+                    y,
+                    reason: format!(
+                        "point lies inside excluded rectangle ({}, {}) {}x{}",
+                        rect.x, rect.y, rect.width, rect.height
+                    ),
+                });
+            }
+        }
+        // Shared live list (the app window): refused with the
+        // same typed error, naming the shared zone.
+        if let Some(shared) = &self.shared_excluded {
+            if let Ok(rects) = shared.read() {
+                for rect in rects.iter() {
+                    if rect.contains(x, y) {
+                        return Err(BodyError::ForbiddenTarget {
+                            x,
+                            y,
+                            reason: format!(
+                                "point lies inside the shared exclusion zone ({}, {}) {}x{}",
+                                rect.x, rect.y, rect.width, rect.height
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     fn excluded_rects(&self) -> &[ScreenRect] {
@@ -515,13 +566,37 @@ mod tests {
         // Screenshots do not trip: reading is not self-approval.
         assert!(body.screenshot().is_ok());
         assert!(!flag.is_tripped());
-        // Input while a card waits trips the latch and is refused.
+        // Input while a card waits trips the latch and is refused
+        // with the typed approval-pending error (not a fake
+        // forbidden rect: the refusal is about the waiting card).
         let err = body.click(100, 100).unwrap_err();
-        assert_eq!(err.code(), "forbidden_target");
+        assert_eq!(err.code(), "approval_pending");
         assert!(flag.is_tripped());
         // The latch holds even after the card clears.
         pending.store(false, Ordering::SeqCst);
         assert_eq!(body.click(100, 100).unwrap_err().code(), "stopped");
         assert!(body.into_inner().events().is_empty());
+    }
+
+    #[test]
+    fn shared_exclusion_zone_is_live() {
+        let shared = Arc::new(RwLock::new(Vec::new()));
+        let mut body = guarded(RateLimits::default()).with_shared_exclusion(Arc::clone(&shared));
+        // Empty shared list: clicks pass the guard.
+        assert!(body.click(100, 100).is_ok());
+        // The UI thread writes the app window rect: the same
+        // point is now refused, with no guard rebuild.
+        shared
+            .write()
+            .unwrap()
+            .push(ScreenRect::new(50, 50, 200, 200));
+        let err = body.click(100, 100).unwrap_err();
+        assert_eq!(err.code(), "forbidden_target");
+        assert!(err.message().contains("shared exclusion zone"));
+        // Outside the shared rect still works.
+        assert!(body.click(400, 400).is_ok());
+        // The UI thread clears the list: the point works again.
+        shared.write().unwrap().clear();
+        assert!(body.click(100, 100).is_ok());
     }
 }
