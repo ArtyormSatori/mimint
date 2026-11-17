@@ -96,8 +96,22 @@ verifications, reflections, Privacy Mode state, provider attempts
 and failures. Audit writes FAIL CLOSED: a record that cannot be
 written fails the turn, the guard decision, or the provider
 attempt it belongs to. Nothing runs unrecorded. Key values never
-appear in the audit log. (Hash-chaining of records is planned for
-Phase 8.)
+appear in the audit log. Framebuffer/pixel data NEVER appears in
+the audit log either: `Framebuffer` deliberately has no
+`Serialize` impl (any attempt to serialize one fails to compile),
+the bodyctl audit-line shape is pinned by a test that forbids
+content/pixel fields, and the fix-pass evidence includes a grep
+gate over real audit output. (Hash-chaining of records is planned
+for Phase 8.)
+
+### Screenshot taint / purge (Phase 4 requirement)
+
+Phase 3 has no path that puts a screenshot into brain context, so
+there is nothing to taint yet (verified by grep across
+`mimint-core`, `mimint-ui`, and `mimint-cli`). When Phase 4 adds
+the body tool, screenshots entering context MUST be taint-tracked
+and purged when Privacy Mode changes. This requirement is
+recorded here and in `docs/body-aci.md` so it cannot be forgotten.
 
 ## Migrating from Phase 1
 

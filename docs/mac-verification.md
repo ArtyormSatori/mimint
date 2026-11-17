@@ -17,9 +17,11 @@ this file is the status record.
   `rusqlite-bundled` build scripts invoke the host C compiler with
   macOS flags, and no macOS SDK / cross C toolchain exists on
   vega).
-- The X11 reference body passes the same 8-check conformance suite
-  the macOS body will face (8/8, twice, under Xvfb), so the suite
-  itself is proven against a real body + real target.
+- The X11 reference body passes the same 11-check conformance
+  suite the macOS body will face (11/11 + guarded 2/2, twice,
+  under Xvfb+xfwm4), so the suite itself is proven against a real
+  body + real target. The mock body additionally passes at scale
+  2 with a non-zero origin and the P1 permission-denial check.
 
 ## Blocked: waiting for the real Mac
 
