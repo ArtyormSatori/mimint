@@ -26,6 +26,12 @@ path = "src/bin/testwin.rs"
 
 [dependencies]
 serde_json = "1"
+# Android protocol v2 (P4.3): all already in the workspace
+# lockfile via reqwest — 0 new packages. `ring` is the TLS
+# crypto provider and the SHA-256 source for cert pinning.
+ring = "0.17"
+rustls = { version = "0.23", default-features = false, features = ["ring", "tls12", "std"] }
+rustls-pki-types = "1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 x11rb = { version = "0.13", features = ["xtest"] }

@@ -19,6 +19,7 @@
 //!   rate limits, stop latch, focus delegation).
 
 pub mod action;
+pub mod android;
 pub mod body;
 pub mod captures;
 pub mod conformance;
@@ -30,12 +31,17 @@ pub mod hotkey;
 #[cfg(target_os = "macos")]
 pub mod macos;
 pub mod mock;
+pub mod wayland;
 #[cfg(target_os = "windows")]
 pub mod windows;
 #[cfg(target_os = "linux")]
 pub mod x11;
 
 pub use action::{action_specs, Action, ActionSpec, Key, MAX_HOLD_MILLIS};
+pub use android::{
+    fingerprint_of_cert_der, AndroidBody, AndroidConfig, FakeAndroidOracle, FakeAndroidServer,
+    FakeServerConfig, ProtocolClient, Role, TlsMode, PROTOCOL_VERSION,
+};
 pub use body::{
     write_ppm, ActOutcome, Body, Framebuffer, FramebufferPool, PermissionState, Permissions,
     PoolStats, ScreenRect,
@@ -57,6 +63,10 @@ pub use hotkey::{chord_matches, grab_modifier_combinations, CHORD_MODIFIERS};
 #[cfg(target_os = "macos")]
 pub use macos::MacOsBody;
 pub use mock::{Fault, MockBody, MockEvent, MockOracle};
+pub use wayland::{
+    MockPortal, PortalClient, PortalSession, SessionKinds, SessionTokenStore, WaylandBody,
+    WaylandOracle,
+};
 #[cfg(target_os = "windows")]
 pub use windows::WindowsBody;
 #[cfg(target_os = "linux")]

@@ -73,7 +73,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, MAPVK_VK_TO_VSC, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL,
     MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN,
     MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL, MOUSEINPUT, MOUSE_EVENT_FLAGS, VIRTUAL_KEY, VK_BACK,
-    VK_DELETE, VK_DOWN, VK_ESCAPE, VK_F5, VK_LEFT, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_TAB, VK_UP,
+    VK_DELETE, VK_DOWN, VK_ESCAPE, VK_F5, VK_LEFT, VK_RETURN, VK_RIGHT, VK_SPACE, VK_TAB, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     GetClassNameW, GetForegroundWindow, GetSystemMetrics, GetWindowThreadProcessId,
@@ -225,12 +225,12 @@ fn virtual_key_for(key: Key) -> VIRTUAL_KEY {
         Key::Escape => VK_ESCAPE,
         Key::Backspace => VK_BACK,
         Key::Delete => VK_DELETE,
-        Key::Left => VK_LEFT,
-        Key::Up => VK_UP,
-        Key::Right => VK_RIGHT,
-        Key::Down => VK_DOWN,
+        Key::ArrowUp => VK_UP,
+        Key::ArrowDown => VK_DOWN,
+        Key::ArrowLeft => VK_LEFT,
+        Key::ArrowRight => VK_RIGHT,
+        Key::Space => VK_SPACE,
         Key::F5 => VK_F5,
-        Key::Shift => VK_SHIFT,
     }
 }
 
