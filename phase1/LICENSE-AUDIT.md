@@ -1,5 +1,10 @@
 # Mimint Phase 1 — License Audit
 
+> SUPERSEDED: this file covers the Phase 1 dependency tree only (146
+> packages). The authoritative license audit for the current tree is
+> `phase2/LICENSE-AUDIT.md` (156 packages, Phase 2). This file is kept
+> as a historical record; do not treat it as the source of truth.
+
 Source: `cargo metadata --format-version 1` run on vega against the
 workspace `Cargo.lock` (Rust 1.98.1), 2026-11-17. Every package in the
 resolve is listed below with its declared `license` field exactly as
