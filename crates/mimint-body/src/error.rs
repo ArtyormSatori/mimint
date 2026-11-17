@@ -44,10 +44,11 @@ pub enum BodyError {
         actual: Option<u64>,
     },
     /// Windows UIPI: the target window runs at a higher integrity
-    /// level, so injected input would be silently dropped. No
-    /// Windows body exists yet (Phase 4+); the variant exists so the
-    /// failure mode has a typed name in the contract and the docs,
-    /// instead of becoming a silent success.
+    /// level, so injected input would be silently dropped. The
+    /// Phase 4 `WindowsBody` probes the target's integrity level
+    /// before input and returns this instead of a silent success;
+    /// no Windows run has verified the probe yet (see
+    /// `windows-verify/`).
     UipiBlocked { target: String },
     /// A rate limit refused the action (session cap, per-minute cap,
     /// or repeated-action detection). Nothing was executed.
@@ -55,6 +56,23 @@ pub enum BodyError {
     /// The body was stopped (emergency stop latched). Nothing starts
     /// after a stop until the stop is explicitly cleared.
     Stopped,
+    /// The platform session behind the body expired (for example a
+    /// Wayland portal session closed by the compositor). The caller
+    /// must restore or re-create the session before acting again;
+    /// retrying the same action against the dead session cannot
+    /// succeed.
+    SessionExpired { reason: String },
+    /// The action's arguments are invalid for this body (for
+    /// example a key-hold duration outside the supported range).
+    /// Nothing was executed.
+    InvalidArgument { reason: String },
+    /// The active window is on the forbidden list (password
+    /// manager, authentication dialog, banking app, OS permission
+    /// prompt, payment flow — see `forbidden.rs`). Unlike
+    /// [`BodyError::ForbiddenTarget`], this refusal is about the
+    /// window, not a point, so it carries no coordinates. Nothing
+    /// was executed.
+    ForbiddenWindow { reason: String },
 }
 
 impl BodyError {
@@ -71,6 +89,9 @@ impl BodyError {
             BodyError::UipiBlocked { .. } => "uipi_blocked",
             BodyError::RateLimited { .. } => "rate_limited",
             BodyError::Stopped => "stopped",
+            BodyError::SessionExpired { .. } => "session_expired",
+            BodyError::InvalidArgument { .. } => "invalid_argument",
+            BodyError::ForbiddenWindow { .. } => "forbidden_window",
         }
     }
 
@@ -107,6 +128,15 @@ impl BodyError {
             }
             BodyError::Stopped => {
                 "body stopped: no action starts after an emergency stop".to_string()
+            }
+            BodyError::SessionExpired { reason } => {
+                format!("body session expired: {reason}")
+            }
+            BodyError::InvalidArgument { reason } => {
+                format!("invalid action argument: {reason}")
+            }
+            BodyError::ForbiddenWindow { reason } => {
+                format!("active window is forbidden: {reason}")
             }
         }
     }

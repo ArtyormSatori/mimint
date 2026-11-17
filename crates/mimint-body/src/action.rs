@@ -102,6 +102,34 @@ pub enum Action {
     TypeText { text: String },
     /// Press and release one special (physical) key.
     Key { key: Key },
+    /// Scroll the wheel at (x, y). `dx`/`dy` are wheel notches
+    /// (detents): `dy > 0` scrolls down, `dy < 0` scrolls up,
+    /// `dx > 0` scrolls right, `dx < 0` scrolls left. (0, 0) is a
+    /// no-op that still validates the point. Notches — not pixels
+    /// or lines — are the portable unit: every platform reports
+    /// wheel input in detents, and the target decides how far one
+    /// detent moves.
+    Scroll { x: i32, y: i32, dx: i32, dy: i32 },
+    /// Press the primary button at (from_x, from_y), move to
+    /// (to_x, to_y) with the button held, release. Both endpoints
+    /// are validated like a click.
+    Drag {
+        from_x: i32,
+        from_y: i32,
+        to_x: i32,
+        to_y: i32,
+    },
+    /// Two primary-button clicks at (x, y) in quick succession, as
+    /// one action (the target must observe a double-click, not two
+    /// unrelated clicks).
+    DoubleClick { x: i32, y: i32 },
+    /// One secondary-button (right) click at (x, y).
+    RightClick { x: i32, y: i32 },
+    /// Hold one special (physical) key down for `millis`
+    /// milliseconds, then release. `millis` must be 1..=5000: a
+    /// longer hold is refused before anything happens (a stuck
+    /// modifier must be a caller error, not a body behavior).
+    HoldKey { key: Key, millis: u32 },
 }
 
 impl Action {
@@ -113,9 +141,18 @@ impl Action {
             Action::Move { .. } => "move",
             Action::TypeText { .. } => "type_text",
             Action::Key { .. } => "key",
+            Action::Scroll { .. } => "scroll",
+            Action::Drag { .. } => "drag",
+            Action::DoubleClick { .. } => "double_click",
+            Action::RightClick { .. } => "right_click",
+            Action::HoldKey { .. } => "hold_key",
         }
     }
 }
+
+/// Maximum key-hold duration in milliseconds. Holds longer than
+/// this are refused with [`crate::BodyError::InvalidArgument`].
+pub const MAX_HOLD_MILLIS: u32 = 5000;
 
 /// Machine-readable description of one action, generated from code.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -196,6 +233,78 @@ pub fn action_specs() -> Vec<ActionSpec> {
                 "additionalProperties": false,
             }),
         },
+        ActionSpec {
+            name: "scroll",
+            description: "Scroll the wheel at framebuffer-pixel coordinates (x, y). dx/dy are wheel notches: dy > 0 scrolls down, dy < 0 up, dx > 0 right, dx < 0 left.",
+            params_schema: json!({
+                "type": "object",
+                "properties": {
+                    "x": { "type": "integer" },
+                    "y": { "type": "integer" },
+                    "dx": { "type": "integer", "description": "Horizontal wheel notches (positive = right)." },
+                    "dy": { "type": "integer", "description": "Vertical wheel notches (positive = down)." },
+                },
+                "required": ["x", "y", "dx", "dy"],
+                "additionalProperties": false,
+            }),
+        },
+        ActionSpec {
+            name: "drag",
+            description: "Press the primary button at (from_x, from_y), move to (to_x, to_y) with the button held, then release. Coordinates are framebuffer pixels.",
+            params_schema: json!({
+                "type": "object",
+                "properties": {
+                    "from_x": { "type": "integer" },
+                    "from_y": { "type": "integer" },
+                    "to_x": { "type": "integer" },
+                    "to_y": { "type": "integer" },
+                },
+                "required": ["from_x", "from_y", "to_x", "to_y"],
+                "additionalProperties": false,
+            }),
+        },
+        ActionSpec {
+            name: "double_click",
+            description: "Double-click the primary button at framebuffer-pixel coordinates (x, y): two clicks in quick succession, as one action.",
+            params_schema: json!({
+                "type": "object",
+                "properties": {
+                    "x": { "type": "integer" },
+                    "y": { "type": "integer" },
+                },
+                "required": ["x", "y"],
+                "additionalProperties": false,
+            }),
+        },
+        ActionSpec {
+            name: "right_click",
+            description: "Click the secondary (right) button at framebuffer-pixel coordinates (x, y).",
+            params_schema: json!({
+                "type": "object",
+                "properties": {
+                    "x": { "type": "integer" },
+                    "y": { "type": "integer" },
+                },
+                "required": ["x", "y"],
+                "additionalProperties": false,
+            }),
+        },
+        ActionSpec {
+            name: "hold_key",
+            description: "Hold one special (physical) key down for millis milliseconds, then release. millis must be between 1 and 5000.",
+            params_schema: json!({
+                "type": "object",
+                "properties": {
+                    "key": {
+                        "type": "string",
+                        "enum": Key::all().iter().map(|k| k.name()).collect::<Vec<_>>(),
+                    },
+                    "millis": { "type": "integer", "minimum": 1, "maximum": 5000 },
+                },
+                "required": ["key", "millis"],
+                "additionalProperties": false,
+            }),
+        },
     ]
 }
 
@@ -214,6 +323,24 @@ mod tests {
                 text: String::new(),
             },
             Action::Key { key: Key::Enter },
+            Action::Scroll {
+                x: 0,
+                y: 0,
+                dx: 0,
+                dy: 0,
+            },
+            Action::Drag {
+                from_x: 0,
+                from_y: 0,
+                to_x: 0,
+                to_y: 0,
+            },
+            Action::DoubleClick { x: 0, y: 0 },
+            Action::RightClick { x: 0, y: 0 },
+            Action::HoldKey {
+                key: Key::Enter,
+                millis: 100,
+            },
         ];
         assert_eq!(
             specs.len(),

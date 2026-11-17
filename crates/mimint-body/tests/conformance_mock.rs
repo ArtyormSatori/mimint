@@ -23,7 +23,7 @@ fn suite_passes_on_healthy_mock() {
     let mut oracle = body.oracle();
     let report = run_suite(&mut body, &mut oracle);
     assert!(report.passed, "report:\n{}", report.render());
-    assert_eq!(report.checks.len(), 11);
+    assert_eq!(report.checks.len(), 16);
 }
 
 #[test]
@@ -54,9 +54,12 @@ fn suite_fails_input_checks_on_drop_input_mock() {
     let report = run_suite(&mut body, &mut oracle);
     assert!(!report.passed);
     // C3 (no clicks arrive), C4 (no text), C5 (no keys), C11 (no
-    // Unicode text). C7 still passes: dispatch itself works, the
-    // mock just drops the input.
-    assert_eq!(failed_ids(&report), vec!["C3", "C4", "C5", "C11"]);
+    // Unicode text), C12-C16 (no new-action events). C7 still
+    // passes: dispatch itself works, the mock just drops the input.
+    assert_eq!(
+        failed_ids(&report),
+        vec!["C3", "C4", "C5", "C11", "C12", "C13", "C14", "C15", "C16"]
+    );
 }
 
 #[test]
@@ -67,11 +70,12 @@ fn report_render_is_stable_and_complete() {
     let text = report.render();
     assert!(text.contains("conformance body=mock"));
     for id in [
-        "C1", "C2", "C3", "C4", "C5", "C6", "C7", "C8", "C9", "C10", "C11",
+        "C1", "C2", "C3", "C4", "C5", "C6", "C7", "C8", "C9", "C10", "C11", "C12", "C13", "C14",
+        "C15", "C16",
     ] {
         assert!(text.contains(id), "missing {id} in:\n{text}");
     }
-    assert!(text.contains("conformance PASS: 11/11"));
+    assert!(text.contains("conformance PASS: 16/16"));
 }
 
 #[test]

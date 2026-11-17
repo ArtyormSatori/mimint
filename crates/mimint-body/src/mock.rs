@@ -14,10 +14,11 @@
 //! transform records OS coordinates and fails the accuracy check —
 //! exactly the Retina bug the contract exists to prevent.
 
-use crate::action::Key;
-use crate::body::{Body, Framebuffer, PermissionState, Permissions, ScreenRect};
+use crate::action::{Key, MAX_HOLD_MILLIS};
+use crate::body::{Body, Framebuffer, FramebufferPool, PermissionState, Permissions, ScreenRect};
 use crate::conformance::TargetOracle;
 use crate::error::BodyError;
+use crate::forbidden::check_forbidden_window;
 use std::sync::{Arc, Mutex};
 
 /// Events a target window would observe, in order.
@@ -34,6 +35,30 @@ pub enum MockEvent {
     /// One typed character. Enter and Tab arrive as '\n' and '\t'.
     Char(char),
     Key(Key),
+    Scroll {
+        x: i32,
+        y: i32,
+        dx: i32,
+        dy: i32,
+    },
+    Drag {
+        from_x: i32,
+        from_y: i32,
+        to_x: i32,
+        to_y: i32,
+    },
+    DoubleClick {
+        x: i32,
+        y: i32,
+    },
+    RightClick {
+        x: i32,
+        y: i32,
+    },
+    Hold {
+        key: Key,
+        millis: u32,
+    },
 }
 
 /// A fault injected into a mock body, to prove the conformance suite
@@ -70,6 +95,9 @@ struct MockState {
     focus_window: u64,
     expected_focus: Option<u64>,
     max_capture_dimension: Option<u32>,
+    /// Fake active-window identity for the forbidden-window policy
+    /// (P4.6.1): (class, title). `None` means undeterminable.
+    active_window: Option<(Option<String>, Option<String>)>,
 }
 
 /// Deterministic in-memory body. Default display is 800x600 at scale
@@ -78,6 +106,7 @@ struct MockState {
 #[derive(Debug)]
 pub struct MockBody {
     state: Arc<Mutex<MockState>>,
+    pool: FramebufferPool,
 }
 
 /// The target side of a [`MockBody`]: observes what the body did.
@@ -106,7 +135,9 @@ impl MockBody {
                 focus_window: 1,
                 expected_focus: None,
                 max_capture_dimension: None,
+                active_window: None,
             })),
+            pool: FramebufferPool::new(),
         }
     }
 
@@ -142,6 +173,13 @@ impl MockBody {
         body
     }
 
+    /// Set the fake active-window identity the forbidden-window
+    /// policy sees. Pass `None` for a field that is undeterminable.
+    pub fn set_active_window(&self, class: Option<&str>, title: Option<&str>) {
+        lock_state(&self.state).active_window =
+            Some((class.map(str::to_string), title.map(str::to_string)));
+    }
+
     /// The oracle sharing this body's state.
     pub fn oracle(&self) -> MockOracle {
         MockOracle {
@@ -165,8 +203,12 @@ impl MockBody {
     /// variants always differ in the rectangle's pixels. Variant 3
     /// is the pixel-pattern oracle pattern: four quadrants (red /
     /// green / blue / yellow), matching the test targets.
-    fn pixels(width: u32, height: u32, variant: u8) -> Vec<u8> {
-        let mut data = Vec::with_capacity(width as usize * height as usize * 4);
+    ///
+    /// Fills `data` (which must already be exactly
+    /// `width * height * 4` bytes, e.g. from the framebuffer pool)
+    /// instead of allocating: the mock captures through the same
+    /// pool discipline as the real bodies.
+    fn fill_pixels(data: &mut [u8], width: u32, height: u32, variant: u8) {
         // Rectangle color per variant: distinct, far apart.
         let rect = match variant % 3 {
             0 => (200u8, 40u8, 40u8),
@@ -193,10 +235,10 @@ impl MockBody {
                         ((x % 251) as u8, (y % 251) as u8, ((x + y) % 251) as u8)
                     }
                 };
-                data.extend_from_slice(&[r, g, b, 255]);
+                let idx = (y as usize * width as usize + x as usize) * 4;
+                data[idx..idx + 4].copy_from_slice(&[r, g, b, 255]);
             }
         }
-        data
     }
 
     fn check_bounds(&self, x: i32, y: i32) -> Result<(), BodyError> {
@@ -221,6 +263,14 @@ impl MockBody {
             });
         }
         Ok(())
+    }
+
+    fn check_forbidden(&self) -> Result<(), BodyError> {
+        let active = lock_state(&self.state).active_window.clone();
+        match active {
+            Some((class, title)) => check_forbidden_window(class.as_deref(), title.as_deref()),
+            None => Ok(()),
+        }
     }
 
     /// Simulate the body's internal coordinate conversion:
@@ -279,13 +329,9 @@ impl Body for MockBody {
                 variant,
             )
         };
-        let frame = Framebuffer::with_geometry(
-            width,
-            height,
-            Self::pixels(width, height, variant),
-            scale,
-            origin,
-        )?;
+        let mut buffer = self.pool.acquire(width as usize * height as usize * 4);
+        Self::fill_pixels(&mut buffer, width, height, variant);
+        let frame = Framebuffer::with_geometry(width, height, buffer, scale, origin)?;
         Ok(match max_dim {
             Some(max) => frame.downscale(max),
             None => frame,
@@ -296,6 +342,7 @@ impl Body for MockBody {
         self.check_bounds(x, y)?;
         self.check_target(x, y)?;
         self.check_input_permission()?;
+        self.check_forbidden()?;
         self.verify_focus()?;
         let state = lock_state(&self.state);
         if state.fault == Some(Fault::DropInput) {
@@ -317,6 +364,7 @@ impl Body for MockBody {
         self.check_bounds(x, y)?;
         self.check_target(x, y)?;
         self.check_input_permission()?;
+        self.check_forbidden()?;
         let mut state = lock_state(&self.state);
         if state.fault == Some(Fault::DropInput) {
             return Ok(());
@@ -327,6 +375,7 @@ impl Body for MockBody {
 
     fn type_text(&mut self, text: &str) -> Result<(), BodyError> {
         self.check_input_permission()?;
+        self.check_forbidden()?;
         self.verify_focus()?;
         let mut state = lock_state(&self.state);
         if state.fault == Some(Fault::DropInput) {
@@ -340,6 +389,7 @@ impl Body for MockBody {
 
     fn key(&mut self, key: Key) -> Result<(), BodyError> {
         self.check_input_permission()?;
+        self.check_forbidden()?;
         self.verify_focus()?;
         let mut state = lock_state(&self.state);
         if state.fault == Some(Fault::DropInput) {
@@ -353,6 +403,86 @@ impl Body for MockBody {
             _ => {}
         }
         state.events.push(MockEvent::Key(key));
+        Ok(())
+    }
+
+    fn scroll(&mut self, x: i32, y: i32, dx: i32, dy: i32) -> Result<(), BodyError> {
+        self.check_bounds(x, y)?;
+        self.check_target(x, y)?;
+        self.check_input_permission()?;
+        self.check_forbidden()?;
+        self.verify_focus()?;
+        let mut state = lock_state(&self.state);
+        if state.fault == Some(Fault::DropInput) {
+            return Ok(());
+        }
+        state.events.push(MockEvent::Scroll { x, y, dx, dy });
+        Ok(())
+    }
+
+    fn drag(&mut self, from_x: i32, from_y: i32, to_x: i32, to_y: i32) -> Result<(), BodyError> {
+        self.check_bounds(from_x, from_y)?;
+        self.check_bounds(to_x, to_y)?;
+        self.check_target(from_x, from_y)?;
+        self.check_target(to_x, to_y)?;
+        self.check_input_permission()?;
+        self.check_forbidden()?;
+        self.verify_focus()?;
+        let mut state = lock_state(&self.state);
+        if state.fault == Some(Fault::DropInput) {
+            return Ok(());
+        }
+        state.events.push(MockEvent::Drag {
+            from_x,
+            from_y,
+            to_x,
+            to_y,
+        });
+        Ok(())
+    }
+
+    fn double_click(&mut self, x: i32, y: i32) -> Result<(), BodyError> {
+        self.check_bounds(x, y)?;
+        self.check_target(x, y)?;
+        self.check_input_permission()?;
+        self.check_forbidden()?;
+        self.verify_focus()?;
+        let mut state = lock_state(&self.state);
+        if state.fault == Some(Fault::DropInput) {
+            return Ok(());
+        }
+        state.events.push(MockEvent::DoubleClick { x, y });
+        Ok(())
+    }
+
+    fn right_click(&mut self, x: i32, y: i32) -> Result<(), BodyError> {
+        self.check_bounds(x, y)?;
+        self.check_target(x, y)?;
+        self.check_input_permission()?;
+        self.check_forbidden()?;
+        self.verify_focus()?;
+        let mut state = lock_state(&self.state);
+        if state.fault == Some(Fault::DropInput) {
+            return Ok(());
+        }
+        state.events.push(MockEvent::RightClick { x, y });
+        Ok(())
+    }
+
+    fn hold_key(&mut self, key: Key, millis: u32) -> Result<(), BodyError> {
+        if millis == 0 || millis > MAX_HOLD_MILLIS {
+            return Err(BodyError::InvalidArgument {
+                reason: format!("hold duration must be 1..={MAX_HOLD_MILLIS} ms, got {millis}"),
+            });
+        }
+        self.check_input_permission()?;
+        self.check_forbidden()?;
+        self.verify_focus()?;
+        let mut state = lock_state(&self.state);
+        if state.fault == Some(Fault::DropInput) {
+            return Ok(());
+        }
+        state.events.push(MockEvent::Hold { key, millis });
         Ok(())
     }
 
@@ -408,6 +538,10 @@ impl Body for MockBody {
     fn set_max_capture_dimension(&mut self, max: Option<u32>) {
         lock_state(&self.state).max_capture_dimension = max;
     }
+
+    fn framebuffer_pool(&self) -> Option<&FramebufferPool> {
+        Some(&self.pool)
+    }
 }
 
 impl TargetOracle for MockOracle {
@@ -445,6 +579,66 @@ impl TargetOracle for MockOracle {
             .iter()
             .filter_map(|e| match e {
                 MockEvent::Key(k) => Some(*k),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn received_scrolls(&mut self) -> Vec<(i32, i32, i32, i32)> {
+        lock_state(&self.state)
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                MockEvent::Scroll { x, y, dx, dy } => Some((*x, *y, *dx, *dy)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn received_drags(&mut self) -> Vec<(i32, i32, i32, i32)> {
+        lock_state(&self.state)
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                MockEvent::Drag {
+                    from_x,
+                    from_y,
+                    to_x,
+                    to_y,
+                } => Some((*from_x, *from_y, *to_x, *to_y)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn received_double_clicks(&mut self) -> Vec<(i32, i32)> {
+        lock_state(&self.state)
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                MockEvent::DoubleClick { x, y } => Some((*x, *y)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn received_right_clicks(&mut self) -> Vec<(i32, i32)> {
+        lock_state(&self.state)
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                MockEvent::RightClick { x, y } => Some((*x, *y)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn received_holds(&mut self) -> Vec<(Key, u32)> {
+        lock_state(&self.state)
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                MockEvent::Hold { key, millis } => Some((*key, *millis)),
                 _ => None,
             })
             .collect()
@@ -540,6 +734,110 @@ mod tests {
         body.set_expected_focus(None);
         body.set_focus_window(99);
         assert!(body.type_text("y").is_ok(), "no expectation means no check");
+    }
+
+    #[test]
+    fn new_actions_record_exact_events_and_respect_bounds() {
+        let mut body = MockBody::new();
+        let mut oracle = body.oracle();
+        body.scroll(100, 100, 2, -3).unwrap();
+        body.drag(100, 100, 200, 150).unwrap();
+        body.double_click(300, 300).unwrap();
+        body.right_click(400, 400).unwrap();
+        body.hold_key(Key::F5, 150).unwrap();
+        assert_eq!(oracle.received_scrolls(), vec![(100, 100, 2, -3)]);
+        assert_eq!(oracle.received_drags(), vec![(100, 100, 200, 150)]);
+        assert_eq!(oracle.received_double_clicks(), vec![(300, 300)]);
+        assert_eq!(oracle.received_right_clicks(), vec![(400, 400)]);
+        assert_eq!(oracle.received_holds(), vec![(Key::F5, 150)]);
+        // Out-of-bounds endpoints are typed errors, nothing recorded.
+        assert_eq!(
+            body.drag(100, 100, 900, 100).unwrap_err().code(),
+            "out_of_bounds"
+        );
+        assert_eq!(
+            body.scroll(-1, 0, 0, 1).unwrap_err().code(),
+            "out_of_bounds"
+        );
+        assert_eq!(oracle.received_drags().len(), 1);
+        assert_eq!(oracle.received_scrolls().len(), 1);
+    }
+
+    #[test]
+    fn hold_key_duration_is_validated_before_anything_happens() {
+        let mut body = MockBody::new();
+        assert_eq!(
+            body.hold_key(Key::Enter, 0).unwrap_err().code(),
+            "invalid_argument"
+        );
+        assert_eq!(
+            body.hold_key(Key::Enter, MAX_HOLD_MILLIS + 1)
+                .unwrap_err()
+                .code(),
+            "invalid_argument"
+        );
+        assert!(body.hold_key(Key::Enter, MAX_HOLD_MILLIS).is_ok());
+        assert!(body.events().iter().any(|e| matches!(
+            e,
+            MockEvent::Hold {
+                millis: MAX_HOLD_MILLIS,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn pool_reuse_is_measured_fifty_recycled_captures_one_allocation() {
+        // P4.6.2 before/after, on the mock: without recycling, every
+        // capture allocates; with recycling, one buffer serves all.
+        let mut body = MockBody::new();
+        for _ in 0..10 {
+            let _frame = body.screenshot().unwrap();
+        }
+        let unrecycled = body.framebuffer_pool().unwrap().stats();
+        assert_eq!(unrecycled.allocations, 10);
+        assert_eq!(unrecycled.reuses, 0);
+
+        let mut body = MockBody::new();
+        for _ in 0..50 {
+            let frame = body.screenshot().unwrap();
+            frame.recycle(body.framebuffer_pool().unwrap());
+        }
+        let recycled = body.framebuffer_pool().unwrap().stats();
+        assert_eq!(recycled.allocations, 1, "one buffer allocated");
+        assert_eq!(recycled.reuses, 49, "49 captures reused it");
+    }
+
+    #[test]
+    fn forbidden_active_window_refuses_input_but_not_screenshots() {
+        let mut body = MockBody::new();
+        body.set_active_window(Some("KeePassXC"), Some("KeePassXC"));
+        for outcome in [
+            body.click(10, 10),
+            body.mouse_move(10, 10),
+            body.type_text("x"),
+            body.key(Key::Enter),
+            body.scroll(10, 10, 0, 1),
+            body.drag(10, 10, 20, 20),
+            body.double_click(10, 10),
+            body.right_click(10, 10),
+            body.hold_key(Key::F5, 50),
+        ] {
+            assert_eq!(outcome.unwrap_err().code(), "forbidden_window");
+        }
+        assert!(
+            body.screenshot().is_ok(),
+            "the forbidden policy gates input only"
+        );
+        assert!(
+            body.oracle().received_clicks().is_empty(),
+            "no input reached the target"
+        );
+
+        body.set_active_window(Some("firefox"), Some("Inbox"));
+        assert!(body.click(10, 10).is_ok());
+        body.set_active_window(None, None);
+        assert!(body.click(10, 10).is_ok(), "undeterminable allows");
     }
 
     #[test]

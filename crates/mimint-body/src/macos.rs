@@ -64,11 +64,13 @@
 //! the Mac checklist (CHECKLIST.md P1) confirms post-event behavior
 //! empirically before anyone relies on it.
 
-use crate::action::Key;
+use crate::action::{Key, MAX_HOLD_MILLIS};
 use crate::body::{Body, Framebuffer, PermissionState, Permissions, ScreenRect};
 use crate::error::BodyError;
 use core_graphics::display::CGDisplay;
-use core_graphics::event::{CGEvent, CGEventTapLocation, CGEventType, CGMouseButton, EventField};
+use core_graphics::event::{
+    CGEvent, CGEventTapLocation, CGEventType, CGMouseButton, CGScrollEventUnit, EventField,
+};
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use core_graphics::geometry::CGPoint;
 use core_graphics::window::{
@@ -245,9 +247,17 @@ impl MacOsBody {
     }
 
     fn post_mouse(&self, kind: CGEventType, point: CGPoint) -> Result<(), BodyError> {
-        let event =
-            CGEvent::new_mouse_event(Self::event_source()?, kind, point, CGMouseButton::Left)
-                .map_err(|_| BodyError::Backend("CGEventCreateMouseEvent failed".to_string()))?;
+        self.post_mouse_button(kind, point, CGMouseButton::Left)
+    }
+
+    fn post_mouse_button(
+        &self,
+        kind: CGEventType,
+        point: CGPoint,
+        button: CGMouseButton,
+    ) -> Result<(), BodyError> {
+        let event = CGEvent::new_mouse_event(Self::event_source()?, kind, point, button)
+            .map_err(|_| BodyError::Backend("CGEventCreateMouseEvent failed".to_string()))?;
         event.post(CGEventTapLocation::HID);
         Ok(())
     }
@@ -256,10 +266,39 @@ impl MacOsBody {
     /// single click), so the target never has to guess whether a
     /// down/up pair is one click or part of a multi-click.
     fn post_click(&self, kind: CGEventType, point: CGPoint) -> Result<(), BodyError> {
-        let event =
-            CGEvent::new_mouse_event(Self::event_source()?, kind, point, CGMouseButton::Left)
-                .map_err(|_| BodyError::Backend("CGEventCreateMouseEvent failed".to_string()))?;
-        event.set_integer_value_field(EventField::MOUSE_EVENT_CLICK_STATE, 1);
+        self.post_click_state(kind, point, CGMouseButton::Left, 1)
+    }
+
+    fn post_click_state(
+        &self,
+        kind: CGEventType,
+        point: CGPoint,
+        button: CGMouseButton,
+        click_state: i64,
+    ) -> Result<(), BodyError> {
+        let event = CGEvent::new_mouse_event(Self::event_source()?, kind, point, button)
+            .map_err(|_| BodyError::Backend("CGEventCreateMouseEvent failed".to_string()))?;
+        event.set_integer_value_field(EventField::MOUSE_EVENT_CLICK_STATE, click_state);
+        event.post(CGEventTapLocation::HID);
+        Ok(())
+    }
+
+    /// Post a scroll-wheel event. Quartz wheel deltas: axis 1
+    /// positive scrolls up, axis 2 positive scrolls left — the
+    /// opposite of the contract's `dy > 0` = down / `dx > 0` =
+    /// right, hence the negation. The mapping is a documented
+    /// assumption until the Mac package verifies it empirically
+    /// (CHECKLIST.md): no Mac run has confirmed it yet.
+    fn post_scroll(&self, dx: i32, dy: i32) -> Result<(), BodyError> {
+        let event = CGEvent::new_scroll_event(
+            Self::event_source()?,
+            CGScrollEventUnit::LINE,
+            2,
+            -dy,
+            -dx,
+            0,
+        )
+        .map_err(|_| BodyError::Backend("CGEventCreateScrollWheelEvent failed".to_string()))?;
         event.post(CGEventTapLocation::HID);
         Ok(())
     }
@@ -411,6 +450,86 @@ impl Body for MacOsBody {
         self.require_input_control()?;
         self.verify_focus()?;
         self.press_keycode(keycode_for(key))
+    }
+
+    fn scroll(&mut self, x: i32, y: i32, dx: i32, dy: i32) -> Result<(), BodyError> {
+        self.refresh_geometry();
+        self.check_bounds(x, y)?;
+        self.check_target(x, y)?;
+        self.require_input_control()?;
+        self.verify_focus()?;
+        // Scroll events act on the window under the cursor: move
+        // there first.
+        let point = pixels_to_points(x, y, self.scale);
+        self.post_mouse(CGEventType::MouseMoved, point)?;
+        self.post_scroll(dx, dy)
+    }
+
+    fn drag(&mut self, from_x: i32, from_y: i32, to_x: i32, to_y: i32) -> Result<(), BodyError> {
+        self.refresh_geometry();
+        self.check_bounds(from_x, from_y)?;
+        self.check_bounds(to_x, to_y)?;
+        self.check_target(from_x, from_y)?;
+        self.check_target(to_x, to_y)?;
+        self.require_input_control()?;
+        self.verify_focus()?;
+        let from = pixels_to_points(from_x, from_y, self.scale);
+        let to = pixels_to_points(to_x, to_y, self.scale);
+        self.post_mouse(CGEventType::MouseMoved, from)?;
+        self.post_click(CGEventType::LeftMouseDown, from)?;
+        const STEPS: i32 = 10;
+        for step in 1..=STEPS {
+            let at = CGPoint::new(
+                from.x + (to.x - from.x) * f64::from(step) / f64::from(STEPS),
+                from.y + (to.y - from.y) * f64::from(step) / f64::from(STEPS),
+            );
+            self.post_mouse(CGEventType::LeftMouseDragged, at)?;
+        }
+        self.post_click(CGEventType::LeftMouseUp, to)
+    }
+
+    fn double_click(&mut self, x: i32, y: i32) -> Result<(), BodyError> {
+        self.refresh_geometry();
+        self.check_bounds(x, y)?;
+        self.check_target(x, y)?;
+        self.require_input_control()?;
+        self.verify_focus()?;
+        let point = pixels_to_points(x, y, self.scale);
+        self.post_mouse(CGEventType::MouseMoved, point)?;
+        self.post_click_state(CGEventType::LeftMouseDown, point, CGMouseButton::Left, 1)?;
+        std::thread::sleep(Duration::from_millis(5));
+        self.post_click_state(CGEventType::LeftMouseUp, point, CGMouseButton::Left, 1)?;
+        std::thread::sleep(Duration::from_millis(30));
+        self.post_click_state(CGEventType::LeftMouseDown, point, CGMouseButton::Left, 2)?;
+        std::thread::sleep(Duration::from_millis(5));
+        self.post_click_state(CGEventType::LeftMouseUp, point, CGMouseButton::Left, 2)
+    }
+
+    fn right_click(&mut self, x: i32, y: i32) -> Result<(), BodyError> {
+        self.refresh_geometry();
+        self.check_bounds(x, y)?;
+        self.check_target(x, y)?;
+        self.require_input_control()?;
+        self.verify_focus()?;
+        let point = pixels_to_points(x, y, self.scale);
+        self.post_mouse(CGEventType::MouseMoved, point)?;
+        self.post_click_state(CGEventType::RightMouseDown, point, CGMouseButton::Right, 1)?;
+        std::thread::sleep(Duration::from_millis(5));
+        self.post_click_state(CGEventType::RightMouseUp, point, CGMouseButton::Right, 1)
+    }
+
+    fn hold_key(&mut self, key: Key, millis: u32) -> Result<(), BodyError> {
+        if millis == 0 || millis > MAX_HOLD_MILLIS {
+            return Err(BodyError::InvalidArgument {
+                reason: format!("hold duration must be 1..={MAX_HOLD_MILLIS} ms, got {millis}"),
+            });
+        }
+        self.require_input_control()?;
+        self.verify_focus()?;
+        let keycode = keycode_for(key);
+        self.post_key(keycode, true)?;
+        std::thread::sleep(Duration::from_millis(u64::from(millis)));
+        self.post_key(keycode, false)
     }
 
     fn permissions(&mut self) -> Permissions {

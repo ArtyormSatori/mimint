@@ -11,9 +11,17 @@
 //!   GEOM x=100 y=100 w=400 h=300
 //!   WIN id=<window>
 //!   READY
-//!   BUTTON root_x=.. root_y=.. win_x=.. win_y=.. detail=..
-//!   KEY sym=0x.... tok=<token>
+//!   BUTTON root_x=.. root_y=.. win_x=.. win_y=.. detail=.. t=<ms>
+//!   RELEASE root_x=.. root_y=.. detail=.. t=<ms>
+//!   MOTION root_x=.. root_y=.. t=<ms>
+//!   KEY sym=0x.... tok=<token> t=<ms>
+//!   KEYUP sym=0x.... tok=<token> t=<ms>
 //!   COLOR <name>
+//!
+//! Env: `TESTWIN_WM_CLASS=<name>` sets the window's WM_CLASS (both
+//! the instance and class fields) so the forbidden-window policy
+//! can be exercised against a denylisted class. The value is also
+//! logged as a `CLASS <name>` line.
 //!
 //! Linux only. On other platforms this binary exits with an error.
 
@@ -202,11 +210,31 @@ mod linux {
                 .event_mask(
                     EventMask::EXPOSURE
                         | EventMask::BUTTON_PRESS
+                        | EventMask::BUTTON_RELEASE
+                        | EventMask::POINTER_MOTION
                         | EventMask::KEY_PRESS
+                        | EventMask::KEY_RELEASE
                         | EventMask::STRUCTURE_NOTIFY,
                 ),
         )
         .unwrap();
+        // Optional WM_CLASS for forbidden-window policy tests.
+        if let Ok(class) = env::var("TESTWIN_WM_CLASS") {
+            if !class.is_empty() {
+                let value = format!("{class}\0{class}\0");
+                let _ = change_property(
+                    &conn,
+                    PropMode::REPLACE,
+                    win,
+                    AtomEnum::WM_CLASS,
+                    AtomEnum::STRING,
+                    8,
+                    value.len() as u32,
+                    value.as_bytes(),
+                );
+                log.log(&format!("CLASS {class}"));
+            }
+        }
         create_gc(&conn, gc, win, &CreateGCAux::new()).unwrap();
         map_window(&conn, win).unwrap();
         conn.flush().unwrap();
@@ -280,8 +308,8 @@ mod linux {
                 }
                 Event::ButtonPress(ev) => {
                     log.log(&format!(
-                        "BUTTON root_x={} root_y={} win_x={} win_y={} detail={}",
-                        ev.root_x, ev.root_y, ev.event_x, ev.event_y, ev.detail
+                        "BUTTON root_x={} root_y={} win_x={} win_y={} detail={} t={}",
+                        ev.root_x, ev.root_y, ev.event_x, ev.event_y, ev.detail, ev.time
                     ));
                     // Click-to-focus, like a real window. Best-effort.
                     if let Ok(cookie) =
@@ -290,6 +318,28 @@ mod linux {
                         let _ = cookie.check();
                     }
                     conn.flush().unwrap();
+                }
+                Event::ButtonRelease(ev) => {
+                    log.log(&format!(
+                        "RELEASE root_x={} root_y={} detail={} t={}",
+                        ev.root_x, ev.root_y, ev.detail, ev.time
+                    ));
+                }
+                Event::MotionNotify(ev) => {
+                    log.log(&format!(
+                        "MOTION root_x={} root_y={} t={}",
+                        ev.root_x, ev.root_y, ev.time
+                    ));
+                }
+                Event::KeyRelease(ev) => {
+                    let shift = u16::from(ev.state) & 0x0001 != 0;
+                    let level = if shift { 1 } else { 0 };
+                    let mut sym = sym_for(&conn, ev.detail, level);
+                    if sym == 0 {
+                        sym = sym_for(&conn, ev.detail, 0);
+                    }
+                    let tok = keysym_token(sym);
+                    log.log(&format!("KEYUP sym=0x{sym:04x} tok={tok} t={}", ev.time));
                 }
                 Event::KeyPress(ev) => {
                     // ShiftMask bit = 0x0001 in the event state: pick
@@ -303,7 +353,7 @@ mod linux {
                         sym = sym_for(&conn, ev.detail, 0);
                     }
                     let tok = keysym_token(sym);
-                    log.log(&format!("KEY sym=0x{sym:04x} tok={tok}"));
+                    log.log(&format!("KEY sym=0x{sym:04x} tok={tok} t={}", ev.time));
                     if sym == 0xffc2 {
                         // F5 toggles red <-> green (variant 0/1).
                         variant = if variant == 0 { 1 } else { 0 };

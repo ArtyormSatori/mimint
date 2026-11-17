@@ -2044,6 +2044,7 @@ dependencies = [
  "core-foundation 0.10.1",
  "core-graphics 0.25.0",
  "serde_json",
+ "windows",
  "x11rb",
 ]
 

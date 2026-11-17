@@ -21,6 +21,11 @@
 //!   bodyctl --body x11|macos --audit-path audit.jsonl move <x> <y>
 //!   bodyctl --body x11|macos --audit-path audit.jsonl type <text...>
 //!   bodyctl --body x11|macos --audit-path audit.jsonl key <name>
+//!   bodyctl --body x11|macos --audit-path audit.jsonl scroll <x> <y> <dx> <dy>
+//!   bodyctl --body x11|macos --audit-path audit.jsonl drag <x1> <y1> <x2> <y2>
+//!   bodyctl --body x11|macos --audit-path audit.jsonl dclick <x> <y>
+//!   bodyctl --body x11|macos --audit-path audit.jsonl rclick <x> <y>
+//!   bodyctl --body x11|macos --audit-path audit.jsonl hold <name> <millis>
 //!   bodyctl --body x11|macos --audit-path audit.jsonl shot <out.ppm>
 //!   bodyctl --body x11|macos size
 //!   bodyctl --body x11|macos --audit-path audit.jsonl --exclude x,y,w,h [--exclude ...] [--limit-session N] [--limit-per-minute N] [--limit-repeats N] [--max-capture N] <action>
@@ -39,8 +44,8 @@ use std::path::Path;
 use std::process::exit;
 
 fn usage() -> ! {
-    eprintln!("usage: bodyctl --body x11|macos [--audit-path FILE] [--exclude x,y,w,h]... [--limit-session N] [--limit-per-minute N] [--limit-repeats N] [--max-capture N] <click X Y|move X Y|type TEXT...|key NAME|shot FILE|size>");
-    eprintln!("  --audit-path is REQUIRED for click/move/type/key/shot (not for size).");
+    eprintln!("usage: bodyctl --body x11|macos [--audit-path FILE] [--exclude x,y,w,h]... [--limit-session N] [--limit-per-minute N] [--limit-repeats N] [--max-capture N] <click X Y|move X Y|type TEXT...|key NAME|scroll X Y DX DY|drag X1 Y1 X2 Y2|dclick X Y|rclick X Y|hold NAME MILLIS|shot FILE|size>");
+    eprintln!("  --audit-path is REQUIRED for click/move/type/key/scroll/drag/dclick/rclick/hold/shot (not for size).");
     exit(2);
 }
 
@@ -176,7 +181,19 @@ fn main() {
 
 fn run<B: Body>(connect: impl FnOnce() -> Result<B, mimint_body::BodyError>, opts: Options) -> ! {
     let action = opts.rest[0].as_str();
-    let needs_audit = matches!(action, "click" | "move" | "type" | "key" | "shot");
+    let needs_audit = matches!(
+        action,
+        "click"
+            | "move"
+            | "type"
+            | "key"
+            | "scroll"
+            | "drag"
+            | "dclick"
+            | "rclick"
+            | "hold"
+            | "shot"
+    );
     if needs_audit && opts.audit_path.is_empty() {
         eprintln!("--audit-path is required for '{action}' (refusing to act unaudited)");
         exit(2);
@@ -220,6 +237,47 @@ fn run<B: Body>(connect: impl FnOnce() -> Result<B, mimint_body::BodyError>, opt
             let name = opts.rest.get(1).cloned().unwrap_or_default();
             match Key::parse(&name) {
                 Some(key) => (body.key(key), serde_json::json!({"key": name})),
+                None => {
+                    eprintln!("unknown key: {name}");
+                    exit(2);
+                }
+            }
+        }
+        "scroll" => {
+            let (x, y) = parse_xy(&opts.rest);
+            let dx: i32 = parse_nth(&opts.rest, 3, "dx");
+            let dy: i32 = parse_nth(&opts.rest, 4, "dy");
+            (
+                body.scroll(x, y, dx, dy),
+                serde_json::json!({"x": x, "y": y, "dx": dx, "dy": dy}),
+            )
+        }
+        "drag" => {
+            let (from_x, from_y) = parse_xy(&opts.rest);
+            let to_x: i32 = parse_nth(&opts.rest, 3, "to_x");
+            let to_y: i32 = parse_nth(&opts.rest, 4, "to_y");
+            (
+                body.drag(from_x, from_y, to_x, to_y),
+                serde_json::json!({"from_x": from_x, "from_y": from_y, "to_x": to_x, "to_y": to_y}),
+            )
+        }
+        "dclick" | "rclick" => {
+            let (x, y) = parse_xy(&opts.rest);
+            let outcome = if action == "dclick" {
+                body.double_click(x, y)
+            } else {
+                body.right_click(x, y)
+            };
+            (outcome, serde_json::json!({"x": x, "y": y}))
+        }
+        "hold" => {
+            let name = opts.rest.get(1).cloned().unwrap_or_default();
+            let millis: u32 = parse_nth(&opts.rest, 2, "millis");
+            match Key::parse(&name) {
+                Some(key) => (
+                    body.hold_key(key, millis),
+                    serde_json::json!({"key": name, "millis": millis}),
+                ),
                 None => {
                     eprintln!("unknown key: {name}");
                     exit(2);
@@ -311,13 +369,14 @@ fn run<B: Body>(connect: impl FnOnce() -> Result<B, mimint_body::BodyError>, opt
 }
 
 fn parse_xy(rest: &[String]) -> (i32, i32) {
-    let x: i32 = rest
-        .get(1)
+    (parse_nth(rest, 1, "x"), parse_nth(rest, 2, "y"))
+}
+
+fn parse_nth<T: std::str::FromStr>(rest: &[String], index: usize, what: &str) -> T {
+    rest.get(index)
         .and_then(|v| v.parse().ok())
-        .unwrap_or_else(|| usage());
-    let y: i32 = rest
-        .get(2)
-        .and_then(|v| v.parse().ok())
-        .unwrap_or_else(|| usage());
-    (x, y)
+        .unwrap_or_else(|| {
+            eprintln!("invalid {what}: expected a number");
+            usage()
+        })
 }

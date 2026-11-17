@@ -30,6 +30,14 @@
 //!   matches the display size, and is pixel-addressable.
 //! - `C11 type-unicode`: Vietnamese text with diacritics arrives
 //!   exactly (the Unicode typing path, not the ASCII key path).
+//! - `C12 scroll`: scroll notches arrive with exact points and
+//!   directions.
+//! - `C13 drag`: a drag arrives with endpoints within 2px.
+//! - `C14 double-click`: a double-click arrives as one paired
+//!   action at the aim point.
+//! - `C15 right-click`: a secondary-button click arrives.
+//! - `C16 hold-key`: a key hold arrives with the requested key and
+//!   a duration in the accepted window.
 //!
 //! The guarded suite ([`run_guarded_suite`]) adds:
 //! - `G1 self-exclusion`: clicks into the exclusion zone are refused
@@ -67,6 +75,31 @@ pub trait TargetOracle {
     fn set_content(&mut self, variant: u8);
     /// Forget all observed events.
     fn reset_events(&mut self);
+    /// Scroll actions observed: (x, y, dx, dy) in notches, in
+    /// order. The default (no observations) FAILS the scroll
+    /// check: an oracle that cannot observe scrolls must not pass
+    /// vacuously.
+    fn received_scrolls(&mut self) -> Vec<(i32, i32, i32, i32)> {
+        Vec::new()
+    }
+    /// Drag actions observed: (from_x, from_y, to_x, to_y).
+    fn received_drags(&mut self) -> Vec<(i32, i32, i32, i32)> {
+        Vec::new()
+    }
+    /// Double-clicks observed: aim points.
+    fn received_double_clicks(&mut self) -> Vec<(i32, i32)> {
+        Vec::new()
+    }
+    /// Right-clicks observed: aim points.
+    fn received_right_clicks(&mut self) -> Vec<(i32, i32)> {
+        Vec::new()
+    }
+    /// Key holds observed: (key, duration in milliseconds). For a
+    /// real target the duration is measured (press to release); for
+    /// the mock it is the requested duration.
+    fn received_holds(&mut self) -> Vec<(Key, u32)> {
+        Vec::new()
+    }
 }
 
 /// One check's outcome.
@@ -306,23 +339,57 @@ pub fn run_suite<B: Body, O: TargetOracle>(body: &mut B, oracle: &mut O) -> Suit
         Err(err) => check("C6", "out-of-bounds", false, format!("{err}")),
     });
 
-    // C7: action dispatch through Body::act.
+    // C7: action dispatch through Body::act. Every action variant
+    // dispatches (screenshot via `act`, click via `act`, and the
+    // five Phase 4 actions via `act` too); the spec count must
+    // match the variant count exactly.
     let c7 = (|| -> Result<CheckResult, BodyError> {
         let specs = body.actions();
         let names: Vec<&str> = specs.iter().map(|s| s.name).collect();
         let shot = body.act(&Action::Screenshot)?;
         let shot_ok = matches!(shot, crate::body::ActOutcome::Frame(_));
         let (w, h) = body.display_size()?;
-        let click = body.act(&Action::Click {
-            x: (w / 2) as i32,
-            y: (h / 2) as i32,
-        })?;
+        let (rx, ry, rw, rh) = oracle.target_rect().unwrap_or((0, 0, w, h));
+        let cx = rx + rw as i32 / 2;
+        let cy = ry + rh as i32 / 2;
+        let click = body.act(&Action::Click { x: cx, y: cy })?;
         let click_ok = matches!(click, crate::body::ActOutcome::Done);
+        let scroll = body.act(&Action::Scroll {
+            x: cx,
+            y: cy,
+            dx: 0,
+            dy: 1,
+        })?;
+        let scroll_ok = matches!(scroll, crate::body::ActOutcome::Done);
+        let drag = body.act(&Action::Drag {
+            from_x: cx,
+            from_y: cy,
+            to_x: cx + 10,
+            to_y: cy + 10,
+        })?;
+        let drag_ok = matches!(drag, crate::body::ActOutcome::Done);
+        let dclick = body.act(&Action::DoubleClick { x: cx, y: cy })?;
+        let dclick_ok = matches!(dclick, crate::body::ActOutcome::Done);
+        let rclick = body.act(&Action::RightClick { x: cx, y: cy })?;
+        let rclick_ok = matches!(rclick, crate::body::ActOutcome::Done);
+        let hold = body.act(&Action::HoldKey {
+            key: Key::F5,
+            millis: 10,
+        })?;
+        let hold_ok = matches!(hold, crate::body::ActOutcome::Done);
+        let all_ok = shot_ok
+            && click_ok
+            && scroll_ok
+            && drag_ok
+            && dclick_ok
+            && rclick_ok
+            && hold_ok
+            && names.len() == 10;
         Ok(check(
             "C7",
             "action-dispatch",
-            shot_ok && click_ok && names.len() == 5,
-            format!("specs={names:?} screenshot_ok={shot_ok} click_ok={click_ok}"),
+            all_ok,
+            format!("specs={names:?} screenshot_ok={shot_ok} click_ok={click_ok} scroll_ok={scroll_ok} drag_ok={drag_ok} dclick_ok={dclick_ok} rclick_ok={rclick_ok} hold_ok={hold_ok}"),
         ))
     })();
     checks.push(match c7 {
@@ -462,6 +529,132 @@ pub fn run_suite<B: Body, O: TargetOracle>(body: &mut B, oracle: &mut O) -> Suit
     checks.push(match c11 {
         Ok(result) => result,
         Err(err) => check("C11", "type-unicode", false, format!("{err}")),
+    });
+
+    // C12: scroll. Three scrolls with distinct directions must
+    // arrive exactly (point + notches + order). The three scrolls
+    // aim at three distinct points: a file-log oracle cannot see
+    // call boundaries, so it groups consecutive wheel notches by
+    // point — two scrolls at one point would be indistinguishable
+    // from one scroll, and the check must stay observable.
+    let c12 = (|| -> Result<CheckResult, BodyError> {
+        let (w, h) = body.display_size()?;
+        let (rx, ry, rw, rh) = oracle.target_rect().unwrap_or((0, 0, w, h));
+        let cx = rx + rw as i32 / 2;
+        let cy = ry + rh as i32 / 2;
+        let expected = vec![(cx, cy, 0, 3), (cx - 40, cy, 0, -2), (cx + 40, cy, 2, 0)];
+        oracle.reset_events();
+        for (x, y, dx, dy) in &expected {
+            body.scroll(*x, *y, *dx, *dy)?;
+        }
+        let got = oracle.received_scrolls();
+        Ok(check(
+            "C12",
+            "scroll",
+            got == expected,
+            format!("expected={expected:?} got={got:?}"),
+        ))
+    })();
+    checks.push(match c12 {
+        Ok(result) => result,
+        Err(err) => check("C12", "scroll", false, format!("{err}")),
+    });
+
+    // C13: drag. One drag across the target rect; endpoints within
+    // 2px of the aim points.
+    let c13 = (|| -> Result<CheckResult, BodyError> {
+        let (w, h) = body.display_size()?;
+        let (rx, ry, rw, rh) = oracle.target_rect().unwrap_or((0, 0, w, h));
+        let from = (rx + rw as i32 * 3 / 10, ry + rh as i32 * 3 / 10);
+        let to = (rx + rw as i32 * 6 / 10, ry + rh as i32 * 6 / 10);
+        oracle.reset_events();
+        body.drag(from.0, from.1, to.0, to.1)?;
+        let got = oracle.received_drags();
+        let ok = got.len() == 1
+            && (got[0].0 - from.0).abs() <= 2
+            && (got[0].1 - from.1).abs() <= 2
+            && (got[0].2 - to.0).abs() <= 2
+            && (got[0].3 - to.1).abs() <= 2;
+        Ok(check(
+            "C13",
+            "drag",
+            ok,
+            format!(
+                "expected=[({},{})->({},{})] got={got:?}",
+                from.0, from.1, to.0, to.1
+            ),
+        ))
+    })();
+    checks.push(match c13 {
+        Ok(result) => result,
+        Err(err) => check("C13", "drag", false, format!("{err}")),
+    });
+
+    // C14: double-click. One paired double-click at the target
+    // center, within 2px.
+    let c14 = (|| -> Result<CheckResult, BodyError> {
+        let (w, h) = body.display_size()?;
+        let (rx, ry, rw, rh) = oracle.target_rect().unwrap_or((0, 0, w, h));
+        let cx = rx + rw as i32 / 2;
+        let cy = ry + rh as i32 / 2;
+        oracle.reset_events();
+        body.double_click(cx, cy)?;
+        let got = oracle.received_double_clicks();
+        let ok = got.len() == 1 && (got[0].0 - cx).abs() <= 2 && (got[0].1 - cy).abs() <= 2;
+        Ok(check(
+            "C14",
+            "double-click",
+            ok,
+            format!("expected=[({cx},{cy})] got={got:?}"),
+        ))
+    })();
+    checks.push(match c14 {
+        Ok(result) => result,
+        Err(err) => check("C14", "double-click", false, format!("{err}")),
+    });
+
+    // C15: right-click. One secondary click at the target center.
+    let c15 = (|| -> Result<CheckResult, BodyError> {
+        let (w, h) = body.display_size()?;
+        let (rx, ry, rw, rh) = oracle.target_rect().unwrap_or((0, 0, w, h));
+        let cx = rx + rw as i32 / 2;
+        let cy = ry + rh as i32 / 2;
+        oracle.reset_events();
+        body.right_click(cx, cy)?;
+        let got = oracle.received_right_clicks();
+        let ok = got.len() == 1 && (got[0].0 - cx).abs() <= 2 && (got[0].1 - cy).abs() <= 2;
+        Ok(check(
+            "C15",
+            "right-click",
+            ok,
+            format!("expected=[({cx},{cy})] got={got:?}"),
+        ))
+    })();
+    checks.push(match c15 {
+        Ok(result) => result,
+        Err(err) => check("C15", "right-click", false, format!("{err}")),
+    });
+
+    // C16: hold-key. One hold of F5 for 150ms. The mock reports the
+    // requested duration exactly; a real target measures press to
+    // release, so the window is [75, 650]ms: wide enough for
+    // scheduling jitter, tight enough to catch a missing hold (a
+    // plain press measures ~0ms) or a stuck key.
+    let c16 = (|| -> Result<CheckResult, BodyError> {
+        oracle.reset_events();
+        body.hold_key(Key::F5, 150)?;
+        let got = oracle.received_holds();
+        let ok = got.len() == 1 && got[0].0 == Key::F5 && (75..=650).contains(&got[0].1);
+        Ok(check(
+            "C16",
+            "hold-key",
+            ok,
+            format!("expected=[(F5, 150ms)] got={got:?}"),
+        ))
+    })();
+    checks.push(match c16 {
+        Ok(result) => result,
+        Err(err) => check("C16", "hold-key", false, format!("{err}")),
     });
 
     let passed = checks.iter().all(|c| c.passed);

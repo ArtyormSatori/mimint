@@ -35,7 +35,7 @@
 //! the same `Arc<AtomicBool>` when the body tool lands.
 
 use crate::action::Key;
-use crate::body::{Body, Framebuffer, Permissions, ScreenRect};
+use crate::body::{Body, Framebuffer, FramebufferPool, Permissions, ScreenRect};
 use crate::error::BodyError;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -91,10 +91,43 @@ impl Default for RateLimits {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Fingerprint {
     Screenshot,
-    Click { x: i32, y: i32 },
-    Move { x: i32, y: i32 },
-    Type { len: usize, hash: u64 },
+    Click {
+        x: i32,
+        y: i32,
+    },
+    Move {
+        x: i32,
+        y: i32,
+    },
+    Type {
+        len: usize,
+        hash: u64,
+    },
     Key(Key),
+    Scroll {
+        x: i32,
+        y: i32,
+        dx: i32,
+        dy: i32,
+    },
+    Drag {
+        from_x: i32,
+        from_y: i32,
+        to_x: i32,
+        to_y: i32,
+    },
+    DoubleClick {
+        x: i32,
+        y: i32,
+    },
+    RightClick {
+        x: i32,
+        y: i32,
+    },
+    Hold {
+        key: Key,
+        millis: u32,
+    },
 }
 
 fn fingerprint_text(text: &str) -> Fingerprint {
@@ -280,6 +313,49 @@ impl<B: Body> Body for GuardedBody<B> {
         self.inner.key(key)
     }
 
+    fn scroll(&mut self, x: i32, y: i32, dx: i32, dy: i32) -> Result<(), BodyError> {
+        self.check_target(x, y)?;
+        self.gate(Fingerprint::Scroll { x, y, dx, dy }, true)?;
+        self.inner.verify_focus()?;
+        self.inner.scroll(x, y, dx, dy)
+    }
+
+    fn drag(&mut self, from_x: i32, from_y: i32, to_x: i32, to_y: i32) -> Result<(), BodyError> {
+        self.check_target(from_x, from_y)?;
+        self.check_target(to_x, to_y)?;
+        self.gate(
+            Fingerprint::Drag {
+                from_x,
+                from_y,
+                to_x,
+                to_y,
+            },
+            true,
+        )?;
+        self.inner.verify_focus()?;
+        self.inner.drag(from_x, from_y, to_x, to_y)
+    }
+
+    fn double_click(&mut self, x: i32, y: i32) -> Result<(), BodyError> {
+        self.check_target(x, y)?;
+        self.gate(Fingerprint::DoubleClick { x, y }, true)?;
+        self.inner.verify_focus()?;
+        self.inner.double_click(x, y)
+    }
+
+    fn right_click(&mut self, x: i32, y: i32) -> Result<(), BodyError> {
+        self.check_target(x, y)?;
+        self.gate(Fingerprint::RightClick { x, y }, true)?;
+        self.inner.verify_focus()?;
+        self.inner.right_click(x, y)
+    }
+
+    fn hold_key(&mut self, key: Key, millis: u32) -> Result<(), BodyError> {
+        self.gate(Fingerprint::Hold { key, millis }, true)?;
+        self.inner.verify_focus()?;
+        self.inner.hold_key(key, millis)
+    }
+
     fn permissions(&mut self) -> Permissions {
         self.inner.permissions()
     }
@@ -315,6 +391,10 @@ impl<B: Body> Body for GuardedBody<B> {
 
     fn set_max_capture_dimension(&mut self, max: Option<u32>) {
         self.inner.set_max_capture_dimension(max);
+    }
+
+    fn framebuffer_pool(&self) -> Option<&FramebufferPool> {
+        self.inner.framebuffer_pool()
     }
 }
 
@@ -381,6 +461,37 @@ mod tests {
         assert_eq!(err.code(), "forbidden_target");
         assert!(body.click(100, 100).is_ok());
         assert_eq!(body.into_inner().events().len(), 1);
+    }
+
+    #[test]
+    fn new_actions_pass_through_exclusion_and_repeat_gates() {
+        let mut body = guarded(RateLimits {
+            max_per_session: 100,
+            max_per_minute: 100,
+            max_repeats: 2,
+        });
+        body.set_excluded_rects(vec![ScreenRect::new(0, 0, 50, 50)]);
+        // Drag endpoints inside the zone are refused.
+        assert_eq!(
+            body.drag(25, 25, 100, 100).unwrap_err().code(),
+            "forbidden_target"
+        );
+        assert_eq!(
+            body.scroll(25, 25, 0, 1).unwrap_err().code(),
+            "forbidden_target"
+        );
+        // Repeated identical scrolls trip the repeat gate.
+        assert!(body.scroll(100, 100, 0, 1).is_ok());
+        assert!(body.scroll(100, 100, 0, 1).is_ok());
+        assert_eq!(
+            body.scroll(100, 100, 0, 1).unwrap_err().code(),
+            "rate_limited"
+        );
+        // Other new actions flow through the gate to the inner body.
+        assert!(body.double_click(100, 100).is_ok());
+        assert!(body.right_click(100, 100).is_ok());
+        assert!(body.hold_key(Key::F5, 10).is_ok());
+        assert!(body.drag(100, 100, 120, 120).is_ok());
     }
 
     #[test]

@@ -24,16 +24,21 @@ pub mod captures;
 pub mod conformance;
 pub mod error;
 pub mod file_oracle;
+pub mod forbidden;
 pub mod guarded;
+pub mod hotkey;
 #[cfg(target_os = "macos")]
 pub mod macos;
 pub mod mock;
+#[cfg(target_os = "windows")]
+pub mod windows;
 #[cfg(target_os = "linux")]
 pub mod x11;
 
-pub use action::{action_specs, Action, ActionSpec, Key};
+pub use action::{action_specs, Action, ActionSpec, Key, MAX_HOLD_MILLIS};
 pub use body::{
-    write_ppm, ActOutcome, Body, Framebuffer, PermissionState, Permissions, ScreenRect,
+    write_ppm, ActOutcome, Body, Framebuffer, FramebufferPool, PermissionState, Permissions,
+    PoolStats, ScreenRect,
 };
 pub use captures::{
     append_audit_line, bodyctl_audit_line, captures_dir, ensure_captures_dir, shot_path_allowed,
@@ -44,9 +49,15 @@ pub use conformance::{
 };
 pub use error::BodyError;
 pub use file_oracle::FileOracle;
+pub use forbidden::{check_forbidden_window, is_forbidden_window};
 pub use guarded::{GuardedBody, RateLimits, StopFlag};
+#[cfg(target_os = "linux")]
+pub use hotkey::HotkeyListener;
+pub use hotkey::{chord_matches, grab_modifier_combinations, CHORD_MODIFIERS};
 #[cfg(target_os = "macos")]
 pub use macos::MacOsBody;
 pub use mock::{Fault, MockBody, MockEvent, MockOracle};
+#[cfg(target_os = "windows")]
+pub use windows::WindowsBody;
 #[cfg(target_os = "linux")]
 pub use x11::X11Body;

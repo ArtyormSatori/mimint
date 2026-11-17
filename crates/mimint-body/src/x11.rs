@@ -27,9 +27,10 @@
 //! body reports both permissions as `NotApplicable`, and the focus
 //! check reads the server's input focus directly.
 
-use crate::action::Key;
-use crate::body::{Body, Framebuffer, PermissionState, Permissions, ScreenRect};
+use crate::action::{Key, MAX_HOLD_MILLIS};
+use crate::body::{Body, Framebuffer, FramebufferPool, PermissionState, Permissions, ScreenRect};
 use crate::error::BodyError;
+use crate::forbidden::check_forbidden_window;
 use std::collections::HashMap;
 use std::time::Duration;
 use x11rb::connection::Connection;
@@ -185,6 +186,8 @@ pub struct X11Body {
     /// Original mappings of remapped keycodes, for restore on drop:
     /// (keycode, original keysyms on all levels).
     remapped_originals: Vec<(u8, Vec<u32>)>,
+    /// Reusable screenshot buffers (P4.6.2).
+    pool: FramebufferPool,
 }
 
 impl Drop for X11Body {
@@ -239,6 +242,7 @@ impl X11Body {
             max_capture_dimension: None,
             unicode_keycodes: HashMap::new(),
             remapped_originals: Vec::new(),
+            pool: FramebufferPool::new(),
         })
     }
 
@@ -319,11 +323,118 @@ impl X11Body {
             .map_err(|err| BodyError::Backend(format!("X connection flush failed: {err}")))
     }
 
+    /// Intern an atom by name; `None` on any failure. The atom is
+    /// interned on every call: input actions are rare, and caching
+    /// atoms would add state for no measurable gain.
+    fn intern(&self, name: &[u8]) -> Option<Atom> {
+        intern_atom(&self.conn, false, name)
+            .ok()?
+            .reply()
+            .ok()
+            .map(|r| r.atom)
+    }
+
+    /// Read a string property of a window; `None` on any failure
+    /// (missing property, wrong format, connection error). All
+    /// failures mean "undeterminable", which the forbidden policy
+    /// treats as allow.
+    fn string_property(&self, window: Window, name: &[u8], type_atom: Atom) -> Option<String> {
+        let property = self.intern(name)?;
+        let reply = get_property(&self.conn, false, window, property, type_atom, 0, 1024)
+            .ok()?
+            .reply()
+            .ok()?;
+        if reply.format != 8 {
+            return None;
+        }
+        String::from_utf8(reply.value).ok()
+    }
+
+    /// The active window's (class, title), from the window
+    /// manager's `_NET_ACTIVE_WINDOW` property on the root window.
+    /// `None` fields mean undeterminable (no WM, no active window,
+    /// unreadable property). WM_CLASS holds "instance\0class\0";
+    /// the class segment is the second one.
+    fn active_window_info(&self) -> (Option<String>, Option<String>) {
+        let active_atom = match self.intern(b"_NET_ACTIVE_WINDOW") {
+            Some(atom) => atom,
+            None => return (None, None),
+        };
+        let reply = match get_property(
+            &self.conn,
+            false,
+            self.root,
+            active_atom,
+            AtomEnum::WINDOW,
+            0,
+            1,
+        )
+        .ok()
+        .and_then(|cookie| cookie.reply().ok())
+        {
+            Some(reply) => reply,
+            None => return (None, None),
+        };
+        if reply.format != 32 || reply.value.len() < 4 {
+            return (None, None);
+        }
+        let window = u32::from_ne_bytes(reply.value[0..4].try_into().unwrap());
+        if window == 0 {
+            return (None, None);
+        }
+        let class_raw = self.string_property(window, b"WM_CLASS", AtomEnum::STRING.into());
+        let class = class_raw.and_then(|raw| {
+            let parts: Vec<&str> = raw.split('\0').filter(|s| !s.is_empty()).collect();
+            // Prefer the class segment (second); fall back to the
+            // only segment present.
+            parts
+                .get(1)
+                .or_else(|| parts.first())
+                .map(|s| s.to_string())
+        });
+        let utf8 = self.intern(b"UTF8_STRING");
+        let title = utf8.and_then(|atom| self.string_property(window, b"_NET_WM_NAME", atom));
+        (class, title)
+    }
+
+    /// Refuse input when the active window is on the forbidden
+    /// list (P4.6.1). Undeterminable active window allows.
+    fn check_forbidden(&self) -> Result<(), BodyError> {
+        let (class, title) = self.active_window_info();
+        check_forbidden_window(class.as_deref(), title.as_deref())
+    }
+
     fn fake_key(&self, keycode: u8, press: bool) -> Result<(), BodyError> {
         let event = if press { KEY_PRESS } else { KEY_RELEASE };
         void_cookie(
             "XTest key event failed",
             fake_input(&self.conn, event, keycode, 0, 0, 0, 0, 0),
+        )
+    }
+
+    fn fake_motion(&self, x: i32, y: i32) -> Result<(), BodyError> {
+        void_cookie(
+            "XTest motion failed",
+            fake_input(
+                &self.conn,
+                MOTION_NOTIFY,
+                0,
+                0,
+                self.root,
+                x as i16,
+                y as i16,
+                0,
+            ),
+        )
+    }
+
+    fn fake_button(&self, detail: u8, press: bool, x: i32, y: i32) -> Result<(), BodyError> {
+        let event = if press { BUTTON_PRESS } else { BUTTON_RELEASE };
+        void_cookie(
+            "XTest button event failed",
+            fake_input(
+                &self.conn, event, detail, 0, self.root, x as i16, y as i16, 0,
+            ),
         )
     }
 
@@ -398,9 +509,16 @@ impl Body for X11Body {
                 reply.depth
             )));
         }
-        let mut rgba = Vec::with_capacity(width as usize * height as usize * 4);
-        for px in reply.data.as_chunks::<4>().0 {
-            rgba.extend_from_slice(&[px[2], px[1], px[0], 255]);
+        let expected = width as usize * height as usize * 4;
+        if reply.data.len() < expected {
+            return Err(BodyError::Backend(format!(
+                "GetImage returned {} bytes, expected {expected} for {width}x{height}",
+                reply.data.len()
+            )));
+        }
+        let mut rgba = self.pool.acquire(expected);
+        for (dst, px) in rgba.chunks_mut(4).zip(reply.data.as_chunks::<4>().0) {
+            dst.copy_from_slice(&[px[2], px[1], px[0], 255]);
         }
         let frame = Framebuffer::new(width, height, rgba)?;
         Ok(match self.max_capture_dimension {
@@ -412,6 +530,7 @@ impl Body for X11Body {
     fn click(&mut self, x: i32, y: i32) -> Result<(), BodyError> {
         self.check_bounds(x, y)?;
         self.check_target(x, y)?;
+        self.check_forbidden()?;
         self.verify_focus()?;
         let (x16, y16) = (x as i16, y as i16);
         void_cookie(
@@ -434,6 +553,7 @@ impl Body for X11Body {
     fn mouse_move(&mut self, x: i32, y: i32) -> Result<(), BodyError> {
         self.check_bounds(x, y)?;
         self.check_target(x, y)?;
+        self.check_forbidden()?;
         void_cookie(
             "XTest motion failed",
             fake_input(
@@ -453,6 +573,7 @@ impl Body for X11Body {
     fn type_text(&mut self, text: &str) -> Result<(), BodyError> {
         self.refresh_keymap()?;
         let keysyms = self.resolve_text(text)?;
+        self.check_forbidden()?;
         self.verify_focus()?;
         // Pre-allocate every keycode before pressing anything: a
         // call that cannot type every character fails here, with
@@ -479,6 +600,7 @@ impl Body for X11Body {
     }
 
     fn key(&mut self, key: Key) -> Result<(), BodyError> {
+        self.check_forbidden()?;
         self.verify_focus()?;
         let keysym = keysym_for(key);
         let (keycode, shift) = self.keymap.find(keysym, self.max_keycode).ok_or_else(|| {
@@ -487,6 +609,115 @@ impl Body for X11Body {
             ))
         })?;
         self.press_keycode(keycode, shift)
+    }
+
+    fn scroll(&mut self, x: i32, y: i32, dx: i32, dy: i32) -> Result<(), BodyError> {
+        self.check_bounds(x, y)?;
+        self.check_target(x, y)?;
+        self.check_forbidden()?;
+        self.verify_focus()?;
+        // X11 wheel: button 4 = up, 5 = down, 6 = left, 7 = right.
+        // One press+release per notch, at the aim point.
+        self.fake_motion(x, y)?;
+        self.flush()?;
+        let wheel = |detail: u8, count: u32| -> Result<(), BodyError> {
+            for _ in 0..count {
+                self.fake_button(detail, true, x, y)?;
+                self.fake_button(detail, false, x, y)?;
+            }
+            Ok(())
+        };
+        if dy > 0 {
+            wheel(5, dy as u32)?;
+        } else if dy < 0 {
+            wheel(4, dy.unsigned_abs())?;
+        }
+        if dx > 0 {
+            wheel(7, dx as u32)?;
+        } else if dx < 0 {
+            wheel(6, dx.unsigned_abs())?;
+        }
+        self.flush()
+    }
+
+    fn drag(&mut self, from_x: i32, from_y: i32, to_x: i32, to_y: i32) -> Result<(), BodyError> {
+        self.check_bounds(from_x, from_y)?;
+        self.check_bounds(to_x, to_y)?;
+        self.check_target(from_x, from_y)?;
+        self.check_target(to_x, to_y)?;
+        self.check_forbidden()?;
+        self.verify_focus()?;
+        self.fake_motion(from_x, from_y)?;
+        self.fake_button(1, true, from_x, from_y)?;
+        self.flush()?;
+        // Interpolate so the target observes motion with the button
+        // held (a teleport press/release at two points is not a
+        // drag to most targets).
+        const STEPS: i32 = 10;
+        for step in 1..=STEPS {
+            let x = from_x + (to_x - from_x) * step / STEPS;
+            let y = from_y + (to_y - from_y) * step / STEPS;
+            self.fake_motion(x, y)?;
+        }
+        self.fake_button(1, false, to_x, to_y)?;
+        self.flush()
+    }
+
+    fn double_click(&mut self, x: i32, y: i32) -> Result<(), BodyError> {
+        self.check_bounds(x, y)?;
+        self.check_target(x, y)?;
+        self.check_forbidden()?;
+        self.verify_focus()?;
+        self.fake_motion(x, y)?;
+        for _ in 0..2 {
+            self.fake_button(1, true, x, y)?;
+            self.flush()?;
+            std::thread::sleep(Duration::from_millis(5));
+            self.fake_button(1, false, x, y)?;
+            self.flush()?;
+            std::thread::sleep(Duration::from_millis(30));
+        }
+        Ok(())
+    }
+
+    fn right_click(&mut self, x: i32, y: i32) -> Result<(), BodyError> {
+        self.check_bounds(x, y)?;
+        self.check_target(x, y)?;
+        self.check_forbidden()?;
+        self.verify_focus()?;
+        self.fake_motion(x, y)?;
+        self.fake_button(3, true, x, y)?;
+        self.flush()?;
+        std::thread::sleep(Duration::from_millis(5));
+        self.fake_button(3, false, x, y)?;
+        self.flush()
+    }
+
+    fn hold_key(&mut self, key: Key, millis: u32) -> Result<(), BodyError> {
+        if millis == 0 || millis > MAX_HOLD_MILLIS {
+            return Err(BodyError::InvalidArgument {
+                reason: format!("hold duration must be 1..={MAX_HOLD_MILLIS} ms, got {millis}"),
+            });
+        }
+        self.check_forbidden()?;
+        self.verify_focus()?;
+        let keysym = keysym_for(key);
+        let (keycode, shift) = self.keymap.find(keysym, self.max_keycode).ok_or_else(|| {
+            BodyError::Backend(format!(
+                "key {key:?} has no keycode in the keyboard mapping"
+            ))
+        })?;
+        if shift {
+            self.fake_key(self.shift_keycode, true)?;
+        }
+        self.fake_key(keycode, true)?;
+        self.flush()?;
+        std::thread::sleep(Duration::from_millis(u64::from(millis)));
+        self.fake_key(keycode, false)?;
+        if shift {
+            self.fake_key(self.shift_keycode, false)?;
+        }
+        self.flush()
     }
 
     fn permissions(&mut self) -> Permissions {
@@ -531,5 +762,9 @@ impl Body for X11Body {
 
     fn set_max_capture_dimension(&mut self, max: Option<u32>) {
         self.max_capture_dimension = max;
+    }
+
+    fn framebuffer_pool(&self) -> Option<&FramebufferPool> {
+        Some(&self.pool)
     }
 }
