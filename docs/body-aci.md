@@ -267,11 +267,15 @@ with denied permissions (`mock-denied` mode, P1 only).
   oracle log protocol for the golden gate.
 - **`pool-bench`** (Phase 4, Linux) measures the framebuffer
   pool on the real X11 body: 200 screenshots without recycling
-  vs 200 with. Measured 2026-11-18 under Xvfb (machine loaded
-  by a concurrent Ollama run, so wall times are noisy and NOT
-  compared as a speedup claim): unrecycled 200 allocations / 0
-  reuses; recycled 1 allocation / 199 reuses. The pool's
-  contract is allocation reuse, and the counters prove it.
+  vs 200 with. Measured twice 2026-11-18 under Xvfb (both runs
+  on a loaded machine, so wall times are noisy and NOT a speedup
+  claim): run 1 — unrecycled 200 allocations / 0 reuses /
+  64.1s, recycled 1 allocation / 199 reuses / 70.2s; run 2 —
+  unrecycled 200 / 0 / 47.8s, recycled 1 / 199 / 46.8s. The
+  counters are deterministic across runs (the pool's contract
+  is allocation reuse, and it holds exactly); wall time is
+  dominated by XGetImage + machine load and shows no meaningful
+  difference (±2–9%, both directions).
 - **`golden`** and **`safety`** (Phase 4, in `mimint-control`
   / `mimint-ui`) are the P4.1 gates: the golden-task gate and
   the 8-case safety gate. See `docs/body-tools.md`.
