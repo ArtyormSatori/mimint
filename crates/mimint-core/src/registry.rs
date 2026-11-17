@@ -165,10 +165,16 @@ pub struct BackendSpec {
     /// (kinds without a preset fail validation instead).
     pub base_url: Option<String>,
     /// Environment variable holding the key (mutually exclusive with
-    /// `key_file`; when neither is set, `MIMINT_API_KEY` is tried).
+    /// `key_file` and `key_keychain`; when none is set, `MIMINT_API_KEY`
+    /// is tried).
     pub key_env: Option<String>,
-    /// Key file holding the key (mutually exclusive with `key_env`).
+    /// Key file holding the key (mutually exclusive with `key_env`
+    /// and `key_keychain`).
     pub key_file: Option<PathBuf>,
+    /// macOS Keychain account holding the key, under service
+    /// `ai.mimint` (mutually exclusive with `key_env` and `key_file`;
+    /// fails closed off macOS).
+    pub key_keychain: Option<String>,
     /// Per-request timeout.
     pub timeout: Duration,
     /// Claude-only `max_tokens`. Must be `None` for other kinds.
@@ -196,9 +202,12 @@ impl BackendSpec {
                 self.name
             )));
         }
-        if self.key_env.is_some() && self.key_file.is_some() {
+        let key_sources = self.key_env.is_some() as u8
+            + self.key_file.is_some() as u8
+            + self.key_keychain.is_some() as u8;
+        if key_sources > 1 {
             return Err(MimintError::Config(format!(
-                "backend '{}': specify only one of key_env and key_file",
+                "backend '{}': specify only one of key_env, key_file, and key_keychain",
                 self.name
             )));
         }
@@ -274,6 +283,12 @@ fn resolve_key(
     }
     if let Some(var) = &spec.key_env {
         return vault.get(var);
+    }
+    if let Some(account) = &spec.key_keychain {
+        let keychain = crate::keychain::KeychainVault;
+        return keychain.get(account).map_err(|err| {
+            MimintError::Config(format!("backend '{}': {}", spec.name, err.message()))
+        });
     }
     if loopback {
         return Ok(None);
@@ -401,6 +416,7 @@ mod tests {
             base_url: None,
             key_env: None,
             key_file: None,
+            key_keychain: None,
             timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS),
             max_tokens: None,
             allow_plaintext_auth: false,
@@ -461,6 +477,14 @@ mod tests {
         both.key_env = Some("A".to_string());
         both.key_file = Some(PathBuf::from("/tmp/x.key"));
         assert!(both.validate().is_err());
+        let mut keychain_plus_env = spec("x", BackendKind::Ollama, "m");
+        keychain_plus_env.key_env = Some("A".to_string());
+        keychain_plus_env.key_keychain = Some("acct".to_string());
+        let err = keychain_plus_env.validate().unwrap_err();
+        assert!(err.to_string().contains("only one of"), "{err}");
+        let mut keychain_only = spec("x", BackendKind::Ollama, "m");
+        keychain_only.key_keychain = Some("acct".to_string());
+        assert!(keychain_only.validate().is_ok());
         let mut wrong = spec("x", BackendKind::Ollama, "m");
         wrong.max_tokens = Some(10);
         assert!(wrong.validate().is_err());

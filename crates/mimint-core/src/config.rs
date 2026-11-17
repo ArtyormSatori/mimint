@@ -37,8 +37,8 @@
 //!
 //! Rules: unknown fields are rejected (typos fail loudly); a backend's
 //! model is always required; keys are NEVER written in this file —
-//! `key_env` / `key_file` name where the key lives, and a literal
-//! `api_key` field is rejected as an unknown field.
+//! `key_env` / `key_file` / `key_keychain` name where the key lives,
+//! and a literal `api_key` field is rejected as an unknown field.
 
 use crate::error::MimintError;
 use crate::fallback::RetryPolicy;
@@ -141,6 +141,9 @@ pub struct BackendEntry {
     pub key_env: Option<String>,
     /// Key file path (0600-checked).
     pub key_file: Option<String>,
+    /// macOS Keychain account holding the key (service `ai.mimint`).
+    /// Fails closed on other platforms.
+    pub key_keychain: Option<String>,
     /// Per-request timeout in seconds. Default: 30.
     pub timeout_secs: Option<u64>,
     /// Claude-only `max_tokens`. Default: 4096 (see [`crate::claude`]).
@@ -215,6 +218,7 @@ impl FileConfig {
                 base_url: entry.base_url.clone(),
                 key_env: entry.key_env.clone(),
                 key_file: entry.key_file.clone().map(PathBuf::from),
+                key_keychain: entry.key_keychain.clone(),
                 timeout: Duration::from_secs(entry.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS)),
                 max_tokens: entry.max_tokens,
                 allow_plaintext_auth: entry.allow_plaintext_auth.unwrap_or(false),
@@ -376,6 +380,26 @@ max_attempts = 2
         );
         assert_eq!(resolved.retry.max_attempts, 2);
         assert_eq!(resolved.backends[1].timeout, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn keychain_source_parses_and_resolves() {
+        let text = r#"
+default_backend = "cloud"
+
+[[backend]]
+name = "cloud"
+kind = "claude"
+model = "claude-sonnet-4-5"
+key_keychain = "anthropic"
+"#;
+        let resolved = FileConfig::parse(text).unwrap().validate().unwrap();
+        assert_eq!(
+            resolved.backends[0].key_keychain.as_deref(),
+            Some("anthropic")
+        );
+        assert!(resolved.backends[0].key_env.is_none());
+        assert!(resolved.backends[0].key_file.is_none());
     }
 
     #[test]

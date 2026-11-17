@@ -322,6 +322,7 @@ fn adhoc_spec(
         base_url: Some(base_url),
         key_env: None,
         key_file,
+        key_keychain: None,
         timeout: Duration::from_secs(timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS)),
         max_tokens: None,
         allow_plaintext_auth,

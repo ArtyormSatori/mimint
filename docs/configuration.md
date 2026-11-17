@@ -2,8 +2,8 @@
 
 Config file format: TOML. Unknown fields are rejected everywhere
 (typos fail loudly), including a literal `api_key` field: secrets
-must come from `key_env`/`key_file` through the vault, never from
-the file itself.
+must come from `key_env`/`key_file`/`key_keychain` through the
+vault, never from the file itself.
 
 ## File location
 
@@ -67,8 +67,9 @@ max_delay_ms = 5000
 | `kind` | string | yes | One of `ollama`, `lm-studio` (aliases: `lmstudio`, `lm_studio`), `openai` (alias: `openai-compatible`), `claude` (alias: `anthropic`). |
 | `model` | string | yes | Model name. There is no default model anywhere. |
 | `base_url` | string | only for `openai` | Endpoint override. Presets: Ollama `http://127.0.0.1:11434/v1`, LM Studio `http://127.0.0.1:1234/v1`, Claude `https://api.anthropic.com`. |
-| `key_env` | string | no | Environment variable holding the key. Mutually exclusive with `key_file`. |
-| `key_file` | string | no | Key file path. The file must be a regular file, not a symlink, with permissions no more open than owner-only (0600); it is checked on the open file descriptor at every read. Mutually exclusive with `key_env`. |
+| `key_env` | string | no | Environment variable holding the key. Mutually exclusive with `key_file` and `key_keychain`. |
+| `key_file` | string | no | Key file path. The file must be a regular file, not a symlink, with permissions no more open than owner-only (0600); it is checked on the open file descriptor at every read. Mutually exclusive with `key_env` and `key_keychain`. |
+| `key_keychain` | string | no | macOS Keychain account holding the key, under service `ai.mimint`. Read-only: store the key with Keychain Access or `security add-generic-password -s ai.mimint -a <account> -w`. On any other platform the backend fails to build with a clear error. Mutually exclusive with `key_env` and `key_file`. |
 | `timeout_secs` | integer | no | Per-request timeout. Default: 30. The `--timeout` flag overrides every backend. |
 | `max_tokens` | integer | no | Claude only. Default: 4096. Setting it for another kind is a configuration error. |
 | `allow_plaintext_auth` | bool | no | Default `false`. Opt-in to send this backend's key over plaintext `http://` to a loopback endpoint. Without it, a keyed plaintext-loopback backend fails at construction. |
@@ -107,15 +108,16 @@ variables were ignored.
 
 ## Key resolution
 
-Order: `key_file` > `key_env` > `MIMINT_API_KEY`. Absent
-everywhere means no key; whether a key is required is decided by
-the provider (remote endpoints require one; loopback endpoints do
-not).
+Order: `key_file` > `key_env` > `key_keychain` > `MIMINT_API_KEY`.
+Absent everywhere means no key; whether a key is required is
+decided by the provider (remote endpoints require one; loopback
+endpoints do not).
 
 Exception: for LOOPBACK endpoints, the `MIMINT_API_KEY` fallback
 does NOT apply. A loopback backend only gets a key when it
-explicitly declares `key_env`/`key_file`, so a stray ambient key is
-never sent to a local port where any process could be listening.
+explicitly declares `key_env`/`key_file`/`key_keychain`, so a stray
+ambient key is never sent to a local port where any process could
+be listening.
 
 Plaintext loopback auth: when a backend has a key and its endpoint
 is plaintext `http://` on loopback, construction fails unless the

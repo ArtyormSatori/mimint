@@ -389,6 +389,7 @@ fn stub_spec(port: u16, key_env: Option<String>, allow_plaintext_auth: bool) -> 
         base_url: Some(format!("http://127.0.0.1:{port}")),
         key_env,
         key_file: None,
+        key_keychain: None,
         timeout: Duration::from_secs(5),
         max_tokens: None,
         allow_plaintext_auth,

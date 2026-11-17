@@ -17,6 +17,7 @@ pub mod egress;
 pub mod error;
 pub mod fallback;
 pub mod guards;
+pub mod keychain;
 pub mod notebook;
 pub mod onboarding;
 pub mod provider;
@@ -32,6 +33,7 @@ pub use egress::{EgressPolicy, GuardedHttpClient};
 pub use error::MimintError;
 pub use fallback::{FallbackChain, RetryPolicy};
 pub use guards::{Approver, GuardedExecutor, Risk};
+pub use keychain::{KeychainVault, KEYCHAIN_SERVICE};
 pub use notebook::{Note, Notebook};
 pub use onboarding::{probe_local_backends, suggestion_text, LocalProbe};
 pub use provider::{
