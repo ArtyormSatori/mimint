@@ -4,6 +4,30 @@
 > Phase 2 dependency tree. `phase1/LICENSE-AUDIT.md` covers the Phase 1
 > tree only and is superseded by this file (see the notice at its top).
 
+## Fix-pass addendum (2026-11-17)
+
+The Phase 2 review fix pass (findings F2-01..F2-22) re-ran this audit
+from scratch: `cargo metadata --format-version 1` on vega against the
+updated `Cargo.lock` (Rust 1.98.1), and the regenerated table was
+compared byte-for-byte with the table below. Result: IDENTICAL — 156
+packages, same names, versions, and declared licenses; 0 new
+packages, 0 forbidden, 0 version changes.
+
+- The fix pass adds exactly two new DIRECT dependencies, both already
+  present in the Phase 2 resolve as transitive dependencies, so
+  `Cargo.lock` grows by 2 lines only (dependency edges, no new
+  packages): `zeroize` 1.9.1 (`Apache-2.0 OR MIT`; secret wiping, with
+  the `alloc` feature for the `String` impl) and `libc` 0.2.191 (`MIT
+  OR Apache-2.0`; `O_NOFOLLOW`/`ELOOP` for the file-vault descriptor
+  check). Both were already counted clean in the table below; no new
+  verdict was needed.
+- The `r-efi` election stands: re-verified 2026-11-17, 0 occurrences
+  in `cargo tree` for x86_64-unknown-linux-gnu and `--target all`, 0
+  compiled artifacts under `target/debug/deps/`.
+- The `webpki-roots` CDLA-Permissive-2.0 note stands unchanged.
+- Repo license still TBD (a user decision is required before Phase
+  8); no license file added.
+
 Source: `cargo metadata --format-version 1` run on vega against the
 workspace `Cargo.lock` (Rust 1.98.1), 2026-11-17. Every package in the
 resolve is listed below with its declared `license` field exactly as

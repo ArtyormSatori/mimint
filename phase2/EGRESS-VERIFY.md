@@ -65,6 +65,51 @@ request.
   available) would still be a useful independent check; it was not
   possible here.
 
+## Fix-pass re-verification (2026-11-17)
+
+The Phase 2 review fix pass added a second enforcement layer: when
+Privacy Mode is on, the reqwest client uses a custom DNS resolver
+(`LoopbackGuardResolver` in `crates/mimint-core/src/egress.rs`) that
+checks the RESOLVED address. `localhost` resolves directly to
+127.0.0.1 with no DNS query (a poisoned `/etc/hosts` cannot redirect
+it); any other name resolving to a non-loopback address is refused
+before `connect()`. The hostname-string check stays as the first
+layer. The single-client-site rule is now enforced mechanically:
+`clippy.toml` disallows `reqwest::Client::builder` /
+`reqwest::Client::new` everywhere except `GuardedHttpClient::new`
+(verified by negative control: removing the `#[allow]` makes clippy
+fail with `disallowed_methods`).
+
+Re-verified with the same strace method (strace 6.13 user-land binary
+at `mimint-run/strace-try/usr/bin/strace`, `connect()` tracing of the
+real binary; no packet capture, same limits as above):
+
+- **Run A — Privacy-ON turn through a `127.0.0.1` stub:** exit 0, 2
+  steps, `notebook_add` executed and verified. Exactly 2 `connect()`
+  calls, both `AF_INET` to `127.0.0.1:18098`, 0 non-loopback.
+- **Run A2 — Privacy-ON turn through a `localhost` stub:** exit 0, 2
+  steps, `notebook_add` executed and verified. Exactly 2 `connect()`
+  calls, both to `127.0.0.1:18099`: the resolver short-circuit is
+  visible at the syscall layer (the URL said `localhost`, the socket
+  went to 127.0.0.1).
+- **Run B — Privacy-ON attempt with `--base-url https://example.com`
+  and a `[cost]` opt-in (so the request reaches the Privacy check):**
+  exit 1 with a Privacy Mode error, **0** `connect()` calls.
+- **Run B2 — same attempt with no config file:** exit 1 with the
+  cost-lock error (absent `[cost]` locks paid backends), **0**
+  `connect()` calls: the cost gate fires before the Privacy check.
+- **Fake-resolver unit tests** (in `egress.rs`): a resolver returning
+  a public IP is refused when Privacy is on, passes when off; a mixed
+  loopback+public answer is refused; `localhost` never consults the
+  inner resolver (0 inner calls across 3 spellings).
+
+Updated limits: the DNS gap from the original verification is now
+closed for the resolve path itself (resolved addresses are checked,
+and `localhost` bypasses DNS entirely). The guarantee still covers
+only this process's own connections; a local proxy or another
+process forwarding traffic onward is still out of scope, as is what
+a loopback backend itself does with received data.
+
 ## Reproduce
 
 ```sh
