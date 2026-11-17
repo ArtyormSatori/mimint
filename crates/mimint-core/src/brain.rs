@@ -36,6 +36,38 @@ struct PendingVerification {
     error: Option<String>,
 }
 
+/// A step verifier: re-reads state after a tool executes and
+/// reports whether the tool's claimed effect is observable.
+///
+/// Body-free by design: mimint-core never depends on a body.
+/// The control crate registers a verifier that re-screenshots
+/// after body tools and records frame metadata in the
+/// verification audit record.
+///
+/// Contract:
+/// - Return `Ok(None)` for tools the verifier has no opinion
+///   on: the brain falls back to status verification.
+/// - Return `Ok(Some((verified, detail)))` to decide: `detail`
+///   becomes the verification audit record's data, so it must
+///   be small, JSON-serializable, and free of secrets and
+///   pixels (frame metadata, not frame bytes).
+/// - Return `Err` when verification itself fails: the step is
+///   recorded as failed with reason `verifier_error`. A
+///   verifier error never aborts the turn.
+/// - `verify` is synchronous and must be bounded: it runs on
+///   the worker thread between steps. A verifier that talks
+///   to hardware must enforce its own timeout.
+/// - `notebook_add` keeps its built-in re-read and is never
+///   offered to the verifier.
+pub trait StepVerifier: Send + Sync {
+    fn verify(
+        &self,
+        tool: &str,
+        args: &Value,
+        output: &Value,
+    ) -> Result<Option<(bool, Value)>, MimintError>;
+}
+
 /// One-turn brain loop over a provider, a tool registry, and a notebook.
 /// The provider is any [`Provider`] implementation: a single backend or
 /// a fallback chain. The loop itself is protocol-agnostic.
@@ -48,6 +80,7 @@ pub struct Brain<'a> {
     turn_id: String,
     max_steps: usize,
     cancel_tokens: Vec<CancelToken>,
+    verifier: Option<Arc<dyn StepVerifier>>,
 }
 
 impl<'a> Brain<'a> {
@@ -75,7 +108,15 @@ impl<'a> Brain<'a> {
             turn_id: turn_id.into(),
             max_steps,
             cancel_tokens: Vec::new(),
+            verifier: None,
         })
+    }
+
+    /// Register a step verifier (see [`StepVerifier`]). A brain
+    /// without one behaves exactly as before: status
+    /// verification for every tool except `notebook_add`.
+    pub fn set_step_verifier(&mut self, verifier: Arc<dyn StepVerifier>) {
+        self.verifier = Some(verifier);
     }
 
     /// Add a cancellation token: checked before every provider call
@@ -271,10 +312,12 @@ impl<'a> Brain<'a> {
     /// Verify one previous tool result by code and audit the outcome.
     ///
     /// `notebook_add` is verified by re-reading the row just written and
-    /// comparing its title and body. Other tools are verified by status
-    /// (the executor returned success); Phase 1 has no further verifier
-    /// hook. A failed verification is recorded and reflected to the model
-    /// on the next round; it does not abort the turn.
+    /// comparing its title and body. Other tools are offered to the
+    /// registered [`StepVerifier`] when one exists (its `None` means
+    /// "no opinion", falling back to status verification); without a
+    /// verifier, status verification applies (the executor returned
+    /// success). A failed verification is recorded and reflected to
+    /// the model on the next round; it does not abort the turn.
     fn verify_previous(&self, prev: &PendingVerification) -> Result<bool, MimintError> {
         if let Some(error) = &prev.error {
             self.audit.log(
@@ -319,16 +362,47 @@ impl<'a> Brain<'a> {
                 json!({"id": id, "re_read_row": verified}),
             )?;
             Ok(verified)
+        } else if let Some(verifier) = &self.verifier {
+            match verifier.verify(&prev.tool, &prev.args, output) {
+                Ok(Some((verified, detail))) => {
+                    self.audit.log(
+                        &self.turn_id,
+                        "verification",
+                        Some(&prev.tool),
+                        Some(if verified { "verified" } else { "failed" }),
+                        detail,
+                    )?;
+                    Ok(verified)
+                }
+                Ok(None) => self.verify_by_status(prev),
+                Err(err) => {
+                    self.audit.log(
+                        &self.turn_id,
+                        "verification",
+                        Some(&prev.tool),
+                        Some("failed"),
+                        json!({"reason": "verifier_error", "error": err.to_string()}),
+                    )?;
+                    Ok(false)
+                }
+            }
         } else {
-            self.audit.log(
-                &self.turn_id,
-                "verification",
-                Some(&prev.tool),
-                Some("verified"),
-                json!({"reason": "status_ok"}),
-            )?;
-            Ok(true)
+            self.verify_by_status(prev)
         }
+    }
+
+    /// Status verification: the executor returned success, so the
+    /// step counts as verified. Used when no verifier is
+    /// registered, or the verifier has no opinion on the tool.
+    fn verify_by_status(&self, prev: &PendingVerification) -> Result<bool, MimintError> {
+        self.audit.log(
+            &self.turn_id,
+            "verification",
+            Some(&prev.tool),
+            Some("verified"),
+            json!({"reason": "status_ok"}),
+        )?;
+        Ok(true)
     }
 }
 
@@ -454,6 +528,245 @@ mod tests {
         .expect("text reply succeeds");
         assert_eq!(outcome.text, "An answer.");
         assert!(!outcome.partial);
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(&audit_path);
+    }
+
+    /// Provider that returns a scripted sequence of replies, then a
+    /// final text reply forever.
+    struct ScriptProvider {
+        replies: std::sync::Mutex<std::collections::VecDeque<ChatMessage>>,
+    }
+
+    impl Provider for ScriptProvider {
+        fn name(&self) -> &str {
+            "script"
+        }
+
+        fn model(&self) -> &str {
+            "script-model"
+        }
+
+        fn endpoint_url(&self) -> &str {
+            "http://127.0.0.1:1/v1/chat/completions"
+        }
+
+        fn is_paid(&self) -> bool {
+            false
+        }
+
+        fn chat<'a>(
+            &'a self,
+            _ctx: &'a CallContext<'a>,
+            _messages: &'a [ChatMessage],
+            _tools: &'a [Value],
+        ) -> BoxFuture<'a, Result<ChatMessage, MimintError>> {
+            let message = self
+                .replies
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(ChatMessage {
+                    role: "assistant".to_string(),
+                    content: Some("Done.".to_string()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                });
+            Box::pin(async move { Ok(message) })
+        }
+    }
+
+    struct RecordingVerifier {
+        calls: std::sync::Mutex<Vec<(String, Value, Value)>>,
+        verdict: Option<(bool, Value)>,
+    }
+
+    impl StepVerifier for RecordingVerifier {
+        fn verify(
+            &self,
+            tool: &str,
+            args: &Value,
+            output: &Value,
+        ) -> Result<Option<(bool, Value)>, MimintError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((tool.to_string(), args.clone(), output.clone()));
+            Ok(self.verdict.clone())
+        }
+    }
+
+    fn tool_call_message(tool: &str, args: &str) -> ChatMessage {
+        use crate::provider::{FunctionCall, ToolCall};
+        ChatMessage {
+            role: "assistant".to_string(),
+            content: None,
+            tool_calls: Some(vec![ToolCall {
+                id: "call_1".to_string(),
+                kind: "function".to_string(),
+                function: FunctionCall {
+                    name: tool.to_string(),
+                    arguments: args.to_string(),
+                },
+            }]),
+            tool_call_id: None,
+        }
+    }
+
+    fn audit_records(path: &str) -> Vec<Value> {
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn step_verifier_decides_and_its_detail_is_audited() {
+        let stem = temp_stem("verifier");
+        let db_path = format!("{stem}.db");
+        let audit_path = format!("{stem}.jsonl");
+        let notebook = Arc::new(Notebook::open(&db_path).unwrap());
+        let audit = AuditLog::open(&audit_path).unwrap();
+        let registry = crate::tools::default_registry(Arc::clone(&notebook));
+        let provider = ScriptProvider {
+            replies: std::sync::Mutex::new(std::collections::VecDeque::from([
+                tool_call_message("notebook_search", r#"{"query":"nothing"}"#),
+                ChatMessage {
+                    role: "assistant".to_string(),
+                    content: Some("Done.".to_string()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                },
+            ])),
+        };
+        let verifier = Arc::new(RecordingVerifier {
+            calls: std::sync::Mutex::new(Vec::new()),
+            verdict: Some((true, json!({"re_read": "state_matches", "frame": 7}))),
+        });
+        let mut brain = Brain::new(
+            &provider,
+            &registry,
+            None,
+            &audit,
+            Arc::clone(&notebook),
+            "turn-verifier-test",
+            3,
+        )
+        .unwrap();
+        brain.set_step_verifier(verifier.clone());
+        let outcome = brain.run("search").await.expect("turn succeeds");
+        assert_eq!(outcome.tools_used, vec!["notebook_search"]);
+        let calls = verifier.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "notebook_search");
+        assert_eq!(
+            calls[0].1.get("query").and_then(Value::as_str),
+            Some("nothing")
+        );
+        let records = audit_records(&audit_path);
+        let verification = records
+            .iter()
+            .find(|r| r["kind"] == "verification")
+            .expect("a verification record");
+        assert_eq!(verification["decision"], "verified");
+        assert_eq!(verification["detail"]["re_read"], "state_matches");
+        assert_eq!(verification["detail"]["frame"], 7);
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(&audit_path);
+    }
+
+    #[tokio::test]
+    async fn step_verifier_no_opinion_falls_back_to_status() {
+        let stem = temp_stem("verifier-none");
+        let db_path = format!("{stem}.db");
+        let audit_path = format!("{stem}.jsonl");
+        let notebook = Arc::new(Notebook::open(&db_path).unwrap());
+        let audit = AuditLog::open(&audit_path).unwrap();
+        let registry = crate::tools::default_registry(Arc::clone(&notebook));
+        let provider = ScriptProvider {
+            replies: std::sync::Mutex::new(std::collections::VecDeque::from([tool_call_message(
+                "notebook_search",
+                r#"{"query":"nothing"}"#,
+            )])),
+        };
+        let verifier = Arc::new(RecordingVerifier {
+            calls: std::sync::Mutex::new(Vec::new()),
+            verdict: None,
+        });
+        let mut brain = Brain::new(
+            &provider,
+            &registry,
+            None,
+            &audit,
+            Arc::clone(&notebook),
+            "turn-verifier-none-test",
+            3,
+        )
+        .unwrap();
+        brain.set_step_verifier(verifier.clone());
+        brain.run("search").await.expect("turn succeeds");
+        assert_eq!(verifier.calls.lock().unwrap().len(), 1);
+        let records = audit_records(&audit_path);
+        let verification = records
+            .iter()
+            .find(|r| r["kind"] == "verification")
+            .expect("a verification record");
+        assert_eq!(verification["decision"], "verified");
+        assert_eq!(verification["detail"]["reason"], "status_ok");
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(&audit_path);
+    }
+
+    #[tokio::test]
+    async fn step_verifier_failure_is_recorded_not_fatal() {
+        let stem = temp_stem("verifier-false");
+        let db_path = format!("{stem}.db");
+        let audit_path = format!("{stem}.jsonl");
+        let notebook = Arc::new(Notebook::open(&db_path).unwrap());
+        let audit = AuditLog::open(&audit_path).unwrap();
+        let registry = crate::tools::default_registry(Arc::clone(&notebook));
+        let provider = ScriptProvider {
+            replies: std::sync::Mutex::new(std::collections::VecDeque::from([tool_call_message(
+                "notebook_search",
+                r#"{"query":"nothing"}"#,
+            )])),
+        };
+        let verifier = Arc::new(RecordingVerifier {
+            calls: std::sync::Mutex::new(Vec::new()),
+            verdict: Some((false, json!({"re_read": "state_differs"}))),
+        });
+        let mut brain = Brain::new(
+            &provider,
+            &registry,
+            None,
+            &audit,
+            Arc::clone(&notebook),
+            "turn-verifier-false-test",
+            3,
+        )
+        .unwrap();
+        brain.set_step_verifier(verifier.clone());
+        let outcome = brain.run("search").await.expect("turn still succeeds");
+        assert_eq!(outcome.text, "Done.");
+        let records = audit_records(&audit_path);
+        let verification = records
+            .iter()
+            .find(|r| r["kind"] == "verification")
+            .expect("a verification record");
+        assert_eq!(verification["decision"], "failed");
+        // The reflection fed back to the model carries verified=false.
+        let reflection = records
+            .iter()
+            .find(|r| {
+                r["kind"] == "reflection"
+                    && r["detail"]["verified"]
+                        .as_array()
+                        .is_some_and(|v| !v.is_empty())
+            })
+            .expect("a reflection with verification results");
+        assert_eq!(reflection["detail"]["verified"][0]["verified"], false);
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_file(&audit_path);
     }

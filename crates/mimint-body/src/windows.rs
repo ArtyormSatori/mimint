@@ -218,6 +218,23 @@ fn window_integrity_level(window: HWND) -> Option<u32> {
     }
 }
 
+/// Human name for an integrity level, for the UIPI error.
+/// Levels between the named constants take the lower name
+/// (e.g. 0x2001 is still "medium" for display purposes).
+fn il_name(level: u32) -> &'static str {
+    if level >= IL_SYSTEM {
+        "system"
+    } else if level >= IL_HIGH {
+        "high"
+    } else if level >= IL_MEDIUM {
+        "medium"
+    } else if level >= IL_LOW {
+        "low"
+    } else {
+        "untrusted"
+    }
+}
+
 fn virtual_key_for(key: Key) -> VIRTUAL_KEY {
     match key {
         Key::Enter => VK_RETURN,
@@ -297,20 +314,6 @@ impl WindowsBody {
         Ok(())
     }
 
-    fn verify_focus(&self) -> Result<(), BodyError> {
-        let Some(expected) = self.expected_focus else {
-            return Ok(());
-        };
-        let actual = unsafe { GetForegroundWindow() };
-        if actual.0 as u64 != expected {
-            return Err(BodyError::FocusMismatch {
-                expected: Some(expected),
-                actual: Some(actual.0 as u64),
-            });
-        }
-        Ok(())
-    }
-
     /// Forbidden-window check on the foreground window class.
     /// Undeterminable (no foreground window, unreadable class)
     /// allows.
@@ -338,7 +341,9 @@ impl WindowsBody {
         if target_il > own {
             return Err(BodyError::UipiBlocked {
                 target: format!(
-                    "{what} runs at integrity level 0x{target_il:x}, above this process (0x{own:x}); input would be dropped by UIPI"
+                    "{what} runs at integrity level {} (0x{target_il:x}), above this process ({} 0x{own:x}); input would be dropped by UIPI",
+                    il_name(target_il),
+                    il_name(own),
                 ),
             });
         }
@@ -512,7 +517,7 @@ impl Body for WindowsBody {
             )));
         }
         let mut rgba = Vec::with_capacity(bgra.len());
-        for px in bgra.chunks_exact(4) {
+        for px in bgra.as_chunks::<4>().0 {
             rgba.extend_from_slice(&[px[2], px[1], px[0], 255]);
         }
         let frame = Framebuffer::with_geometry(width, height, rgba, Self::scale_factor(), (0, 0))?;
@@ -698,7 +703,24 @@ impl Body for WindowsBody {
         self.excluded = rects;
     }
 
-    fn expect_focus(&mut self, window: Option<u64>) {
+    /// The foreground window's handle as a stable id. The trait's
+    /// `verify_focus` compares it against the expectation; a
+    /// NULL foreground window yields None (fail-closed when an
+    /// expectation is set).
+    fn active_window(&mut self) -> Option<u64> {
+        let foreground = unsafe { GetForegroundWindow() };
+        if foreground.is_invalid() {
+            None
+        } else {
+            Some(foreground.0 as u64)
+        }
+    }
+
+    fn expected_focus(&self) -> Option<u64> {
+        self.expected_focus
+    }
+
+    fn set_expected_focus(&mut self, window: Option<u64>) {
         self.expected_focus = window;
     }
 

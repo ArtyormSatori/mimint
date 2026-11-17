@@ -2061,6 +2061,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "mimint-control"
+version = "0.1.0"
+dependencies = [
+ "mimint-body",
+ "mimint-core",
+ "png",
+ "ring",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "mimint-core"
 version = "0.1.0"
 dependencies = [

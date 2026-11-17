@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Shown in Settings > Accessibility when the user enables
+         the service. It must say plainly what the service does:
+         no marketing, no understatement. -->
+    <string name="accessibility_service_description">Mimint Shell: lets the paired Mimint controller on your own computer view this device\'s screen and send touch input over a loopback connection, only while this service is running. The controller must present the pairing token shown in the Mimint Shell app. Stop it any time from the notification or the app.</string>
+    <string name="app_name">Mimint Shell</string>
+</resources>

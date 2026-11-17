@@ -1,0 +1,20 @@
+[package]
+name = "mimint-control"
+version = "0.1.0"
+edition = "2021"
+description = "Body actions as brain tools: the actor thread, frame store, tool surface, and verification hook (Phase 4, P4.1/P4.6)."
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+mimint-core = { path = "../mimint-core" }
+mimint-body = { path = "../mimint-body" }
+serde_json = "1"
+# SHA-256 for frame hashing and cert pins (already in the
+# lockfile via reqwest/rustls: 0 new packages).
+ring = "0.17"
+# PNG encoding for golden-task input hashing (already in the
+# lockfile via egui: 0 new packages).
+png = "0.18"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

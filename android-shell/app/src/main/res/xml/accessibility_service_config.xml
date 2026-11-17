@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  AccessibilityService configuration. The flags are the minimum
+  the shell needs:
+  - flagRequestTouchExplorationMode is NOT set: the shell does
+    not change how the user touches the screen.
+  - flagRetrieveInteractiveWindows: focused-window reporting
+    (the `focused_window` protocol method) needs the window list.
+  - canPerformGestures: dispatchGesture for click/drag/scroll.
+  - canRetrieveWindowContent: findFocus for type_text + the
+    focused-window query.
+  Feedback type generic: the shell is not a screen reader and
+  must not announce itself as one.
+-->
+<accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:accessibilityEventTypes="typeAllMask"
+    android:accessibilityFeedbackType="feedbackGeneric"
+    android:accessibilityFlags="flagRetrieveInteractiveWindows"
+    android:canPerformGestures="true"
+    android:canRetrieveWindowContent="true"
+    android:description="@string/accessibility_service_description"
+    android:notificationTimeout="100" />

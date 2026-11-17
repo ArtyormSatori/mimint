@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Mimint Android shell (P4.3). Thin shell, thick protocol: all
+  policy (allow-list, guards, approval) lives in the Rust core;
+  this app only exposes the device's screen and input over
+  protocol v2 on loopback, behind pairing auth + TLS pinning.
+
+  Permissions, each with its reason:
+  - FOREGROUND_SERVICE / FOREGROUND_SERVICE_MEDIA_PROJECTION:
+    the protocol server runs as a foreground service so the
+    user always sees it running (notification + kill action).
+  - INTERNET: loopback sockets only. The server binds
+    127.0.0.1; nothing here opens an outbound connection.
+  - POST_NOTIFICATIONS: the kill-switch notification.
+  - SYSTEM_ALERT_WINDOW is NOT requested: no overlay, no
+    floating kill button. The kill affordance is the
+    notification action + the MainActivity stop button.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <uses-feature
+        android:name="android.software.leanback"
+        android:required="false" />
+    <uses-feature
+        android:name="android.hardware.touchscreen"
+        android:required="false" />
+
+    <application
+        android:allowBackup="false"
+        android:label="Mimint Shell"
+        android:theme="@android:style/Theme.Material.Light.NoActionBar">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <activity
+            android:name=".TestTargetActivity"
+            android:exported="false"
+            android:theme="@android:style/Theme.Material.Light.NoActionBar.Fullscreen" />
+
+        <service
+            android:name=".MimintAccessibilityService"
+            android:exported="false"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/accessibility_service_config" />
+        </service>
+
+    </application>
+
+</manifest>

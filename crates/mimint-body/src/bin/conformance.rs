@@ -6,7 +6,9 @@
 //!   conformance --body mock-denied
 //!   conformance --body x11 --log <testwin-log> --control <testwin-control-file>
 //!   conformance --body macos --log <testapp-log> --control <testapp-control-file>
-//!   conformance --body x11|macos --shot <out.ppm>
+//!   conformance --body android --addr 127.0.0.1:<port> --token <pairing-token>
+//!       [--pin <64-hex-sha256>] --log <shell-log> --control <shell-control-file>
+//!   conformance --body x11|macos|android --shot <out.ppm>
 //!
 //! Modes:
 //! - `mock`: deterministic in-memory body, no target needed.
@@ -18,6 +20,15 @@
 //!   silent) instead of the main suite.
 //! - `x11` / `macos`: real bodies against a running test target
 //!   (the runner waits for its READY line, up to 10s).
+//! - `android`: the Android body over protocol v2, against the
+//!   Kotlin shell's conformance target (see `android-verify/`).
+//!   The shell's event log is streamed to the local `--log` file
+//!   and the `--control` file is pushed to the device by the
+//!   hook script; this runner only reads/writes the local files.
+//!   The pairing token comes from `--token` or the
+//!   `MIMINT_ANDROID_TOKEN` env var (preferred: CLI args show up
+//!   in `ps`). `--pin` enables pinned TLS; without it the
+//!   connection is plain loopback (test hook only).
 //!
 //! Real bodies are wrapped in [`GuardedBody`] with a default
 //! self-exclusion rect (0,0,40,40) — outside the test target — and
@@ -32,9 +43,11 @@
 
 use mimint_body::conformance::{check_permission_denied, run_guarded_suite, run_suite};
 use mimint_body::{
-    shot_path_allowed, Body, FileOracle, GuardedBody, MockBody, RateLimits, ScreenRect,
+    shot_path_allowed, AndroidBody, AndroidConfig, Body, FileOracle, GuardedBody, MockBody,
+    RateLimits, Role, ScreenRect, TlsMode,
 };
 use std::env;
+use std::net::SocketAddr;
 use std::process::exit;
 use std::time::Duration;
 
@@ -49,14 +62,70 @@ const DEFAULT_EXCLUSION: ScreenRect = ScreenRect {
 };
 
 fn usage() -> ! {
-    eprintln!("usage: conformance --body mock|mock-scaled|mock-denied|x11|macos [--log <path> --control <path>] [--shot <out.ppm>]");
+    eprintln!("usage: conformance --body mock|mock-scaled|mock-denied|x11|macos|android [--log <path> --control <path>] [--shot <out.ppm>] [--addr <ip:port> --token <token> [--pin <hex>]]");
     eprintln!("  mock:        no target needed (the mock body is its own oracle)");
     eprintln!("  mock-scaled: mock body at scale 2 with a non-zero origin");
     eprintln!("  mock-denied: mock body reporting denied permissions (P1 check only)");
     eprintln!("  x11:         needs a running testwin (see testwin binary) on DISPLAY");
     eprintln!("  macos:       needs a running TestWin.app target (see mac-verify/)");
+    eprintln!("  android:     needs --addr (loopback) + --token (or MIMINT_ANDROID_TOKEN) + the shell hook (see android-verify/)");
     eprintln!("  --shot: write one screenshot as PPM and exit (no target needed)");
     exit(2);
+}
+
+/// Decode 64 lowercase/uppercase hex chars into a 32-byte pin.
+/// Hand-rolled: no hex dependency for one flag.
+fn parse_pin(raw: &str) -> Option<[u8; 32]> {
+    let bytes = raw.as_bytes();
+    if bytes.len() != 64 {
+        return None;
+    }
+    let nibble = |b: u8| -> Option<u8> {
+        match b {
+            b'0'..=b'9' => Some(b - b'0'),
+            b'a'..=b'f' => Some(b - b'a' + 10),
+            b'A'..=b'F' => Some(b - b'A' + 10),
+            _ => None,
+        }
+    };
+    let mut pin = [0u8; 32];
+    for i in 0..32 {
+        pin[i] = (nibble(bytes[2 * i])? << 4) | nibble(bytes[2 * i + 1])?;
+    }
+    Some(pin)
+}
+
+fn android_config(addr: &str, token: &str, pin: &str) -> AndroidConfig {
+    let addr: SocketAddr = match addr.parse() {
+        Ok(addr) => addr,
+        Err(err) => {
+            eprintln!("--addr must be an ip:port socket address: {err}");
+            exit(2);
+        }
+    };
+    let token = if token.is_empty() {
+        env::var("MIMINT_ANDROID_TOKEN").unwrap_or_default()
+    } else {
+        token.to_string()
+    };
+    let tls = if pin.is_empty() {
+        TlsMode::Plain
+    } else {
+        match parse_pin(pin) {
+            Some(fingerprint) => TlsMode::PinnedSha256(fingerprint),
+            None => {
+                eprintln!("--pin must be exactly 64 hex characters (SHA-256 of the cert DER)");
+                exit(2);
+            }
+        }
+    };
+    match AndroidConfig::loopback(addr, &token, Role::Owner, tls) {
+        Ok(config) => config,
+        Err(err) => {
+            eprintln!("invalid android config: {err}");
+            exit(2);
+        }
+    }
 }
 
 fn main() {
@@ -65,6 +134,9 @@ fn main() {
     let mut log_path = String::new();
     let mut control_path = String::new();
     let mut shot_path = String::new();
+    let mut addr = String::new();
+    let mut token = String::new();
+    let mut pin = String::new();
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -83,6 +155,18 @@ fn main() {
             "--shot" => {
                 i += 1;
                 shot_path = args.get(i).cloned().unwrap_or_default();
+            }
+            "--addr" => {
+                i += 1;
+                addr = args.get(i).cloned().unwrap_or_default();
+            }
+            "--token" => {
+                i += 1;
+                token = args.get(i).cloned().unwrap_or_default();
+            }
+            "--pin" => {
+                i += 1;
+                pin = args.get(i).cloned().unwrap_or_default();
             }
             "--help" | "-h" => usage(),
             other => {
@@ -168,6 +252,16 @@ fn main() {
                 eprintln!("body 'macos' is only available on macOS");
                 exit(2);
             }
+        }
+        "android" => {
+            let config = android_config(&addr, &token, &pin);
+            if !shot_path.is_empty() {
+                let config = config.clone();
+                shoot::<AndroidBody>(&shot_path, move || Ok(AndroidBody::new(config)));
+            }
+            run_file_oracle_body::<AndroidBody>(&log_path, &control_path, move || {
+                Ok(AndroidBody::new(config))
+            });
         }
         _ => usage(),
     }

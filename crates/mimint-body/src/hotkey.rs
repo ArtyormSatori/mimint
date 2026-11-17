@@ -21,8 +21,13 @@
 //! The chord matching itself is pure computation and unit-tested
 //! on every platform; only the grab loop is Linux-only.
 
+// Only the Linux grab loop uses these; on other targets they
+// would be unused imports (caught by the Windows-target check).
+#[cfg(target_os = "linux")]
 use crate::error::BodyError;
+#[cfg(target_os = "linux")]
 use crate::guarded::StopFlag;
+#[cfg(target_os = "linux")]
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// X modifier mask bits (protocol-stable).

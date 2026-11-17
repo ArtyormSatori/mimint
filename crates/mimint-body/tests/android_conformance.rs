@@ -133,6 +133,58 @@ fn pinned_tls_rejects_a_wrong_fingerprint() {
 }
 
 #[test]
+fn conformance_binary_shot_mode_talks_to_the_fake_shell() {
+    // The `--body android --shot` path of the conformance binary,
+    // exercised end to end against the fake shell over a real
+    // socket: arg parsing, config building, connect, screenshot,
+    // PPM write. The full suite run stays BLOCKED on the real
+    // shell + device (android-verify/).
+    let server = plain_server();
+    let out = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/android-shot-test.ppm");
+    // The crate dir has no target/ of its own (the workspace
+    // target dir lives at the root); create the parent.
+    let _ = std::fs::create_dir_all(out.parent().unwrap());
+    let _ = std::fs::remove_file(&out);
+    let status = std::process::Command::new(env!("CARGO_BIN_EXE_conformance"))
+        .args([
+            "--body",
+            "android",
+            "--addr",
+            &server.addr().to_string(),
+            "--token",
+            TOKEN,
+            "--shot",
+            out.to_str().unwrap(),
+        ])
+        .status()
+        .expect("run conformance binary");
+    assert!(status.success(), "conformance --shot failed: {status}");
+    let ppm = std::fs::read(&out).expect("read PPM");
+    assert!(ppm.starts_with(b"P6\n800 600\n255\n"), "bad PPM header");
+    assert_eq!(ppm.len(), "P6\n800 600\n255\n".len() + 800 * 600 * 3);
+    let _ = std::fs::remove_file(&out);
+    server.stop();
+}
+
+#[test]
+fn conformance_binary_rejects_a_bad_pin() {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_conformance"))
+        .args([
+            "--body",
+            "android",
+            "--addr",
+            "127.0.0.1:1",
+            "--token",
+            "x",
+            "--pin",
+            "not-hex",
+        ])
+        .output()
+        .expect("run conformance binary");
+    assert_eq!(out.status.code(), Some(2));
+}
+
+#[test]
 fn guest_suite_fails_exactly_the_input_checks() {
     let server = plain_server();
     let config =
