@@ -83,8 +83,9 @@ impl Key {
     }
 }
 
-/// One action a body can perform. Coordinates are absolute display
-/// pixels with the origin at the top-left of the primary display.
+/// One action a body can perform. Coordinates are framebuffer
+/// pixels (see the contract in `crate::body`): the single coordinate
+/// space, origin top-left of the frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     /// Capture the full primary display.
@@ -93,9 +94,13 @@ pub enum Action {
     Click { x: i32, y: i32 },
     /// Move the pointer to (x, y) without clicking.
     Move { x: i32, y: i32 },
-    /// Type text as keystrokes. `\n` means Enter, `\t` means Tab.
+    /// Type Unicode text as characters. `\n` means Enter, `\t`
+    /// means Tab. This is the TEXT path: it types characters,
+    /// independent of the keyboard layout where the platform allows
+    /// it. It is NOT the physical-key path — arrows, function keys,
+    /// and modifiers belong to [`Action::Key`].
     TypeText { text: String },
-    /// Press and release one special key.
+    /// Press and release one special (physical) key.
     Key { key: Key },
 }
 
@@ -140,12 +145,12 @@ pub fn action_specs() -> Vec<ActionSpec> {
         },
         ActionSpec {
             name: "click",
-            description: "Move the pointer to absolute display coordinates (x, y) and click the primary button. Origin is the top-left of the primary display.",
+            description: "Move the pointer to framebuffer-pixel coordinates (x, y) and click the primary button. Origin is the top-left of the screenshot frame; the body converts to OS-native coordinates internally. Validated against the display size at execution time.",
             params_schema: json!({
                 "type": "object",
                 "properties": {
-                    "x": { "type": "integer", "description": "Absolute X pixel, 0-based from the left edge." },
-                    "y": { "type": "integer", "description": "Absolute Y pixel, 0-based from the top edge." },
+                    "x": { "type": "integer", "description": "Framebuffer X pixel, 0-based from the left edge of the screenshot." },
+                    "y": { "type": "integer", "description": "Framebuffer Y pixel, 0-based from the top edge of the screenshot." },
                 },
                 "required": ["x", "y"],
                 "additionalProperties": false,
@@ -153,7 +158,7 @@ pub fn action_specs() -> Vec<ActionSpec> {
         },
         ActionSpec {
             name: "move",
-            description: "Move the pointer to absolute display coordinates (x, y) without clicking.",
+            description: "Move the pointer to framebuffer-pixel coordinates (x, y) without clicking.",
             params_schema: json!({
                 "type": "object",
                 "properties": {
@@ -166,7 +171,7 @@ pub fn action_specs() -> Vec<ActionSpec> {
         },
         ActionSpec {
             name: "type_text",
-            description: "Type text as keystrokes into the focused target. Newline means Enter, tab means Tab. Only characters with a key mapping on the current keyboard layout can be typed; others fail the whole call before anything is typed.",
+            description: "Type Unicode text as characters into the focused target. Newline means Enter, tab means Tab. Only characters the platform can deliver can be typed; others fail the whole call before anything is typed. This types TEXT (characters); physical keys (arrows, function keys) use the 'key' action instead. IME composition is not supported: precomposed characters are injected as single characters.",
             params_schema: json!({
                 "type": "object",
                 "properties": {
@@ -178,7 +183,7 @@ pub fn action_specs() -> Vec<ActionSpec> {
         },
         ActionSpec {
             name: "key",
-            description: "Press and release one special key.",
+            description: "Press and release one special (physical) key. This presses a KEY, it does not type a character; use 'type_text' for text.",
             params_schema: json!({
                 "type": "object",
                 "properties": {

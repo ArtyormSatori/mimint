@@ -34,6 +34,11 @@ pub enum MimintError {
     Audit(String),
     /// I/O failure.
     Io(String),
+    /// Cancelled by the user (turn cancel or emergency stop). This is
+    /// NOT a failure of the provider or the tool: it means the user
+    /// asked the work to stop, and it must never be retried or fed
+    /// back to the model as a tool error.
+    Cancelled(String),
 }
 
 impl MimintError {
@@ -56,6 +61,12 @@ impl MimintError {
         }
     }
 
+    /// True only for user cancellation (turn cancel / emergency
+    /// stop). Cancelled work must abort the turn, never retry.
+    pub fn is_cancelled(&self) -> bool {
+        matches!(self, Self::Cancelled(_))
+    }
+
     /// The inner message without the kind prefix, for wrapping an error
     /// with extra context without duplicating prefixes.
     pub fn message(&self) -> &str {
@@ -68,7 +79,8 @@ impl MimintError {
             | Self::Tool(msg)
             | Self::Notebook(msg)
             | Self::Audit(msg)
-            | Self::Io(msg) => msg,
+            | Self::Io(msg)
+            | Self::Cancelled(msg) => msg,
         }
     }
 }
@@ -89,6 +101,7 @@ impl fmt::Display for MimintError {
             Self::Notebook(msg) => write!(f, "notebook error: {msg}"),
             Self::Audit(msg) => write!(f, "audit error: {msg}"),
             Self::Io(msg) => write!(f, "io error: {msg}"),
+            Self::Cancelled(msg) => write!(f, "cancelled: {msg}"),
         }
     }
 }

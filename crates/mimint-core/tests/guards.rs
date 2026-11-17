@@ -4,7 +4,10 @@
 //! executor they must FAIL with real assertion failures (not compile
 //! errors); with enforcement they must pass.
 
-use mimint_core::{default_registry, Approver, AuditLog, GuardedExecutor, MimintError, Notebook};
+use mimint_core::{
+    default_registry, ApprovalDecision, ApprovalOutcome, ApprovalRequest, Approver, AuditLog,
+    CancelToken, GuardedExecutor, MimintError, Notebook,
+};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -81,6 +84,58 @@ fn has_decision(records: &[Value], tool: &str, decision: &str) -> bool {
             && record.get("tool").and_then(Value::as_str) == Some(tool)
             && record.get("decision").and_then(Value::as_str) == Some(decision)
     })
+}
+
+/// Approver returning one fixed decision through `approve_request`.
+struct FixedOutcomeApprover {
+    decision: ApprovalDecision,
+}
+
+impl Approver for FixedOutcomeApprover {
+    fn approve(&self, _tool: &str, _args: &Value) -> Result<bool, MimintError> {
+        Ok(self.decision == ApprovalDecision::Allow)
+    }
+
+    fn approve_request(&self, request: &ApprovalRequest) -> Result<ApprovalOutcome, MimintError> {
+        Ok(ApprovalOutcome {
+            request_id: request.id,
+            decision: self.decision,
+        })
+    }
+
+    fn label(&self) -> &'static str {
+        "test fixed outcome"
+    }
+}
+
+/// Approver answering with the WRONG request id.
+struct WrongIdApprover;
+impl Approver for WrongIdApprover {
+    fn approve(&self, _tool: &str, _args: &Value) -> Result<bool, MimintError> {
+        Ok(true)
+    }
+
+    fn approve_request(&self, request: &ApprovalRequest) -> Result<ApprovalOutcome, MimintError> {
+        Ok(ApprovalOutcome::allow(request.id + 100))
+    }
+}
+
+/// Approver that allows — but cancels the shared token while
+/// deciding, simulating STOP pressed after the card appeared and
+/// before execution.
+struct CancellingAllowApprover {
+    token: CancelToken,
+}
+
+impl Approver for CancellingAllowApprover {
+    fn approve(&self, _tool: &str, _args: &Value) -> Result<bool, MimintError> {
+        Ok(true)
+    }
+
+    fn approve_request(&self, request: &ApprovalRequest) -> Result<ApprovalOutcome, MimintError> {
+        self.token.cancel();
+        Ok(ApprovalOutcome::allow(request.id))
+    }
 }
 
 #[test]
@@ -186,6 +241,151 @@ fn approved_consequential_tool_runs_and_is_audited() {
     assert!(
         has_decision(&records, "notebook_add", "allow"),
         "allow decision must be audited: {records:?}"
+    );
+    cleanup(&db_path, &audit_path);
+}
+
+#[test]
+fn timeout_is_audited_distinct_from_deny_and_does_not_run() {
+    let (notebook, audit, db_path, audit_path) = setup("timeout");
+    let registry = default_registry(Arc::clone(&notebook));
+    let approver = FixedOutcomeApprover {
+        decision: ApprovalDecision::Timeout,
+    };
+    let executor = GuardedExecutor::new(&registry, Some(&approver), &audit, "turn-guard-timeout");
+    let result = executor.execute("notebook_add", &json!({"title": "x", "body": "y"}));
+    assert!(result.is_err(), "timeout must deny");
+    assert_eq!(notebook.count().unwrap(), 0);
+    let records = audit_records(&audit_path);
+    assert!(
+        has_decision(&records, "notebook_add", "timeout"),
+        "timeout must be audited as its own decision: {records:?}"
+    );
+    assert!(
+        records
+            .iter()
+            .any(|r| r["detail"]["reason"] == "approval_timeout"),
+        "timeout reason must be approval_timeout: {records:?}"
+    );
+    cleanup(&db_path, &audit_path);
+}
+
+#[test]
+fn cancelled_approval_is_audited_distinct_from_deny_and_does_not_run() {
+    let (notebook, audit, db_path, audit_path) = setup("cancelled");
+    let registry = default_registry(Arc::clone(&notebook));
+    let approver = FixedOutcomeApprover {
+        decision: ApprovalDecision::Cancelled,
+    };
+    let executor = GuardedExecutor::new(&registry, Some(&approver), &audit, "turn-guard-cancelled");
+    let err = executor
+        .execute("notebook_add", &json!({"title": "x", "body": "y"}))
+        .expect_err("cancelled approval must not run");
+    assert!(
+        err.is_cancelled(),
+        "cancelled outcome must surface as Cancelled: {err}"
+    );
+    assert_eq!(notebook.count().unwrap(), 0);
+    let records = audit_records(&audit_path);
+    assert!(
+        has_decision(&records, "notebook_add", "cancelled"),
+        "cancelled must be audited as its own decision: {records:?}"
+    );
+    cleanup(&db_path, &audit_path);
+}
+
+#[test]
+fn mismatched_request_id_is_denied_and_audited() {
+    let (notebook, audit, db_path, audit_path) = setup("mismatch");
+    let registry = default_registry(Arc::clone(&notebook));
+    let approver = WrongIdApprover;
+    let executor = GuardedExecutor::new(&registry, Some(&approver), &audit, "turn-guard-mismatch");
+    let result = executor.execute("notebook_add", &json!({"title": "x", "body": "y"}));
+    assert!(result.is_err(), "wrong-id decision must deny");
+    assert_eq!(notebook.count().unwrap(), 0);
+    let records = audit_records(&audit_path);
+    assert!(
+        records
+            .iter()
+            .any(|r| r["detail"]["reason"] == "approval_id_mismatch"),
+        "mismatch must be audited: {records:?}"
+    );
+    cleanup(&db_path, &audit_path);
+}
+
+#[test]
+fn stop_after_approval_blocks_execution_and_audits_cancelled() {
+    let (notebook, audit, db_path, audit_path) = setup("stop-after-approval");
+    let registry = default_registry(Arc::clone(&notebook));
+    let token = CancelToken::new();
+    let approver = CancellingAllowApprover {
+        token: token.clone(),
+    };
+    let mut executor = GuardedExecutor::new(&registry, Some(&approver), &audit, "turn-guard-stop");
+    executor.add_cancel_token(token);
+    let err = executor
+        .execute("notebook_add", &json!({"title": "x", "body": "y"}))
+        .expect_err("approved-then-stopped tool must not run");
+    assert!(err.is_cancelled(), "{err}");
+    assert_eq!(notebook.count().unwrap(), 0, "tool must not have run");
+    let records = audit_records(&audit_path);
+    assert!(
+        records
+            .iter()
+            .any(|r| r["detail"]["reason"] == "cancelled_after_approval"),
+        "cancelled_after_approval must be audited: {records:?}"
+    );
+    assert!(
+        !has_decision(&records, "notebook_add", "allow"),
+        "no allow may be recorded for a stopped tool: {records:?}"
+    );
+    cleanup(&db_path, &audit_path);
+}
+
+#[test]
+fn pre_cancelled_token_blocks_before_the_card_and_before_read_only_tools() {
+    let (notebook, audit, db_path, audit_path) = setup("pre-cancelled");
+    let id = notebook.add("Seed", "seed body").unwrap();
+    let registry = default_registry(Arc::clone(&notebook));
+    let token = CancelToken::new();
+    token.cancel();
+    let approver = AllowApprover;
+    let mut executor =
+        GuardedExecutor::new(&registry, Some(&approver), &audit, "turn-guard-precancel");
+    executor.add_cancel_token(token);
+    let err = executor
+        .execute("notebook_add", &json!({"title": "x", "body": "y"}))
+        .expect_err("pre-cancelled consequential tool must not run");
+    assert!(err.is_cancelled(), "{err}");
+    assert_eq!(notebook.count().unwrap(), 1);
+    let err = executor
+        .execute("notebook_read", &json!({"id": id}))
+        .expect_err("pre-cancelled read-only tool must not run either");
+    assert!(err.is_cancelled(), "{err}");
+    cleanup(&db_path, &audit_path);
+}
+
+#[test]
+fn request_ids_increase_across_requests() {
+    let (notebook, audit, db_path, audit_path) = setup("request-ids");
+    let registry = default_registry(Arc::clone(&notebook));
+    let approver = AllowApprover;
+    let executor = GuardedExecutor::new(&registry, Some(&approver), &audit, "turn-guard-ids");
+    executor
+        .execute("notebook_add", &json!({"title": "a", "body": "b"}))
+        .unwrap();
+    executor
+        .execute("notebook_add", &json!({"title": "c", "body": "d"}))
+        .unwrap();
+    let records = audit_records(&audit_path);
+    let ids: Vec<u64> = records
+        .iter()
+        .filter_map(|r| r["detail"]["request_id"].as_u64())
+        .collect();
+    assert_eq!(
+        ids,
+        vec![1, 2],
+        "request ids must be 1, 2 in order: {ids:?}"
     );
     cleanup(&db_path, &audit_path);
 }

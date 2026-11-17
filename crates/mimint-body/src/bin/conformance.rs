@@ -2,29 +2,59 @@
 //!
 //! Usage:
 //!   conformance --body mock
+//!   conformance --body mock-scaled
+//!   conformance --body mock-denied
 //!   conformance --body x11 --log <testwin-log> --control <testwin-control-file>
 //!   conformance --body macos --log <testapp-log> --control <testapp-control-file>
 //!   conformance --body x11|macos --shot <out.ppm>
 //!
-//! The test target must already be running (the runner waits for its
-//! READY line, up to 10s). Exit 0 iff every check passes. The report
-//! goes to stdout; diagnostics to stderr.
+//! Modes:
+//! - `mock`: deterministic in-memory body, no target needed.
+//! - `mock-scaled`: mock body at scale 2 with a non-zero origin,
+//!   proving the framebuffer-pixel contract holds under Retina-like
+//!   geometry (C9/C10 grade it the same way).
+//! - `mock-denied`: mock body reporting both permissions denied;
+//!   runs the P1 permission-denial check (typed errors, never
+//!   silent) instead of the main suite.
+//! - `x11` / `macos`: real bodies against a running test target
+//!   (the runner waits for its READY line, up to 10s).
+//!
+//! Real bodies are wrapped in [`GuardedBody`] with a default
+//! self-exclusion rect (0,0,40,40) — outside the test target — and
+//! both the main suite (C1..C11) and the guarded suite (G1..G2) run.
+//! Exit 0 iff every check passes. Reports go to stdout; diagnostics
+//! to stderr.
 //!
 //! `--shot` takes one screenshot and writes it as a binary PPM (P6),
 //! without needing a test target. It is the mechanical evidence
 //! path for the Mac verification package and the demo gate.
+//! Screenshots are refused under the OS temp dir.
 
-use mimint_body::conformance::run_suite;
-use mimint_body::{Body, FileOracle, MockBody};
+use mimint_body::conformance::{check_permission_denied, run_guarded_suite, run_suite};
+use mimint_body::{
+    shot_path_allowed, Body, FileOracle, GuardedBody, MockBody, RateLimits, ScreenRect,
+};
 use std::env;
 use std::process::exit;
 use std::time::Duration;
 
+/// Default self-exclusion rect for conformance runs: the top-left
+/// 40x40 corner, where the test target never sits (it starts at
+/// (100,100)). G1 clicks its center and expects a typed refusal.
+const DEFAULT_EXCLUSION: ScreenRect = ScreenRect {
+    x: 0,
+    y: 0,
+    width: 40,
+    height: 40,
+};
+
 fn usage() -> ! {
-    eprintln!("usage: conformance --body mock|x11|macos [--log <path> --control <path>] [--shot <out.ppm>]");
-    eprintln!("  mock:  no target needed (the mock body is its own oracle)");
-    eprintln!("  x11:   needs a running testwin (see testwin binary) on DISPLAY");
-    eprintln!("  macos: needs a running TestWin.app target (see mac-verify/)");
+    eprintln!("usage: conformance --body mock|mock-scaled|mock-denied|x11|macos [--log <path> --control <path>] [--shot <out.ppm>]");
+    eprintln!("  mock:        no target needed (the mock body is its own oracle)");
+    eprintln!("  mock-scaled: mock body at scale 2 with a non-zero origin");
+    eprintln!("  mock-denied: mock body reporting denied permissions (P1 check only)");
+    eprintln!("  x11:         needs a running testwin (see testwin binary) on DISPLAY");
+    eprintln!("  macos:       needs a running TestWin.app target (see mac-verify/)");
     eprintln!("  --shot: write one screenshot as PPM and exit (no target needed)");
     exit(2);
 }
@@ -64,16 +94,46 @@ fn main() {
     }
 
     match body_name.as_str() {
-        "mock" => {
+        "mock" | "mock-scaled" => {
             if !shot_path.is_empty() {
                 eprintln!("--shot is not meaningful for the mock body");
                 exit(2);
             }
-            let mut body = MockBody::new();
+            let mut body = if body_name == "mock-scaled" {
+                MockBody::with_geometry(1600, 1200, 2.0, (10, 20))
+            } else {
+                MockBody::new()
+            };
             let mut oracle = body.oracle();
             let report = run_suite(&mut body, &mut oracle);
             print!("{}", report.render());
-            exit(if report.passed { 0 } else { 1 });
+            // The guarded suite needs a wrapped body with a zone.
+            let mut guarded = GuardedBody::new(body, RateLimits::default());
+            guarded.set_excluded_rects(vec![DEFAULT_EXCLUSION]);
+            let guarded_report = run_guarded_suite(&mut guarded, &mut oracle);
+            print!("{}", guarded_report.render());
+            exit(if report.passed && guarded_report.passed {
+                0
+            } else {
+                1
+            });
+        }
+        "mock-denied" => {
+            if !shot_path.is_empty() {
+                eprintln!("--shot is not meaningful for the mock body");
+                exit(2);
+            }
+            let mut body = MockBody::with_permissions(mimint_body::Permissions {
+                screen_capture: mimint_body::PermissionState::Denied,
+                input_control: mimint_body::PermissionState::Denied,
+            });
+            let result = check_permission_denied(&mut body);
+            println!(
+                "P1 permission-denied: {} ({})",
+                if result.passed { "PASS" } else { "FAIL" },
+                result.detail
+            );
+            exit(if result.passed { 0 } else { 1 });
         }
         "x11" => {
             #[cfg(target_os = "linux")]
@@ -87,7 +147,7 @@ fn main() {
             }
             #[cfg(not(target_os = "linux"))]
             {
-                let _ = (&log_path, &control_path);
+                let _ = (&log_path, &control_path, &shot_path);
                 eprintln!("body 'x11' is only available on Linux");
                 exit(2);
             }
@@ -104,7 +164,7 @@ fn main() {
             }
             #[cfg(not(target_os = "macos"))]
             {
-                let _ = (&log_path, &control_path);
+                let _ = (&log_path, &control_path, &shot_path);
                 eprintln!("body 'macos' is only available on macOS");
                 exit(2);
             }
@@ -116,6 +176,10 @@ fn main() {
 /// Take one screenshot and write it as binary PPM (P6, RGB).
 #[allow(dead_code)]
 fn shoot<B: Body>(path: &str, connect: impl FnOnce() -> Result<B, mimint_body::BodyError>) -> ! {
+    if !shot_path_allowed(std::path::Path::new(path)) {
+        eprintln!("refusing to write a screenshot under the OS temp dir: {path}");
+        exit(2);
+    }
     let mut body = match connect() {
         Ok(body) => body,
         Err(err) => {
@@ -148,13 +212,17 @@ fn run_file_oracle_body<B: mimint_body::Body>(
         eprintln!("--log and --control are required for real bodies");
         usage();
     }
-    let mut body = match connect() {
-        Ok(body) => body,
-        Err(err) => {
-            eprintln!("cannot open body: {err}");
-            exit(2);
-        }
-    };
+    let mut body = GuardedBody::new(
+        match connect() {
+            Ok(body) => body,
+            Err(err) => {
+                eprintln!("cannot open body: {err}");
+                exit(2);
+            }
+        },
+        RateLimits::default(),
+    );
+    body.set_excluded_rects(vec![DEFAULT_EXCLUSION]);
     let mut oracle = match FileOracle::open(log_path, control_path) {
         Ok(oracle) => oracle,
         Err(err) => {
@@ -168,5 +236,11 @@ fn run_file_oracle_body<B: mimint_body::Body>(
     }
     let report = run_suite(&mut body, &mut oracle);
     print!("{}", report.render());
-    exit(if report.passed { 0 } else { 1 });
+    let guarded_report = run_guarded_suite(&mut body, &mut oracle);
+    print!("{}", guarded_report.render());
+    exit(if report.passed && guarded_report.passed {
+        0
+    } else {
+        1
+    });
 }

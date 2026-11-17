@@ -8,17 +8,23 @@
 //!
 //! - [`Body`]: the trait every OS body implements.
 //! - [`conformance::run_suite`]: the suite that grades a body.
+//! - [`conformance::run_guarded_suite`]: the guarded checks
+//!   (self-exclusion zone, focus verification) for wrapped bodies.
 //! - [`MockBody`]: deterministic in-memory body, for tests anywhere.
 //! - [`X11Body`]: Linux/X11 reference body (contract verification
 //!   only; the Linux product body is Wayland-portal-first, Phase 4).
 //! - [`MacOsBody`]: macOS body (macOS only; runtime verification
 //!   needs the user's Mac — see `mac-verify/` in the repo root).
+//! - [`GuardedBody`]: the body-level safety wrapper (exclusion zone,
+//!   rate limits, stop latch, focus delegation).
 
 pub mod action;
 pub mod body;
+pub mod captures;
 pub mod conformance;
 pub mod error;
 pub mod file_oracle;
+pub mod guarded;
 #[cfg(target_os = "macos")]
 pub mod macos;
 pub mod mock;
@@ -26,10 +32,19 @@ pub mod mock;
 pub mod x11;
 
 pub use action::{action_specs, Action, ActionSpec, Key};
-pub use body::{write_ppm, ActOutcome, Body, Framebuffer, PermissionState, Permissions};
-pub use conformance::{run_suite, CheckResult, SuiteReport, TargetOracle, TYPE_STRINGS};
+pub use body::{
+    write_ppm, ActOutcome, Body, Framebuffer, PermissionState, Permissions, ScreenRect,
+};
+pub use captures::{
+    append_audit_line, bodyctl_audit_line, captures_dir, ensure_captures_dir, shot_path_allowed,
+};
+pub use conformance::{
+    check_permission_denied, run_guarded_suite, run_suite, CheckResult, SuiteReport, TargetOracle,
+    PATTERN_VARIANT, TYPE_STRINGS, UNICODE_STRINGS,
+};
 pub use error::BodyError;
 pub use file_oracle::FileOracle;
+pub use guarded::{GuardedBody, RateLimits, StopFlag};
 #[cfg(target_os = "macos")]
 pub use macos::MacOsBody;
 pub use mock::{Fault, MockBody, MockEvent, MockOracle};

@@ -14,19 +14,27 @@
 //! - `MIMINT_UI_EVENT_LOG=<path>`: append UI test events.
 //! - `MIMINT_UI_BENCH_SECS=<n>`: run N seconds, print FPS, exit.
 //! - `MIMINT_UI_DEGRADED=1`: static face + visible simple-mode label.
+//! - `MIMINT_REDUCED_MOTION=1`: OS reduced-motion signal (Linux hook).
+//! - `MIMINT_APPROVAL_TIMEOUT_SECS=<n>`: approval card timeout
+//!   (default 120). Values under 5 are clamped to 5.
+//! - `MIMINT_UI_PIXELS_PER_POINT=<f>`: UI scale (demo gate
+//!   screenshots at 125%/150%).
 
 use mimint_core::{
-    build_chain, default_config_path, default_vault, load_config_file, probe_local_backends,
-    suggestion_text, AuditLog, EgressPolicy, FileConfig, MimintError, Notebook, ResolvedConfig,
+    build_chain, default_config_path, default_vault, egress::url_is_loopback, load_config_file,
+    probe_local_backends, suggestion_text, AuditLog, EgressPolicy, FileConfig, MimintError,
+    Notebook, ResolvedConfig,
 };
-use mimint_ui::approver::approval_channel;
+use mimint_ui::app::{AppOptions, BackendInfo};
+use mimint_ui::approver::{approval_channel, RepaintSignal, TokenSlot, DEFAULT_APPROVAL_TIMEOUT};
 use mimint_ui::worker::{RebuildConfig, WorkerDeps};
-use mimint_ui::{app::AppOptions, MimintApp};
+use mimint_ui::MimintApp;
 use serde_json::json;
 use std::env;
 use std::path::PathBuf;
 use std::process::exit;
 use std::sync::Arc;
+use std::time::Duration;
 
 const USAGE: &str = "mimint-app: the Mimint desktop app (Phase 3).\n\nUsage:\n  mimint-app [--config PATH] [--db PATH] [--audit PATH] [--max-steps N] [--degraded]\n\n  --config PATH     Config file (default: $XDG_CONFIG_HOME/mimint/config.toml or ~/.config/mimint/config.toml)\n  --db PATH         Notebook SQLite path (default: mimint.db)\n  --audit PATH      Audit JSONL path (default: mimint-audit.jsonl)\n  --max-steps N     Max brain steps per turn (default: 5)\n  --degraded        Static face + visible simple-mode label (weak machines)\n  --help            Show this help\n";
 
@@ -147,8 +155,26 @@ fn run() -> Result<(), MimintError> {
         .iter()
         .map(|spec| spec.name.clone())
         .collect();
+    // Info about the providers that actually built, for the UI's
+    // backend-change warning and "backend in use" line. A backend
+    // that failed to build has no entry (unknown, not assumed).
+    let backend_infos: Vec<BackendInfo> = initial_providers
+        .iter()
+        .map(|provider| BackendInfo {
+            name: provider.name().to_string(),
+            endpoint_url: provider.endpoint_url().to_string(),
+            is_paid: provider.is_paid(),
+            loopback: url_is_loopback(provider.endpoint_url()).unwrap_or(false),
+        })
+        .collect();
 
     let (approval_tx, approval_rx) = approval_channel();
+    let approval_timeout = env::var("MIMINT_APPROVAL_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(|secs| Duration::from_secs(secs.max(5)))
+        .unwrap_or(DEFAULT_APPROVAL_TIMEOUT);
+    let repaint = RepaintSignal::new();
     let deps = WorkerDeps {
         initial_providers,
         retry: resolved.retry,
@@ -161,6 +187,10 @@ fn run() -> Result<(), MimintError> {
         audit,
         max_steps: args.max_steps,
         approval_tx,
+        stop_slot: TokenSlot::new(),
+        turn_slot: TokenSlot::new(),
+        repaint: Arc::clone(&repaint),
+        approval_timeout,
     };
     let worker = mimint_ui::worker::spawn_worker(deps);
 
@@ -168,6 +198,7 @@ fn run() -> Result<(), MimintError> {
     let options = AppOptions {
         privacy_on,
         backend_names,
+        backend_infos,
         audit_path: args.audit.clone(),
         degraded,
         bench_secs: env::var("MIMINT_UI_BENCH_SECS")
@@ -175,14 +206,28 @@ fn run() -> Result<(), MimintError> {
             .and_then(|v| v.parse::<f64>().ok()),
         event_log: env::var("MIMINT_UI_EVENT_LOG").ok().map(PathBuf::from),
         onboarding_text,
+        repaint,
     };
     let app = MimintApp::new(worker, approval_rx, options);
+    let pixels_per_point = env::var("MIMINT_UI_PIXELS_PER_POINT")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .filter(|v| *v > 0.0);
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([1024.0, 720.0]),
         ..Default::default()
     };
-    eframe::run_native("Mimint", native_options, Box::new(|_cc| Ok(Box::new(app))))
-        .map_err(|err| MimintError::Config(format!("cannot open the window: {err}")))
+    eframe::run_native(
+        "Mimint",
+        native_options,
+        Box::new(move |cc| {
+            if let Some(ppp) = pixels_per_point {
+                cc.egui_ctx.set_pixels_per_point(ppp);
+            }
+            Ok(Box::new(app))
+        }),
+    )
+    .map_err(|err| MimintError::Config(format!("cannot open the window: {err}")))
 }
 
 /// Probe loopback backends and render the onboarding suggestion.

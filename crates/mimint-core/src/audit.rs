@@ -124,4 +124,51 @@ mod tests {
             .expect_err("write to /dev/full must fail");
         assert!(err.to_string().contains("audit"), "{err}");
     }
+
+    /// Single-writer integrity (Phase 3 fix pass F3-23/F3-26): one
+    /// shared `AuditLog` written concurrently from many threads
+    /// produces exactly one valid JSON record per write, with no
+    /// interleaved or torn lines. The `Mutex<File>` inside `record`
+    /// is the single-writer mechanism; the app holds exactly one
+    /// `Arc<AuditLog>`, and the UI viewer only reads.
+    #[test]
+    fn concurrent_writes_produce_whole_json_lines_only() {
+        use std::sync::Arc;
+        let dir =
+            std::env::temp_dir().join(format!("mimint-audit-concurrent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("audit.jsonl");
+        let audit = Arc::new(AuditLog::open(&path).unwrap());
+        let mut handles = Vec::new();
+        for t in 0..8 {
+            let audit = Arc::clone(&audit);
+            handles.push(std::thread::spawn(move || {
+                for i in 0..25 {
+                    audit
+                        .log(
+                            "concurrent",
+                            "probe",
+                            None,
+                            None,
+                            serde_json::json!({"thread": t, "i": i}),
+                        )
+                        .unwrap();
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        let text = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 200, "one line per write");
+        for line in &lines {
+            let value: serde_json::Value =
+                serde_json::from_str(line).expect("every line is whole JSON");
+            assert_eq!(value["kind"], "probe");
+        }
+        assert!(text.ends_with('\n'), "file ends with a newline");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

@@ -7,6 +7,29 @@
 //! Keychain account; every item lives under the single service
 //! [`KEYCHAIN_SERVICE`].
 //!
+//! Thread rule (verified, Phase 3 fix pass F3-10): a Keychain read
+//! may show a system popup and block until the user answers, so it
+//! must NEVER run from UI frame code. The only call path is
+//! `build_provider` → `resolve_key` (`registry.rs`), which runs (a)
+//! at startup, before the window/event loop exists, and (b) on the
+//! worker thread during a chain rebuild. No code in `mimint-ui`'s
+//! frame path (`app.rs`, `chat.rs`, `face.rs`) touches this vault.
+//!
+//! Access control: Mimint never creates items and never sets or
+//! loosens an ACL — the item's ACL and `kSecAttrAccessible` value
+//! are whatever the user (or `security`) set at creation time. The
+//! read goes through `security-framework`'s `get_generic_password`,
+//! which uses the default query for the account/service pair. There
+//! is no timeout parameter in that API: in a headless session (no
+//! GUI, locked keychain) the read fails with
+//! `errSecInteractionNotAllowed`, mapped below to a message that
+//! says so, instead of hanging forever. An unsigned or
+//! freshly-rebuilt binary may prompt on every read until the user
+//! grants "Always Allow", and rebuilding an ad-hoc binary can drop
+//! the grant — see `docs/keychain-and-signing.md`. The signing
+//! decision itself is open (the user's call); nothing here works
+//! around it by loosening access.
+//!
 //! On any platform other than macOS the vault still exists (so config
 //! and registry code compiles everywhere) but every lookup fails
 //! closed with a clear message naming the alternatives. The macOS
@@ -44,6 +67,10 @@ impl Vault for KeychainVault {
 fn get_from_keychain(name: &str) -> Result<Option<Zeroizing<String>>, MimintError> {
     /// `errSecItemNotFound` from SecBase.h: no matching item exists.
     const ERR_SEC_ITEM_NOT_FOUND: i32 = -25300;
+    /// `errSecInteractionNotAllowed` from SecBase.h: the keychain
+    /// would need to interact with the user (popup), but the
+    /// session cannot — headless, locked, or no GUI.
+    const ERR_SEC_INTERACTION_NOT_ALLOWED: i32 = -25308;
     match security_framework::passwords::get_generic_password(KEYCHAIN_SERVICE, name) {
         Ok(bytes) => {
             let text = String::from_utf8(bytes).map_err(|_| {
@@ -59,6 +86,14 @@ fn get_from_keychain(name: &str) -> Result<Option<Zeroizing<String>>, MimintErro
             }
         }
         Err(err) if err.code() == ERR_SEC_ITEM_NOT_FOUND => Ok(None),
+        Err(err) if err.code() == ERR_SEC_INTERACTION_NOT_ALLOWED => {
+            Err(MimintError::Config(format!(
+                "cannot read Keychain item '{name}' (service '{KEYCHAIN_SERVICE}'): \
+                 macOS refused interaction (errSecInteractionNotAllowed). \
+                 Unlock the login keychain in a GUI session and retry; \
+                 Keychain reads cannot run headless"
+            )))
+        }
         Err(err) => Err(MimintError::Config(format!(
             "cannot read Keychain item '{name}' (service '{KEYCHAIN_SERVICE}'): {err}"
         ))),

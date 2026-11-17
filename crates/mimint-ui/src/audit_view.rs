@@ -4,13 +4,20 @@
 //!
 //! Malformed lines are skipped, never fatal: the viewer must keep
 //! working even if a record is half-written while the worker appends.
+//! A trailing line WITHOUT a newline terminator is dropped outright,
+//! even when it parses: it may be mid-append, and the next refresh
+//! picks it up once the writer finishes the line. The audit log has
+//! exactly one writer (the worker's `Arc<AuditLog>` behind a mutex);
+//! the viewer only ever reads.
 
 use serde_json::Value;
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::Read;
 use std::path::Path;
 
-/// One audit record, as displayed.
+/// One audit record, as displayed. Two layers: the friendly summary
+/// ([`AuditRow::friendly_summary`]) for everyday reading, and the
+/// raw JSON line for technical inspection.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AuditRow {
     pub ts_ms: u64,
@@ -20,6 +27,87 @@ pub struct AuditRow {
     pub decision: Option<String>,
     /// One-line summary of the detail object.
     pub detail: String,
+    /// The `reason` inside the detail object, when present (it
+    /// distinguishes refused / timed-out / cancelled decisions).
+    pub reason: Option<String>,
+    /// The raw JSONL line, for the technical layer.
+    pub raw: String,
+}
+
+impl AuditRow {
+    /// The readable layer: one plain sentence per record, in
+    /// Vietnamese, with no jargon. Unknown kinds fall back to the
+    /// kind/tool/decision triple, never to silence.
+    pub fn friendly_summary(&self) -> String {
+        match self.kind.as_str() {
+            "turn_start" => "Bắt đầu một lượt trò chuyện.".to_string(),
+            "turn_end" => match self.decision.as_deref() {
+                Some("completed") => "Lượt trò chuyện xong.".to_string(),
+                Some("cancelled") => "Lượt trò chuyện đã bị hủy.".to_string(),
+                Some("partial") => {
+                    "Lượt trò chuyện dừng giữa chừng (hết ngân sách bước).".to_string()
+                }
+                Some(other) => format!("Lượt trò chuyện kết thúc: {other}."),
+                None => "Lượt trò chuyện kết thúc.".to_string(),
+            },
+            "decision" => {
+                let tool = self.tool.as_deref().unwrap_or("công cụ");
+                match self.reason.as_deref() {
+                    Some("approved") => format!("Đã cho phép {tool}."),
+                    Some("approval_refused") => format!("Đã từ chối {tool}."),
+                    Some("approval_cancelled") => {
+                        format!("Phê duyệt {tool} đã bị hủy (DỪNG / hủy lượt).")
+                    }
+                    Some("approval_timeout") => {
+                        format!("Phê duyệt {tool} hết thời gian chờ — đã từ chối.")
+                    }
+                    Some("approval_id_mismatch") => {
+                        format!("Quyết định phê duyệt {tool} sai mã yêu cầu — đã từ chối.")
+                    }
+                    Some("cancelled_after_approval") => {
+                        format!("{tool} đã được duyệt nhưng bị DỪNG trước khi chạy — không chạy.")
+                    }
+                    Some("cancelled_before_approval") | Some("cancelled_before_execution") => {
+                        format!("{tool} bị DỪNG trước khi chạy — không chạy.")
+                    }
+                    Some("approver_error") => {
+                        format!("Thẻ phê duyệt {tool} gặp lỗi — đã từ chối cho an toàn.")
+                    }
+                    _ => match self.decision.as_deref() {
+                        Some("allow") => format!("Đã cho phép {tool}."),
+                        Some("deny") => format!("Đã từ chối {tool}."),
+                        Some("cancelled") => format!("{tool} đã bị hủy."),
+                        Some("timeout") => {
+                            format!("Phê duyệt {tool} hết thời gian chờ — đã từ chối.")
+                        }
+                        Some(other) => format!("Quyết định cho {tool}: {other}."),
+                        None => format!("Quyết định cho {tool}."),
+                    },
+                }
+            }
+            "approval_timeout" => "Một yêu cầu phê duyệt hết thời gian chờ.".to_string(),
+            "privacy_mode" => match self.decision.as_deref() {
+                Some("on") => "Chế độ riêng tư: BẬT.".to_string(),
+                Some("off") => "Chế độ riêng tư: TẮT.".to_string(),
+                _ => "Chế độ riêng tư thay đổi.".to_string(),
+            },
+            "provider_call" => {
+                let tool = self.tool.as_deref().unwrap_or("backend");
+                format!("Đã gọi {tool}.")
+            }
+            "body_action" => {
+                let tool = self.tool.as_deref().unwrap_or("bodyctl");
+                format!("Hành động {tool} (công cụ phát triển).")
+            }
+            _ => {
+                let tool = self.tool.as_deref().unwrap_or("-");
+                let decision = self.decision.as_deref().unwrap_or("");
+                format!("{} {} {}", self.kind, tool, decision)
+                    .trim_end()
+                    .to_string()
+            }
+        }
+    }
 }
 
 /// Parse one JSONL line. Returns `None` for blank or malformed lines.
@@ -50,6 +138,11 @@ pub fn parse_audit_line(line: &str) -> Option<AuditRow> {
         Some(other) => other.to_string(),
         None => String::new(),
     };
+    let reason = obj
+        .get("detail")
+        .and_then(|d| d.get("reason"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
     Some(AuditRow {
         ts_ms,
         turn_id,
@@ -57,6 +150,8 @@ pub fn parse_audit_line(line: &str) -> Option<AuditRow> {
         tool,
         decision,
         detail,
+        reason,
+        raw: line.trim().to_string(),
     })
 }
 
@@ -64,15 +159,26 @@ pub fn parse_audit_line(line: &str) -> Option<AuditRow> {
 /// first). A missing file reads as empty; an unreadable file also
 /// reads as empty — the viewer shows "no records yet" either way,
 /// and the worker owns the real failure modes.
+///
+/// Only newline-terminated lines are read: a trailing unterminated
+/// line is dropped even when it parses, because the worker may
+/// still be appending to it. The next refresh reads it once the
+/// newline lands.
 pub fn read_audit_tail(path: &Path, max_lines: usize) -> Vec<AuditRow> {
-    let Ok(file) = File::open(path) else {
+    let Ok(mut file) = File::open(path) else {
         return Vec::new();
     };
-    let reader = BufReader::new(file);
+    let mut content = String::new();
+    if file.read_to_string(&mut content).is_err() {
+        return Vec::new();
+    }
+    let complete = match content.rfind('\n') {
+        Some(pos) => &content[..=pos],
+        None => return Vec::new(),
+    };
     let mut rows: Vec<AuditRow> = Vec::new();
-    for line in reader.lines() {
-        let Ok(line) = line else { continue };
-        if let Some(row) = parse_audit_line(&line) {
+    for line in complete.lines() {
+        if let Some(row) = parse_audit_line(line) {
             rows.push(row);
         }
     }
@@ -135,6 +241,44 @@ mod tests {
         assert_eq!(rows[0].turn_id, "t2");
         assert_eq!(rows[2].turn_id, "t4");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn trailing_unterminated_line_is_dropped_even_when_it_parses() {
+        let dir =
+            std::env::temp_dir().join(format!("mimint-audit-view-partial-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("audit.jsonl");
+        // One complete record, then a valid-looking record with no
+        // trailing newline (a write in progress): only the first
+        // must show.
+        let content = "{\"ts_ms\":1,\"turn_id\":\"done\",\"kind\":\"k\",\"detail\":{}}\n\
+             {\"ts_ms\":2,\"turn_id\":\"pending\",\"kind\":\"k\",\"detail\":{}}";
+        std::fs::write(&path, content).unwrap();
+        let rows = read_audit_tail(&path, 10);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].turn_id, "done");
+        // Once the newline lands, the second record appears.
+        std::fs::write(&path, format!("{content}\n")).unwrap();
+        let rows = read_audit_tail(&path, 10);
+        assert_eq!(rows.len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn friendly_summary_reads_plainly() {
+        let row = parse_audit_line(
+            r#"{"ts_ms":1,"turn_id":"t","kind":"decision","tool":"notebook_add","decision":"timeout","detail":{"reason":"approval_timeout"}}"#,
+        )
+        .unwrap();
+        assert!(row.friendly_summary().contains("hết thời gian chờ"));
+        assert!(row.raw.contains("approval_timeout"));
+        let row = parse_audit_line(
+            r#"{"ts_ms":1,"turn_id":"t","kind":"privacy_mode","decision":"on","detail":{}}"#,
+        )
+        .unwrap();
+        assert_eq!(row.friendly_summary(), "Chế độ riêng tư: BẬT.");
     }
 
     #[test]

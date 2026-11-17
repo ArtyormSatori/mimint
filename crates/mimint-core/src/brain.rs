@@ -7,6 +7,7 @@
 //!   budget runs out (partial result, recorded in the audit log).
 
 use crate::audit::AuditLog;
+use crate::cancel::CancelToken;
 use crate::error::MimintError;
 use crate::guards::{Approver, GuardedExecutor};
 use crate::notebook::Notebook;
@@ -46,6 +47,7 @@ pub struct Brain<'a> {
     notebook: Arc<Notebook>,
     turn_id: String,
     max_steps: usize,
+    cancel_tokens: Vec<CancelToken>,
 }
 
 impl<'a> Brain<'a> {
@@ -72,17 +74,43 @@ impl<'a> Brain<'a> {
             notebook,
             turn_id: turn_id.into(),
             max_steps,
+            cancel_tokens: Vec::new(),
         })
     }
 
+    /// Add a cancellation token: checked before every provider call
+    /// and, through the guard executor, immediately before every tool
+    /// executes. The worker adds the per-turn token and the latching
+    /// stop token; a brain without tokens behaves exactly as before.
+    pub fn add_cancel_token(&mut self, token: CancelToken) {
+        self.cancel_tokens.push(token);
+    }
+
+    fn check_cancelled(&self) -> Result<(), MimintError> {
+        for token in &self.cancel_tokens {
+            token.check()?;
+        }
+        Ok(())
+    }
+
     /// Run one turn for a user prompt.
+    ///
+    /// Cancellation aborts the turn: a cancelled check, or a
+    /// cancelled guard decision, returns [`MimintError::Cancelled`]
+    /// after recording a `turn_end`/`cancelled` audit record. It is
+    /// never fed back to the model as a tool error, and the loop
+    /// never starts another provider call or tool after it.
     pub async fn run(&self, user_prompt: &str) -> Result<TurnOutcome, MimintError> {
-        let executor = GuardedExecutor::new(
+        let mut executor = GuardedExecutor::new(
             self.registry,
             self.approver,
             self.audit,
             self.turn_id.clone(),
         );
+        for token in &self.cancel_tokens {
+            executor.add_cancel_token(token.clone());
+        }
+        let executor = executor;
         let tool_schemas = self.registry.tool_schemas();
         let mut messages = vec![
             ChatMessage::system(
@@ -95,6 +123,20 @@ impl<'a> Brain<'a> {
         let mut pending: Vec<PendingVerification> = Vec::new();
 
         for step in 0..self.max_steps {
+            // Cancellation check at the top of every step: no new
+            // provider call and no new tool starts after a stop.
+            // (A request already in flight is bounded by its
+            // per-request timeout; see docs/stop-and-approval.md.)
+            if let Err(err) = self.check_cancelled() {
+                self.audit.log(
+                    &self.turn_id,
+                    "turn_end",
+                    None,
+                    Some("cancelled"),
+                    json!({"reason": "cancelled_before_step", "step": step + 1}),
+                )?;
+                return Err(err);
+            }
             // Phase 1 (mandatory): verify the previous tool results by code.
             for prev in pending.drain(..) {
                 let ok = self.verify_previous(&prev)?;
@@ -136,6 +178,18 @@ impl<'a> Brain<'a> {
             messages.push(reply);
             // Tools run strictly sequentially, in the order requested.
             for call in calls {
+                // A stop between two tool calls in one step stops
+                // the rest of the step's tools.
+                if let Err(err) = self.check_cancelled() {
+                    self.audit.log(
+                        &self.turn_id,
+                        "turn_end",
+                        None,
+                        Some("cancelled"),
+                        json!({"reason": "cancelled_between_tools", "step": step + 1}),
+                    )?;
+                    return Err(err);
+                }
                 tools_used.push(call.function.name.clone());
                 let parsed: Result<Value, MimintError> =
                     serde_json::from_str(&call.function.arguments).map_err(|err| {
@@ -151,6 +205,18 @@ impl<'a> Brain<'a> {
                                 output: Some(output),
                                 error: None,
                             });
+                        }
+                        Err(err) if err.is_cancelled() => {
+                            // Cancellation is not a tool error: abort
+                            // the turn instead of telling the model.
+                            self.audit.log(
+                                &self.turn_id,
+                                "turn_end",
+                                None,
+                                Some("cancelled"),
+                                json!({"reason": "cancelled_during_tool", "tool": call.function.name}),
+                            )?;
+                            return Err(err);
                         }
                         Err(err) => {
                             let detail = json!({"error": err.to_string()});
@@ -414,5 +480,84 @@ mod tests {
         .expect_err("unwritable audit must fail the turn");
         assert!(err.to_string().contains("audit"), "{err}");
         let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[tokio::test]
+    async fn pre_cancelled_token_aborts_before_any_provider_call() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct CountingProvider {
+            calls: Arc<AtomicUsize>,
+        }
+        impl Provider for CountingProvider {
+            fn name(&self) -> &str {
+                "counting"
+            }
+            fn model(&self) -> &str {
+                "counting-model"
+            }
+            fn endpoint_url(&self) -> &str {
+                "http://127.0.0.1:1/v1/chat/completions"
+            }
+            fn is_paid(&self) -> bool {
+                false
+            }
+            fn chat<'a>(
+                &'a self,
+                _ctx: &'a CallContext<'a>,
+                _messages: &'a [ChatMessage],
+                _tools: &'a [Value],
+            ) -> BoxFuture<'a, Result<ChatMessage, MimintError>> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async move {
+                    Ok(ChatMessage {
+                        role: "assistant".to_string(),
+                        content: Some("never reached".to_string()),
+                        tool_calls: None,
+                        tool_call_id: None,
+                    })
+                })
+            }
+        }
+
+        let stem = temp_stem("precancel");
+        let db_path = format!("{stem}.db");
+        let audit_path = format!("{stem}.jsonl");
+        let notebook = Arc::new(Notebook::open(&db_path).unwrap());
+        let audit = AuditLog::open(&audit_path).unwrap();
+        let registry = crate::tools::default_registry(Arc::clone(&notebook));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = CountingProvider {
+            calls: Arc::clone(&calls),
+        };
+        let mut brain = Brain::new(
+            &provider,
+            &registry,
+            None,
+            &audit,
+            Arc::clone(&notebook),
+            "turn-brain-precancel",
+            3,
+        )
+        .unwrap();
+        let token = CancelToken::new();
+        token.cancel();
+        brain.add_cancel_token(token);
+        let err = brain
+            .run("hello")
+            .await
+            .expect_err("cancelled turn must fail");
+        assert!(err.is_cancelled(), "{err}");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "provider must not be called"
+        );
+        let audit_text = std::fs::read_to_string(&audit_path).unwrap();
+        assert!(
+            audit_text.contains("\"cancelled\""),
+            "cancelled turn_end must be audited: {audit_text}"
+        );
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(&audit_path);
     }
 }

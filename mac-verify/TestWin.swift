@@ -4,26 +4,34 @@
 // the AppKit API as documented, mirroring the behavior of the X11
 // `testwin` binary (crates/mimint-body/src/bin/testwin.rs). The
 // first Mac run must compile it, fix any API drift, and record the
-// fixes before trusting any result from it.
+// fixes before trusting any result from it. The Phase 3 fix pass
+// edited this file (framebuffer-pixel geometry, pattern variant,
+// Unicode tokens) WITHOUT compiling it — the same warning applies
+// doubly to those edits.
 //
 // Behavior contract (identical to the X11 testwin):
-// - Window 400x300 at screen position (100, 100), top-left origin.
+// - Window 400x300 points at screen position (100, 100), top-left
+//   origin. ALL logged coordinates are FRAMEBUFFER PIXELS
+//   (points × backingScaleFactor), origin top-left — the same
+//   space the suite clicks and samples in. The `GEOM` line reports
+//   the content view's REAL screen position (a window may be
+//   moved; GEOM is re-logged on move/resize).
 // - Logs one line per event to the log file given as argv[1]:
-//     GEOM x=100 y=100 w=400 h=300
+//     GEOM x=.. y=.. w=.. h=..   (framebuffer pixels)
 //     READY
 //     BUTTON root_x=.. root_y=.. win_x=.. win_y=.. detail=1
 //     KEY sym=0x.. tok=..
 //     COLOR <name>
-//   Coordinates are Quartz screen pixels, origin TOP-left (the
-//   NSEvent screen origin is bottom-left; the conversion is in
-//   TestView.mouseDown). The `sym` field is informational; the
-//   oracle parses only `tok`.
+//   The `sym` field is informational; the oracle parses only `tok`.
 // - Polls the control file given as argv[2] every 100ms; its
-//   content (0/1/2) selects the fill color (red/green/blue).
-// - F5 toggles red <-> green (variants 0/1).
+//   content (0/1/2/3) selects the content: 0/1/2 solid red/green/
+//   blue, 3 = the pixel-pattern oracle quadrants (red/green/blue/
+//   yellow). F5 toggles red <-> green (variants 0/1).
 // - A space is logged as the visible token `<Space>`; Return/Tab/
 //   Escape/Delete/F5 log as `<Enter>`/`<Tab>`/<Esc>`/`<BS>`/`<F5>`;
-//   other keys log their character.
+//   other keys log their character (from `event.characters`, WITH
+//   modifiers, so Shift letters log uppercase); multi-character
+//   input logs the first scalar as `<U+XXXX>`.
 //
 // Build (on the Mac):
 //   swiftc -O -o TestWin TestWin.swift -framework AppKit
@@ -72,19 +80,36 @@ final class TestView: NSView {
     override var acceptsFirstResponder: Bool { true }
 
     override func draw(_ dirtyRect: NSRect) {
+        if variant == 3 {
+            // Pixel-pattern oracle: quadrants over the full bounds.
+            let w = bounds.width / 2
+            let h = bounds.height / 2
+            NSColor.red.setFill()
+            NSRect(x: 0, y: h, width: w, height: h).fill()
+            NSColor.green.setFill()
+            NSRect(x: w, y: h, width: w, height: h).fill()
+            NSColor.blue.setFill()
+            NSRect(x: 0, y: 0, width: w, height: h).fill()
+            NSColor.yellow.setFill()
+            NSRect(x: w, y: 0, width: w, height: h).fill()
+            return
+        }
         VARIANTS[variant].0.setFill()
-        dirtyRect.fill()
+        bounds.fill()
     }
 
     override func mouseDown(with event: NSEvent) {
-        // Screen coordinates, origin top-left (Quartz space).
+        // Screen coordinates in FRAMEBUFFER PIXELS, origin top-left:
+        // NSEvent points, flipped vertically, scaled by the backing
+        // factor (1.0 non-Retina, 2.0 Retina).
+        let scale = window?.backingScaleFactor ?? 1
         let screenPoint = NSEvent.mouseLocation
         let screenHeight = NSScreen.main?.frame.height ?? 0
-        let rootX = Int(screenPoint.x.rounded())
-        let rootY = Int((screenHeight - screenPoint.y).rounded())
+        let rootX = Int((screenPoint.x * scale).rounded())
+        let rootY = Int(((screenHeight - screenPoint.y) * scale).rounded())
         let winPoint = convert(event.locationInWindow, from: nil)
-        let winX = Int(winPoint.x.rounded())
-        let winY = Int((bounds.height - winPoint.y).rounded())
+        let winX = Int((winPoint.x * scale).rounded())
+        let winY = Int(((bounds.height - winPoint.y) * scale).rounded())
         log?.log("BUTTON root_x=\(rootX) root_y=\(rootY) win_x=\(winX) win_y=\(winY) detail=1")
     }
 
@@ -98,11 +123,15 @@ final class TestView: NSView {
         case 51: token = "<BS>"
         case 96: token = "<F5>"
         default:
-            let chars = event.charactersIgnoringModifiers ?? ""
+            // `characters` (WITH modifiers) so Shift letters log
+            // uppercase, matching what the suite sent.
+            let chars = event.characters ?? ""
             if chars == " " {
                 token = "<Space>"
-            } else if let first = chars.first, chars.count == 1 {
+            } else if chars.count == 1, let first = chars.first {
                 token = String(first)
+            } else if let scalar = chars.unicodeScalars.first {
+                token = "<U+\(String(format: "%04X", scalar.value))>"
             } else {
                 token = "<U+\(String(format: "%04X", keyCode))>"
             }
@@ -110,7 +139,7 @@ final class TestView: NSView {
         // sym is informational: the character scalar when there is
         // one, else the key code.
         let sym: UInt32
-        if let scalar = event.charactersIgnoringModifiers?.unicodeScalars.first {
+        if let scalar = event.characters?.unicodeScalars.first {
             sym = scalar.value
         } else {
             sym = UInt32(keyCode)
@@ -166,12 +195,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window.makeFirstResponder(view)
         self.window = window
         self.view = view
-        log.log("GEOM x=100 y=100 w=400 h=300")
+        logGeom()
         log.log("READY")
+        // Re-log geometry when the window moves or resizes: the
+        // suite always aims from the latest GEOM line.
+        NotificationCenter.default.addObserver(
+            forName: NSWindow.didMoveNotification, object: window, queue: .main
+        ) { [weak self] _ in self?.logGeom() }
+        NotificationCenter.default.addObserver(
+            forName: NSWindow.didResizeNotification, object: window, queue: .main
+        ) { [weak self] _ in self?.logGeom() }
         // Poll the control file for content changes.
         Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
             self?.pollControlFile()
         }
+    }
+
+    /// Log the content view's REAL screen geometry in framebuffer
+    /// pixels (points × backingScaleFactor, origin top-left).
+    func logGeom() {
+        guard let window = window, let view = view, let log = log else { return }
+        let scale = window.backingScaleFactor
+        let screenHeight = NSScreen.main?.frame.height ?? 0
+        let windowRect = view.convert(view.bounds, to: nil)
+        let screenRect = window.convertToScreen(windowRect)
+        let x = Int((screenRect.origin.x * scale).rounded())
+        let y = Int(((screenHeight - screenRect.origin.y - screenRect.height) * scale).rounded())
+        let w = Int((screenRect.width * scale).rounded())
+        let h = Int((screenRect.height * scale).rounded())
+        log.log("GEOM x=\(x) y=\(y) w=\(w) h=\(h)")
     }
 
     func pollControlFile() {
@@ -181,9 +233,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmed != lastControlContent else { return }
         lastControlContent = trimmed
-        if let value = Int(trimmed), (0..<VARIANTS.count).contains(value) {
+        if let value = Int(trimmed), (0...3).contains(value) {
             view?.variant = value
-            log?.log("COLOR \(VARIANTS[value].1)")
+            let name = value == 3 ? "pattern" : VARIANTS[value].1
+            log?.log("COLOR \(name)")
         }
     }
 

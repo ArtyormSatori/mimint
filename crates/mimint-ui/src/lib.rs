@@ -17,15 +17,21 @@
 //! [`Brain`]: mimint_core::Brain
 
 pub mod app;
+pub mod approval_text;
 pub mod approver;
 pub mod audit_view;
 pub mod chat;
 pub mod face;
+pub mod motion;
 pub mod worker;
 
-pub use app::MimintApp;
-pub use approver::{ApprovalJob, UiApprover};
+pub use app::{BackendInfo, MimintApp};
+pub use approval_text::{approval_detail, ApprovalDetail};
+pub use approver::{
+    approval_channel, ApprovalJob, RepaintSignal, TokenSlot, UiApprover, DEFAULT_APPROVAL_TIMEOUT,
+};
 pub use audit_view::{format_time_ms, parse_audit_line, read_audit_tail, AuditRow};
-pub use chat::{ApprovalRequest, ChatRole, ChatState, UiMessage};
+pub use chat::{ApprovalRequest, ChatRole, ChatState, ControlState, TurnStatus, UiMessage};
 pub use face::{FaceMachine, FaceParams, FaceState};
-pub use worker::{WorkerEvent, WorkerHandle, WorkerRequest};
+pub use motion::{FpsFuse, MotionController, MotionTier};
+pub use worker::{classify_error, FailureKind, WorkerEvent, WorkerHandle, WorkerRequest};

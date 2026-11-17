@@ -37,10 +37,16 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 ///   fallback chain honors the earlier of this deadline and its own
 ///   per-call `max_elapsed` budget. `None` means "no outer bound".
 ///
-/// Cancellation (Ctrl-C) is NOT plumbed through providers yet: there is
-/// no cancel token in this struct on purpose, rather than a fake one.
-/// In-flight requests are bounded by the per-request timeout baked into
-/// each provider's guarded HTTP client.
+/// Cancellation (turn cancel / emergency stop) is NOT plumbed
+/// through providers: there is no cancel token in this struct on
+/// purpose, rather than a fake one. Tokens live in the brain loop
+/// and the guard executor ([`CancelToken`]), which check them
+/// between steps and immediately before a tool executes. An HTTP
+/// request already in flight is NOT interrupted; it is bounded by
+/// the per-request timeout baked into each provider's guarded HTTP
+/// client. See `docs/stop-and-approval.md`.
+///
+/// [`CancelToken`]: crate::cancel::CancelToken
 ///
 /// No `Debug`: `AuditLog` deliberately has none (its path could leak
 /// into debug output), and a context carrying it must not either.

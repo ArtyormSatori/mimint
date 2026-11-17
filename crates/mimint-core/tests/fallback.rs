@@ -454,3 +454,56 @@ fn config_errors_are_not_transient_so_chains_never_retry_them() {
     let err = MimintError::ProviderTransient("timeout".to_string());
     assert!(err.is_transient());
 }
+
+#[tokio::test]
+async fn progress_hook_reports_each_attempt_and_last_used_tracks_the_winner() {
+    // First provider always 500s (permanent? no: 500 is transient,
+    // retried once, then the chain moves on); second succeeds.
+    let failing = start_stub(vec![
+        Behavior {
+            status: 500,
+            delay: Duration::ZERO,
+            body: "boom".to_string(),
+        },
+        Behavior {
+            status: 500,
+            delay: Duration::ZERO,
+            body: "boom".to_string(),
+        },
+    ]);
+    let winning = start_stub(vec![Behavior {
+        status: 200,
+        delay: Duration::ZERO,
+        body: success_body("winner answers"),
+    }]);
+    let audit_path = format!("{}.jsonl", temp_stem("progress"));
+    let audit = Arc::new(AuditLog::open(&audit_path).expect("open audit"));
+    let mut chain = FallbackChain::new(
+        vec![
+            provider_for("first", failing.port, Duration::from_secs(5), None),
+            provider_for("second", winning.port, Duration::from_secs(5), None),
+        ],
+        fast_retry(2),
+    )
+    .expect("chain");
+    assert_eq!(chain.last_used_provider(), None);
+    let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let seen_clone = Arc::clone(&seen);
+    chain.set_progress_hook(Arc::new(move |name| {
+        seen_clone.lock().unwrap().push(name.to_string());
+    }));
+    let ctx = CallContext::new("turn-progress", Some(audit.as_ref()));
+    let message = chain
+        .chat(&ctx, &[ChatMessage::user("hi")], &[])
+        .await
+        .expect("second provider answers");
+    assert_eq!(message.content.as_deref(), Some("winner answers"));
+    let seen = seen.lock().unwrap().clone();
+    assert_eq!(
+        seen,
+        vec!["first", "first", "second"],
+        "hook fires per attempt: {seen:?}"
+    );
+    assert_eq!(chain.last_used_provider().as_deref(), Some("second"));
+    let _ = std::fs::remove_file(&audit_path);
+}

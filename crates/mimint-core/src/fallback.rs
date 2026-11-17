@@ -35,7 +35,15 @@
 use crate::error::MimintError;
 use crate::provider::{BoxFuture, CallContext, ChatMessage, Provider};
 use serde_json::{json, Value};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+/// Called with the provider name before every attempt the chain
+/// starts, so a UI can say which backend is being tried ("trying
+/// another backend…"). The hook must return quickly and must never
+/// panic: it runs inside the attempt loop. It is reporting only — it
+/// cannot change which provider is tried.
+pub type ProgressHook = Arc<dyn Fn(&str) + Send + Sync>;
 
 /// Bounded retry policy for the fallback chain.
 #[derive(Debug, Clone, Copy)]
@@ -126,11 +134,18 @@ impl Default for RetryPolicy {
 /// The chain holds no per-turn state: audit context arrives with each
 /// `chat()` call, so one chain can be built once and reused for many
 /// turns. Reuse is safe precisely because nothing about a turn is
-/// baked into the chain.
+/// baked into the chain. The two reporting fields ([`FallbackChain::last_used_provider`]
+/// and the progress hook) are diagnostics only: they never affect
+/// which provider is tried next.
 pub struct FallbackChain {
     name: String,
     providers: Vec<Box<dyn Provider>>,
     retry: RetryPolicy,
+    /// Name of the provider that answered the most recent successful
+    /// call, if any. Lets the UI show the backend actually in use,
+    /// instead of only the configured chain order.
+    last_used: Mutex<Option<String>>,
+    progress_hook: Option<ProgressHook>,
 }
 
 impl FallbackChain {
@@ -148,7 +163,20 @@ impl FallbackChain {
             name: format!("fallback[{}]", names.join(",")),
             providers,
             retry,
+            last_used: Mutex::new(None),
+            progress_hook: None,
         })
+    }
+
+    /// The provider that answered the most recent successful call, if
+    /// any call has succeeded yet.
+    pub fn last_used_provider(&self) -> Option<String> {
+        self.last_used.lock().ok().and_then(|guard| guard.clone())
+    }
+
+    /// Report every attempt start to `hook` (see [`ProgressHook`]).
+    pub fn set_progress_hook(&mut self, hook: ProgressHook) {
+        self.progress_hook = Some(hook);
     }
 
     /// Provider names in chain order.
@@ -255,6 +283,9 @@ impl FallbackChain {
                 if !provider.is_paid() {
                     saw_local = true;
                 }
+                if let Some(hook) = &self.progress_hook {
+                    hook(provider.name());
+                }
                 let started = Instant::now();
                 let result = provider.chat(ctx, messages, tools).await;
                 let latency = started.elapsed();
@@ -269,7 +300,12 @@ impl FallbackChain {
                     &result,
                 )?;
                 match result {
-                    Ok(message) => return Ok(message),
+                    Ok(message) => {
+                        if let Ok(mut last) = self.last_used.lock() {
+                            *last = Some(provider.name().to_string());
+                        }
+                        return Ok(message);
+                    }
                     Err(err) => {
                         failures.push(format!("{}: {}", provider.name(), err));
                         if !err.is_transient() {

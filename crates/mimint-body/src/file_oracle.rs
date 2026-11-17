@@ -19,7 +19,9 @@
 //! space: the token is the last whitespace-delimited field, so a
 //! literal space would be unparseable. Enter and Tab produce both a
 //! text character and a key event, matching what a real target
-//! observes.
+//! observes. Unicode characters outside Latin-1 are logged as
+//! `<U+XXXX>` tokens (the X11 target cannot reconstruct them from
+//! the keysym table alone); the oracle decodes them to characters.
 //!
 //! Only complete lines are parsed; a partial last line waits for the
 //! rest. Only left-button (`detail=1`) clicks and key presses count.
@@ -197,6 +199,13 @@ fn parse_events(line: &str) -> Vec<LogEvent> {
             single if single.chars().count() == 1 => {
                 vec![LogEvent::Char(single.chars().next().unwrap())]
             }
+            unicode if unicode.starts_with("<U+") && unicode.ends_with('>') => {
+                let hex = &unicode[3..unicode.len() - 1];
+                match u32::from_str_radix(hex, 16).ok().and_then(char::from_u32) {
+                    Some(ch) => vec![LogEvent::Char(ch)],
+                    None => Vec::new(),
+                }
+            }
             _ => Vec::new(),
         };
     }
@@ -302,7 +311,16 @@ mod tests {
             vec![LogEvent::Key(Key::F5)]
         );
         assert!(parse_events("KEY sym=0xffe1 tok=<Shift>").is_empty());
-        assert!(parse_events("KEY sym=0x1234 tok=<U+1234>").is_empty());
+        assert_eq!(
+            parse_events("KEY sym=0x1001ebf tok=<U+1EBF>"),
+            vec![LogEvent::Char('ế')]
+        );
+        assert_eq!(
+            parse_events("KEY sym=0xe0 tok=<U+00E0>"),
+            vec![LogEvent::Char('à')]
+        );
+        assert!(parse_events("KEY sym=0x0 tok=<U+ZZZZ>").is_empty());
+        assert!(parse_events("KEY sym=0x0 tok=<U+D800>").is_empty());
     }
 
     #[test]

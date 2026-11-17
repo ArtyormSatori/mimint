@@ -22,6 +22,25 @@
 //!   through `Body::act` (screenshot via `act`, click via `act`).
 //! - `C8 permissions-reported`: the body reports a permission state
 //!   without error; the report records what it said.
+//! - `C9 pixel-pattern-oracle`: the target draws a known pattern at
+//!   known framebuffer pixels; the suite samples the screenshot's
+//!   pixels directly (an independent channel — not the event log)
+//!   and checks colors and channel order.
+//! - `C10 frame-geometry`: the frame carries a valid scale factor,
+//!   matches the display size, and is pixel-addressable.
+//! - `C11 type-unicode`: Vietnamese text with diacritics arrives
+//!   exactly (the Unicode typing path, not the ASCII key path).
+//!
+//! The guarded suite ([`run_guarded_suite`]) adds:
+//! - `G1 self-exclusion`: clicks into the exclusion zone are refused
+//!   typed, deliver nothing, and clicks outside still work.
+//! - `G2 focus-check`: input with a matching focus expectation works;
+//!   input with a wrong expectation fails typed and delivers
+//!   nothing.
+//!
+//! The permission-denial check ([`check_permission_denied`]) runs
+//! against a body reporting denied permissions: denied operations
+//! must fail with typed `PermissionDenied` errors, never silently.
 
 use crate::action::{Action, Key};
 use crate::body::Body;
@@ -91,9 +110,20 @@ impl SuiteReport {
 }
 
 /// Strings the type-text check sends. ASCII only: Vietnamese/IME
-/// input is untested on every body (same caveat as the Phase 0 spike),
-/// and the suite does not pretend otherwise.
+/// input is covered separately by check C11 (Unicode typing).
 pub const TYPE_STRINGS: [&str; 5] = ["hello", "AbC123", "a b_c-d.e", "Mimint!", "42"];
+
+/// Strings the Unicode typing check (C11) sends: Vietnamese with
+/// diacritics, including precomposed characters outside Latin-1
+/// (`ế`, `ệ`). Bodies type these through the Unicode path
+/// (`type_text`), never through physical-key remapping tricks that
+/// depend on the keyboard layout.
+pub const UNICODE_STRINGS: [&str; 2] = ["àéế", "Tiếng Việt"];
+
+/// Content variant that selects the pixel-pattern oracle pattern in
+/// every test target: four quadrants (top-left red, top-right green,
+/// bottom-left blue, bottom-right yellow) over the target rect.
+pub const PATTERN_VARIANT: u8 = 3;
 
 /// Click points for the accuracy check, spread over the display.
 /// Points are fractions of the display size so the same suite runs on
@@ -312,10 +342,295 @@ pub fn run_suite<B: Body, O: TargetOracle>(body: &mut B, oracle: &mut O) -> Suit
         ),
     ));
 
+    // C9: pixel-pattern oracle. The target draws a KNOWN pattern at
+    // KNOWN framebuffer pixels; the suite reads pixels straight out
+    // of the screenshot. This channel is independent of the event
+    // log and of the body's coordinate transform: a body that
+    // scales or offsets its capture cannot hide behind an oracle
+    // that shares the same bug. Exact color matches also prove the
+    // channel order (RGBA, not BGRA) — a swapped red quadrant reads
+    // blue and fails.
+    let c9 = (|| -> Result<CheckResult, BodyError> {
+        oracle.set_content(PATTERN_VARIANT);
+        let frame = body.screenshot()?;
+        let (w, h) = body.display_size()?;
+        let (rx, ry, rw, rh) = oracle.target_rect().unwrap_or((0, 0, w, h));
+        // Sample points: quadrant centers in framebuffer pixels.
+        let samples: [(i32, i32, [u8; 3], &str); 4] = [
+            (
+                rx + rw as i32 / 4,
+                ry + rh as i32 / 4,
+                [255, 0, 0],
+                "top-left red",
+            ),
+            (
+                rx + 3 * rw as i32 / 4,
+                ry + rh as i32 / 4,
+                [0, 255, 0],
+                "top-right green",
+            ),
+            (
+                rx + rw as i32 / 4,
+                ry + 3 * rh as i32 / 4,
+                [0, 0, 255],
+                "bottom-left blue",
+            ),
+            (
+                rx + 3 * rw as i32 / 4,
+                ry + 3 * rh as i32 / 4,
+                [255, 255, 0],
+                "bottom-right yellow",
+            ),
+        ];
+        let mut matched = 0usize;
+        let mut detail = String::new();
+        for (x, y, expected, name) in samples {
+            match frame.pixel(x, y) {
+                Some(px)
+                    if px[0] == expected[0] && px[1] == expected[1] && px[2] == expected[2] =>
+                {
+                    matched += 1;
+                }
+                other => {
+                    detail.push_str(&format!(
+                        "{name} at ({x},{y}): got {other:?}, want RGB{expected:?}; "
+                    ));
+                }
+            }
+        }
+        oracle.set_content(0);
+        Ok(check(
+            "C9",
+            "pixel-pattern-oracle",
+            matched == 4,
+            if matched == 4 {
+                "4/4 quadrant samples match exactly".to_string()
+            } else {
+                format!("matched={matched}/4 {detail}")
+            },
+        ))
+    })();
+    checks.push(match c9 {
+        Ok(result) => result,
+        Err(err) => check("C9", "pixel-pattern-oracle", false, format!("{err}")),
+    });
+
+    // C10: frame geometry. The frame must carry a valid scale factor
+    // and match the display size; pixel sampling must work at the
+    // corners. A scale=2 body is graded by the same check (the
+    // `mock-scaled` conformance mode), proving the contract holds in
+    // framebuffer-pixel space at any scale.
+    let c10 = (|| -> Result<CheckResult, BodyError> {
+        let (w, h) = body.display_size()?;
+        let frame = body.screenshot()?;
+        let dims_ok = frame.width == w && frame.height == h;
+        let scale_ok = frame.scale_factor.is_finite() && frame.scale_factor > 0.0;
+        let corners_ok = frame.pixel(0, 0).is_some()
+            && frame.pixel(w as i32 - 1, h as i32 - 1).is_some()
+            && frame.pixel(w as i32, h as i32).is_none();
+        Ok(check(
+            "C10",
+            "frame-geometry",
+            dims_ok && scale_ok && corners_ok,
+            format!(
+                "display={w}x{h} frame={}x{} scale={} origin=({},{}) corners_ok={corners_ok}",
+                frame.width, frame.height, frame.scale_factor, frame.origin.0, frame.origin.1
+            ),
+        ))
+    })();
+    checks.push(match c10 {
+        Ok(result) => result,
+        Err(err) => check("C10", "frame-geometry", false, format!("{err}")),
+    });
+
+    // C11: Unicode typing. Vietnamese with diacritics must arrive
+    // exactly, through the Unicode text path.
+    let c11 = (|| -> Result<CheckResult, BodyError> {
+        oracle.reset_events();
+        for text in UNICODE_STRINGS {
+            body.type_text(text)?;
+        }
+        let got = oracle.received_text();
+        let expected: String = UNICODE_STRINGS.concat();
+        Ok(check(
+            "C11",
+            "type-unicode",
+            got == expected,
+            format!("expected={expected:?} got={got:?}"),
+        ))
+    })();
+    checks.push(match c11 {
+        Ok(result) => result,
+        Err(err) => check("C11", "type-unicode", false, format!("{err}")),
+    });
+
     let passed = checks.iter().all(|c| c.passed);
     SuiteReport {
         body_name,
         checks,
         passed,
     }
+}
+
+/// The guarded suite: checks that only make sense for a body wrapped
+/// in [`crate::GuardedBody`] (or otherwise configured with an
+/// exclusion zone and focus support). Run AFTER [`run_suite`]; the
+/// body must already have its exclusion zone configured — a body
+/// with no zone FAILS G1, loudly, instead of passing vacuously.
+pub fn run_guarded_suite<B: Body, O: TargetOracle>(body: &mut B, oracle: &mut O) -> SuiteReport {
+    let mut checks = Vec::new();
+    let body_name = body.name().to_string();
+
+    // G1: self-exclusion zone.
+    let g1 = (|| -> Result<CheckResult, BodyError> {
+        let rects = body.excluded_rects().to_vec();
+        if rects.is_empty() {
+            return Ok(check(
+                "G1",
+                "self-exclusion",
+                false,
+                "no exclusion zone configured on this body".to_string(),
+            ));
+        }
+        let rect = rects[0];
+        let cx = rect.x + rect.width as i32 / 2;
+        let cy = rect.y + rect.height as i32 / 2;
+        oracle.reset_events();
+        let refused = body.click(cx, cy);
+        let forbidden = matches!(refused, Err(ref e) if e.code() == "forbidden_target");
+        let delivered = oracle.received_clicks();
+        // A click outside every rect (target center) must still work.
+        let (w, h) = body.display_size()?;
+        let (rx, ry, rw, rh) = oracle.target_rect().unwrap_or((0, 0, w, h));
+        let ox = rx + rw as i32 / 2;
+        let oy = ry + rh as i32 / 2;
+        let outside_ok = if rects.iter().any(|r| r.contains(ox, oy)) {
+            // The target center itself is excluded (a degenerate
+            // test setup): use the target's far corner instead.
+            let ax = rx + rw as i32 - 5;
+            let ay = ry + rh as i32 - 5;
+            body.click(ax, ay).is_ok()
+        } else {
+            body.click(ox, oy).is_ok()
+        };
+        Ok(check(
+            "G1",
+            "self-exclusion",
+            forbidden && delivered.is_empty() && outside_ok,
+            format!(
+                "rect=({},{}) {}x{} forbidden={forbidden} delivered_clicks={} outside_ok={outside_ok}",
+                rect.x,
+                rect.y,
+                rect.width,
+                rect.height,
+                delivered.len()
+            ),
+        ))
+    })();
+    checks.push(match g1 {
+        Ok(result) => result,
+        Err(err) => check("G1", "self-exclusion", false, format!("{err}")),
+    });
+
+    // G2: focus verification.
+    let g2 = (|| -> Result<CheckResult, BodyError> {
+        let Some(active) = body.active_window() else {
+            return Ok(check(
+                "G2",
+                "focus-check",
+                false,
+                "body cannot determine the focused window".to_string(),
+            ));
+        };
+        body.set_expected_focus(Some(active));
+        oracle.reset_events();
+        let matching_ok = body.type_text("z").is_ok();
+        let matching_text = oracle.received_text();
+        let bogus = active ^ 0xDEAD_BEEF;
+        let bogus = if bogus == active { active + 1 } else { bogus };
+        body.set_expected_focus(Some(bogus));
+        oracle.reset_events();
+        let refused = body.type_text("z");
+        let mismatch = matches!(refused, Err(ref e) if e.code() == "focus_mismatch");
+        let leaked = oracle.received_text();
+        body.set_expected_focus(None);
+        Ok(check(
+            "G2",
+            "focus-check",
+            matching_ok && matching_text == "z" && mismatch && leaked.is_empty(),
+            format!(
+                "active={active} matching_ok={matching_ok} matching_text={matching_text:?} mismatch={mismatch} leaked={leaked:?}"
+            ),
+        ))
+    })();
+    checks.push(match g2 {
+        Ok(result) => result,
+        Err(err) => check("G2", "focus-check", false, format!("{err}")),
+    });
+
+    let passed = checks.iter().all(|c| c.passed);
+    SuiteReport {
+        body_name,
+        checks,
+        passed,
+    }
+}
+
+/// The permission-denial check: run against a body that REPORTS
+/// denied permissions. Every denied operation must fail with a typed
+/// `permission_denied` error — never a silent blank image, never a
+/// swallowed click. A body reporting no denial fails the check: use
+/// a denied body (the `mock-denied` conformance mode), not a
+/// vacuous pass.
+pub fn check_permission_denied<B: Body>(body: &mut B) -> CheckResult {
+    use crate::body::PermissionState;
+    let perms = body.permissions();
+    let mut passed = true;
+    let mut detail = String::new();
+    let mut checked_any = false;
+    if perms.screen_capture == PermissionState::Denied {
+        checked_any = true;
+        match body.screenshot() {
+            Err(err) if err.code() == "permission_denied" => {
+                detail.push_str("screenshot denied typed; ");
+            }
+            other => {
+                passed = false;
+                detail.push_str(&format!("screenshot with denied capture: {other:?}; "));
+            }
+        }
+    }
+    if perms.input_control == PermissionState::Denied {
+        checked_any = true;
+        match body.click(10, 10) {
+            Err(err) if err.code() == "permission_denied" => {
+                detail.push_str("click denied typed; ");
+            }
+            other => {
+                passed = false;
+                detail.push_str(&format!("click with denied input: {other:?}; "));
+            }
+        }
+        match body.type_text("x") {
+            Err(err) if err.code() == "permission_denied" => {
+                detail.push_str("type denied typed; ");
+            }
+            other => {
+                passed = false;
+                detail.push_str(&format!("type with denied input: {other:?}; "));
+            }
+        }
+    }
+    if !checked_any {
+        return check(
+            "P1",
+            "permission-denied",
+            false,
+            format!(
+                "body reports no denial (screen_capture={:?} input_control={:?}); run against a denied body",
+                perms.screen_capture, perms.input_control
+            ),
+        );
+    }
+    check("P1", "permission-denied", passed, detail)
 }

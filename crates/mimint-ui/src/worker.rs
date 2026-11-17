@@ -9,18 +9,33 @@
 //! way to change it, and the old chain is kept when the new one
 //! fails to build.
 //!
+//! Cancellation runs on shared memory, not on the request queue:
+//! the UI trips the per-turn or stop token slots directly, so a
+//! cancel lands even while the worker is blocked inside a provider
+//! call. The worker creates a fresh turn token per turn and hands
+//! the brain both the turn token and the current stop token. A
+//! cancelled turn reports [`WorkerEvent::TurnCancelled`], distinct
+//! from a failure.
+//!
+//! Durability: a panic inside a turn is caught, reported as
+//! [`WorkerEvent::WorkerFault`], and the loop keeps serving — the UI
+//! must never stick on "thinking" because the worker died silently.
+//! If the UI disconnects, the loop exits.
+//!
 //! [`Brain`]: mimint_core::Brain
 //! [`build_chain`]: mimint_core::build_chain
 
-use crate::approver::{ApprovalJob, UiApprover};
+use crate::approver::{ApprovalJob, RepaintSignal, TokenSlot, UiApprover};
 use mimint_core::audit::now_ms;
 use mimint_core::{
-    default_registry, default_vault, AuditLog, BackendSpec, Brain, CostCap, EgressPolicy,
-    FallbackChain, Notebook, Provider, Registry, RetryPolicy,
+    default_registry, default_vault, AuditLog, BackendSpec, Brain, CancelToken, CostCap,
+    EgressPolicy, FallbackChain, Notebook, Provider, Registry, RetryPolicy,
 };
 use serde_json::json;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
+use std::time::Duration;
 
 /// Requests from the UI thread to the worker.
 #[derive(Debug)]
@@ -36,17 +51,71 @@ pub enum WorkerRequest {
     Shutdown,
 }
 
+/// Why a turn failed, classified best-effort from the error text for
+/// UI wording only. The classification never changes behavior; the
+/// raw error is always kept alongside.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureKind {
+    /// Authentication/authorization failure (401/403, bad key).
+    Auth,
+    /// Blocked by the egress policy (Privacy Mode).
+    PolicyBlocked,
+    /// Every backend in the chain failed.
+    OutOfBackends,
+    /// Anything else.
+    Other,
+}
+
+/// Classify an error message for display. Best-effort string
+/// matching: providers surface HTTP status and policy denials in
+/// their messages, and the UI only uses the kind to pick a heading.
+pub fn classify_error(error: &str) -> FailureKind {
+    let lower = error.to_lowercase();
+    if lower.contains("privacy mode is on")
+        || lower.contains("blocked by the egress policy")
+        || lower.contains("egress denied")
+    {
+        FailureKind::PolicyBlocked
+    } else if lower.contains("401")
+        || lower.contains("403")
+        || lower.contains("unauthorized")
+        || lower.contains("authentication")
+        || lower.contains("invalid api key")
+        || lower.contains("incorrect api key")
+    {
+        FailureKind::Auth
+    } else if lower.contains("all ") && lower.contains("provider(s) failed")
+        || lower.contains("no backend")
+        || lower.contains("no provider")
+    {
+        FailureKind::OutOfBackends
+    } else {
+        FailureKind::Other
+    }
+}
+
 /// Events from the worker to the UI thread.
 #[derive(Debug)]
 pub enum WorkerEvent {
-    /// A turn finished cleanly.
+    /// A turn finished cleanly. `backend` is the provider that
+    /// answered the last call, when known.
     TurnDone {
         text: String,
         tools_used: Vec<String>,
         partial: bool,
+        backend: Option<String>,
     },
     /// A turn failed (provider error, guard error, audit failure).
-    TurnFailed { error: String },
+    /// `kind` is the display classification; `error` is the raw text.
+    TurnFailed { error: String, kind: FailureKind },
+    /// The turn was cancelled (turn cancel or STOP), before or
+    /// during execution. Not a failure: nothing ran that should not
+    /// have, and the prompt stays available for retry.
+    TurnCancelled,
+    /// The chain is trying a backend (one event per attempt, in
+    /// chain order, including retries). The UI shows which backend
+    /// is being tried, instead of a generic spinner.
+    TryingBackend { name: String },
     /// The chain was (re)built, or the attempt failed. `names` is
     /// empty when the build failed; the previous chain (if any) is
     /// kept on a failed rebuild.
@@ -54,6 +123,9 @@ pub enum WorkerEvent {
         names: Vec<String>,
         error: Option<String>,
     },
+    /// The worker thread caught a panic inside a turn. The loop
+    /// keeps serving; the UI shows the control error state.
+    WorkerFault { error: String },
 }
 
 /// What a rebuild needs: the specs to build from, the retry policy,
@@ -76,12 +148,23 @@ pub struct WorkerDeps {
     pub max_steps: usize,
     /// Where approval jobs go (the UI thread's receiver).
     pub approval_tx: Sender<ApprovalJob>,
+    /// Latching stop slot, shared with the UI (DỪNG NGAY / resume).
+    pub stop_slot: Arc<TokenSlot>,
+    /// Per-turn cancel slot, shared with the UI (Hủy lượt).
+    pub turn_slot: Arc<TokenSlot>,
+    /// Wake-up flag the approver pokes when a job arrives.
+    pub repaint: Arc<RepaintSignal>,
+    /// How long an approval card may wait before timing out.
+    pub approval_timeout: Duration,
 }
 
-/// Handle for the UI thread: send requests, poll events.
+/// Handle for the UI thread: send requests, poll events, trip the
+/// shared cancellation slots.
 pub struct WorkerHandle {
     request_tx: Sender<WorkerRequest>,
     event_rx: Receiver<WorkerEvent>,
+    stop_slot: Arc<TokenSlot>,
+    turn_slot: Arc<TokenSlot>,
 }
 
 impl WorkerHandle {
@@ -93,6 +176,29 @@ impl WorkerHandle {
         let _ = self
             .request_tx
             .send(WorkerRequest::Rebuild { privacy_on, order });
+    }
+
+    /// Cancel the running turn (cooperative: checked before the next
+    /// provider call / tool execution). Safe to call when idle.
+    pub fn cancel_turn(&self) {
+        self.turn_slot.cancel_current();
+    }
+
+    /// Trip the latching emergency stop. Stays tripped until
+    /// [`WorkerHandle::resume`] replaces the token.
+    pub fn stop_now(&self) {
+        self.stop_slot.cancel_current();
+        self.turn_slot.cancel_current();
+    }
+
+    /// Clear the stop latch (the user actively re-enables). Turns
+    /// already cancelled stay cancelled; new turns start fresh.
+    pub fn resume(&self) {
+        self.stop_slot.replace(CancelToken::new());
+    }
+
+    pub fn is_stopped(&self) -> bool {
+        self.stop_slot.is_cancelled()
     }
 
     /// Non-blocking event poll, for the UI frame loop.
@@ -112,11 +218,25 @@ impl Drop for WorkerHandle {
 pub fn spawn_worker(deps: WorkerDeps) -> WorkerHandle {
     let (request_tx, request_rx) = std::sync::mpsc::channel();
     let (event_tx, event_rx) = std::sync::mpsc::channel();
+    let stop_slot = Arc::clone(&deps.stop_slot);
+    let turn_slot = Arc::clone(&deps.turn_slot);
     std::thread::spawn(move || worker_loop(deps, request_rx, event_tx));
     WorkerHandle {
         request_tx,
         event_rx,
+        stop_slot,
+        turn_slot,
     }
+}
+
+/// Report every fallback attempt to the UI as [`WorkerEvent::TryingBackend`].
+fn attach_progress_hook(chain: &mut FallbackChain, event_tx: &Sender<WorkerEvent>) {
+    let tx = event_tx.clone();
+    chain.set_progress_hook(Arc::new(move |name| {
+        let _ = tx.send(WorkerEvent::TryingBackend {
+            name: name.to_string(),
+        });
+    }));
 }
 
 fn worker_loop(
@@ -142,11 +262,19 @@ fn worker_loop(
         audit,
         max_steps,
         approval_tx,
+        stop_slot,
+        turn_slot,
+        repaint,
+        approval_timeout,
     } = deps;
     let registry = default_registry(Arc::clone(&notebook));
-    let approver = UiApprover::new(approval_tx);
+    let approver = UiApprover::new(approval_tx)
+        .with_timeout(approval_timeout)
+        .with_slots(Arc::clone(&stop_slot), Arc::clone(&turn_slot))
+        .with_repaint(repaint);
     let mut chain = match FallbackChain::new(initial_providers, retry) {
-        Ok(chain) => {
+        Ok(mut chain) => {
+            attach_progress_hook(&mut chain, &event_tx);
             let _ = event_tx.send(WorkerEvent::ChainRebuilt {
                 names: vec![chain.name().to_string()],
                 error: None,
@@ -172,14 +300,34 @@ fn worker_loop(
                     notebook: &notebook,
                     audit: &audit,
                     max_steps,
+                    stop_slot: &stop_slot,
+                    turn_slot: &turn_slot,
                 };
-                let event = run_one_turn(&runtime, chain.as_ref(), &ctx, &prompt);
+                // A panic in a turn must not kill the worker or
+                // leave the UI stuck on "thinking": catch it,
+                // report it, keep serving.
+                let event = match catch_unwind(AssertUnwindSafe(|| {
+                    run_one_turn(&runtime, chain.as_ref(), &ctx, &prompt)
+                })) {
+                    Ok(event) => event,
+                    Err(payload) => {
+                        let message = payload
+                            .downcast_ref::<&str>()
+                            .map(|s| s.to_string())
+                            .or_else(|| payload.downcast_ref::<String>().cloned())
+                            .unwrap_or_else(|| "unknown panic".to_string());
+                        WorkerEvent::WorkerFault {
+                            error: format!("worker thread panicked during the turn: {message}"),
+                        }
+                    }
+                };
                 if event_tx.send(event).is_err() {
                     break;
                 }
             }
             WorkerRequest::Rebuild { privacy_on, order } => {
-                let event = rebuild_chain(&mut chain, &rebuild, &audit, privacy_on, &order);
+                let event =
+                    rebuild_chain(&mut chain, &rebuild, &audit, &event_tx, privacy_on, &order);
                 if event_tx.send(event).is_err() {
                     break;
                 }
@@ -195,6 +343,8 @@ struct TurnCtx<'a> {
     notebook: &'a Arc<Notebook>,
     audit: &'a Arc<AuditLog>,
     max_steps: usize,
+    stop_slot: &'a Arc<TokenSlot>,
+    turn_slot: &'a Arc<TokenSlot>,
 }
 
 fn run_one_turn(
@@ -206,10 +356,15 @@ fn run_one_turn(
     let Some(chain) = chain else {
         return WorkerEvent::TurnFailed {
             error: "no backend is configured: add a backend to the config file or start Ollama/LM Studio, then restart the app".to_string(),
+            kind: FailureKind::OutOfBackends,
         };
     };
+    // Fresh turn token: the UI cancels THIS turn through the slot,
+    // and the approver watches the same slot while a card waits.
+    let turn_token = CancelToken::new();
+    ctx.turn_slot.replace(turn_token.clone());
     let turn_id = format!("ui-turn-{}-{}", std::process::id(), now_ms());
-    let brain = match Brain::new(
+    let mut brain = match Brain::new(
         chain,
         ctx.registry,
         Some(ctx.approver),
@@ -222,18 +377,27 @@ fn run_one_turn(
         Err(err) => {
             return WorkerEvent::TurnFailed {
                 error: err.to_string(),
-            }
+                kind: classify_error(&err.to_string()),
+            };
         }
     };
+    brain.add_cancel_token(turn_token);
+    brain.add_cancel_token(ctx.stop_slot.get());
     match runtime.block_on(brain.run(prompt)) {
         Ok(outcome) => WorkerEvent::TurnDone {
             text: outcome.text,
             tools_used: outcome.tools_used,
             partial: outcome.partial,
+            backend: chain.last_used_provider(),
         },
-        Err(err) => WorkerEvent::TurnFailed {
-            error: err.to_string(),
-        },
+        Err(err) if err.is_cancelled() => WorkerEvent::TurnCancelled,
+        Err(err) => {
+            let text = err.to_string();
+            WorkerEvent::TurnFailed {
+                kind: classify_error(&text),
+                error: text,
+            }
+        }
     }
 }
 
@@ -241,6 +405,7 @@ fn rebuild_chain(
     chain: &mut Option<FallbackChain>,
     rebuild: &Option<RebuildConfig>,
     audit: &Arc<AuditLog>,
+    event_tx: &Sender<WorkerEvent>,
     privacy_on: bool,
     order: &[String],
 ) -> WorkerEvent {
@@ -273,7 +438,8 @@ fn rebuild_chain(
     let vault = default_vault();
     match mimint_core::build_chain(&rebuild.specs, order, &vault, policy, rebuild.cost_cap) {
         Ok(providers) => match FallbackChain::new(providers, rebuild.retry) {
-            Ok(new_chain) => {
+            Ok(mut new_chain) => {
+                attach_progress_hook(&mut new_chain, event_tx);
                 let names = vec![new_chain.name().to_string()];
                 *chain = Some(new_chain);
                 WorkerEvent::ChainRebuilt { names, error: None }
@@ -294,7 +460,9 @@ fn rebuild_chain(
 mod tests {
     use super::*;
     use crate::approver::approval_channel;
-    use mimint_core::{BoxFuture, CallContext, ChatMessage, FunctionCall, MimintError, ToolCall};
+    use mimint_core::{
+        ApprovalDecision, BoxFuture, CallContext, ChatMessage, FunctionCall, MimintError, ToolCall,
+    };
     use std::time::Duration;
 
     /// Provider that answers with a fixed script of messages, one per
@@ -402,6 +570,10 @@ mod tests {
             audit: Arc::new(AuditLog::open(&audit_path).unwrap()),
             max_steps: 5,
             approval_tx,
+            stop_slot: TokenSlot::new(),
+            turn_slot: TokenSlot::new(),
+            repaint: RepaintSignal::new(),
+            approval_timeout: Duration::from_secs(120),
         };
         (spawn_worker(deps), approval_rx, dir)
     }
@@ -417,6 +589,16 @@ mod tests {
         panic!("no worker event within 2s");
     }
 
+    /// Drain TryingBackend events, returning the first non-progress event.
+    fn wait_terminal(handle: &WorkerHandle) -> WorkerEvent {
+        loop {
+            match wait_event(handle) {
+                WorkerEvent::TryingBackend { .. } => continue,
+                other => return other,
+            }
+        }
+    }
+
     #[test]
     fn turn_with_plain_answer_completes() {
         let (handle, _approvals, dir) = spawn_fake(FakeProvider::answering("hello back"));
@@ -426,18 +608,36 @@ mod tests {
             WorkerEvent::ChainRebuilt { error: None, .. }
         ));
         handle.run_turn("hi".to_string());
-        match wait_event(&handle) {
+        match wait_terminal(&handle) {
             WorkerEvent::TurnDone {
                 text,
                 tools_used,
                 partial,
+                backend,
             } => {
                 assert_eq!(text, "hello back");
                 assert!(tools_used.is_empty());
                 assert!(!partial);
+                assert_eq!(backend.as_deref(), Some("fake"));
             }
             other => panic!("unexpected event: {other:?}"),
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn trying_backend_is_reported_before_the_answer() {
+        let (handle, _approvals, dir) = spawn_fake(FakeProvider::answering("hi"));
+        let _ = wait_event(&handle);
+        handle.run_turn("hi".to_string());
+        match wait_event(&handle) {
+            WorkerEvent::TryingBackend { name } => assert_eq!(name, "fake"),
+            other => panic!("expected TryingBackend first, got: {other:?}"),
+        }
+        assert!(matches!(
+            wait_terminal(&handle),
+            WorkerEvent::TurnDone { .. }
+        ));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -455,8 +655,8 @@ mod tests {
             .recv_timeout(Duration::from_secs(5))
             .expect("approval job must arrive");
         assert_eq!(job.tool, "notebook_add");
-        job.reply.send(true).unwrap();
-        match wait_event(&handle) {
+        job.reply.send(ApprovalDecision::Allow).unwrap();
+        match wait_terminal(&handle) {
             WorkerEvent::TurnDone {
                 text, tools_used, ..
             } => {
@@ -480,13 +680,51 @@ mod tests {
         let job = approvals
             .recv_timeout(Duration::from_secs(5))
             .expect("approval job must arrive");
-        job.reply.send(false).unwrap();
-        match wait_event(&handle) {
+        job.reply.send(ApprovalDecision::Deny).unwrap();
+        match wait_terminal(&handle) {
             WorkerEvent::TurnDone { text, .. } => {
                 assert_eq!(text, "ok, not saved");
             }
             other => panic!("unexpected event: {other:?}"),
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stop_before_a_turn_cancels_it_distinctly() {
+        let (handle, _approvals, dir) = spawn_fake(FakeProvider::answering("never"));
+        let _ = wait_event(&handle);
+        handle.stop_now();
+        assert!(handle.is_stopped());
+        handle.run_turn("hi".to_string());
+        match wait_terminal(&handle) {
+            WorkerEvent::TurnCancelled => {}
+            other => panic!("expected TurnCancelled, got: {other:?}"),
+        }
+        handle.resume();
+        assert!(!handle.is_stopped());
+        handle.run_turn("hi".to_string());
+        match wait_terminal(&handle) {
+            WorkerEvent::TurnDone { text, .. } => assert_eq!(text, "never"),
+            other => panic!("expected TurnDone after resume, got: {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn classify_error_picks_the_display_kind() {
+        assert_eq!(
+            classify_error("request blocked: Privacy Mode is ON"),
+            FailureKind::PolicyBlocked
+        );
+        assert_eq!(
+            classify_error("provider returned 401 Unauthorized"),
+            FailureKind::Auth
+        );
+        assert_eq!(
+            classify_error("all 2 provider(s) failed: boom"),
+            FailureKind::OutOfBackends
+        );
+        assert_eq!(classify_error("weird"), FailureKind::Other);
     }
 }

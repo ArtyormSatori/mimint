@@ -11,6 +11,7 @@
 
 pub mod audit;
 pub mod brain;
+pub mod cancel;
 pub mod claude;
 pub mod config;
 pub mod egress;
@@ -27,12 +28,15 @@ pub mod vault;
 
 pub use audit::{AuditLog, AuditRecord};
 pub use brain::{Brain, TurnOutcome};
+pub use cancel::CancelToken;
 pub use claude::{ClaudeClient, ANTHROPIC_BASE_URL, ANTHROPIC_VERSION, DEFAULT_MAX_TOKENS};
 pub use config::{default_config_path, load_config_file, FileConfig, ResolvedConfig};
 pub use egress::{EgressPolicy, GuardedHttpClient};
 pub use error::MimintError;
-pub use fallback::{FallbackChain, RetryPolicy};
-pub use guards::{Approver, GuardedExecutor, Risk};
+pub use fallback::{FallbackChain, ProgressHook, RetryPolicy};
+pub use guards::{
+    ApprovalDecision, ApprovalOutcome, ApprovalRequest, Approver, GuardedExecutor, Risk,
+};
 pub use keychain::{KeychainVault, KEYCHAIN_SERVICE};
 pub use notebook::{Note, Notebook};
 pub use onboarding::{probe_local_backends, suggestion_text, LocalProbe};

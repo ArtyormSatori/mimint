@@ -13,7 +13,9 @@
 //! top-left. Quartz event points are in POINTS, so clicks are scaled
 //! by the display's backing factor (1.0 on the non-Retina
 //! MacBookPro11,1; 2.0 on Retina). Screenshot pixels come from the
-//! `CGImage` itself, which is always in pixels.
+//! `CGImage` itself, which is always in pixels. The frame carries
+//! `scale_factor` + `origin` so callers can see the geometry; the
+//! display size is re-read on every call (no stale cached size).
 //!
 //! Pixel format assumption: `CGWindowListCreateImage` returns 32-bit
 //! BGRA (premultiplied-first, little-endian) on current macOS. The
@@ -21,12 +23,52 @@
 //! channel order mechanically by sampling the test window's center
 //! pixel for each color variant. If Apple ever changes the order,
 //! that check fails loudly instead of silently swapping colors.
+//! Alpha is copied as-is: the source is premultiplied, and the
+//! conversion does NOT un-premultiply (documented approximation —
+//! the suite's color checks use opaque fills, where premultiplied
+//! and straight alpha agree). Stride is honored row by row
+//! (`bytes_per_row` is often wider than `width * 4`).
+//!
+//! Memory management (FFI check, Phase 3 fix pass F3-11): this file
+//! uses ONLY the safe `core-graphics` wrappers (`CGImage`, `CGEvent`,
+//! `CGEventSource`), which own their underlying `CFTypeRef`s and
+//! release them on drop — there is no manual `CFRelease` /
+//! `CGImageRelease` to forget, and no raw pointer escapes. The two
+//! direct `extern "C"` getters (`AXIsProcessTrusted`,
+//! `CGPreflightScreenCaptureAccess`) return plain booleans and own
+//! nothing. Every early-error branch returns before any object is
+//! created, or drops the wrapper by scope exit. `create_image`
+//! returns `Option` (null → `None`), and the `None` branch is
+//! handled with a permission re-probe before reporting a backend
+//! error.
+//!
+//! Deprecation note: `CGWindowListCreateImage` is deprecated since
+//! macOS 14; the long-term direction is ScreenCaptureKit. The
+//! reference machine (MacBookPro11,1, officially to Monterey) keeps
+//! the old API working for the spike, but the ScreenCaptureKit
+//! decision must be made BEFORE distribution — see
+//! `docs/body-aci.md`. This file deliberately keeps the old API for
+//! the spike and says so.
+//!
+//! Permission probing: `connect()` fails fast when a grant is
+//! missing, AND every operation re-probes before acting (a grant
+//! revoked mid-session must fail typed, not silently). Known limit:
+//! when Screen Recording is missing, macOS may still return a valid
+//! image showing only the desktop background (windows hidden); the
+//! per-operation probe is the defense, and the Mac checklist
+//! verifies content, not just "an image arrived".
+//! `CGPreflightPostEventAccess` is deliberately NOT linked: its
+//! availability on the reference machine's macOS version is
+//! unconfirmed, and linking an absent symbol fails at load time.
+//! Post-event access is covered by the `AXIsProcessTrusted` probe;
+//! the Mac checklist (CHECKLIST.md P1) confirms post-event behavior
+//! empirically before anyone relies on it.
 
 use crate::action::Key;
-use crate::body::{Body, Framebuffer, PermissionState, Permissions};
+use crate::body::{Body, Framebuffer, PermissionState, Permissions, ScreenRect};
 use crate::error::BodyError;
 use core_graphics::display::CGDisplay;
-use core_graphics::event::{CGEvent, CGEventTapLocation, CGEventType, CGMouseButton};
+use core_graphics::event::{CGEvent, CGEventTapLocation, CGEventType, CGMouseButton, EventField};
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use core_graphics::geometry::CGPoint;
 use core_graphics::window::{
@@ -100,9 +142,34 @@ pub struct MacOsBody {
     width_px: u32,
     height_px: u32,
     scale: f64,
+    excluded: Vec<ScreenRect>,
+    expected_focus: Option<u64>,
+    max_capture_dimension: Option<u32>,
 }
 
 impl MacOsBody {
+    /// Read the current display geometry (pixels + backing scale)
+    /// from Quartz. Called fresh on every size query.
+    fn current_geometry() -> (u32, u32, f64) {
+        let display = CGDisplay::main();
+        let width_px = display.pixels_wide() as u32;
+        let height_px = display.pixels_high() as u32;
+        let bounds = display.bounds();
+        let scale = if bounds.size.width > 0.0 {
+            display.pixels_wide() as f64 / bounds.size.width
+        } else {
+            1.0
+        };
+        (width_px, height_px, scale)
+    }
+
+    fn refresh_geometry(&mut self) {
+        let (width_px, height_px, scale) = Self::current_geometry();
+        self.width_px = width_px;
+        self.height_px = height_px;
+        self.scale = scale;
+    }
+
     pub fn connect() -> Result<Self, BodyError> {
         if !screen_capture_granted() {
             return Err(BodyError::PermissionDenied {
@@ -121,19 +188,14 @@ impl MacOsBody {
         // Each input operation creates its own source instead.
         let _probe = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
             .map_err(|_| BodyError::Backend("CGEventSourceCreate failed".to_string()))?;
-        let display = CGDisplay::main();
-        let width_px = display.pixels_wide() as u32;
-        let height_px = display.pixels_high() as u32;
-        let bounds = display.bounds();
-        let scale = if bounds.size.width > 0.0 {
-            display.pixels_wide() as f64 / bounds.size.width
-        } else {
-            1.0
-        };
+        let (width_px, height_px, scale) = Self::current_geometry();
         Ok(Self {
             width_px,
             height_px,
             scale,
+            excluded: Vec::new(),
+            expected_focus: None,
+            max_capture_dimension: None,
         })
     }
 
@@ -149,6 +211,34 @@ impl MacOsBody {
         Ok(())
     }
 
+    /// Re-probe Screen Recording before a capture: a grant revoked
+    /// mid-session must fail typed.
+    fn require_screen_capture(&self) -> Result<(), BodyError> {
+        if screen_capture_granted() {
+            Ok(())
+        } else {
+            Err(BodyError::PermissionDenied {
+                permission: "Screen Recording",
+                hint: "Screen Recording was revoked while running; re-enable it and restart."
+                    .to_string(),
+            })
+        }
+    }
+
+    /// Re-probe Accessibility before an input operation: without it,
+    /// `CGEventPost` swallows events silently.
+    fn require_input_control(&self) -> Result<(), BodyError> {
+        if input_control_granted() {
+            Ok(())
+        } else {
+            Err(BodyError::PermissionDenied {
+                permission: "Accessibility",
+                hint: "Accessibility was revoked while running; re-enable it and restart."
+                    .to_string(),
+            })
+        }
+    }
+
     fn event_source() -> Result<CGEventSource, BodyError> {
         CGEventSource::new(CGEventSourceStateID::HIDSystemState)
             .map_err(|_| BodyError::Backend("CGEventSourceCreate failed".to_string()))
@@ -158,6 +248,18 @@ impl MacOsBody {
         let event =
             CGEvent::new_mouse_event(Self::event_source()?, kind, point, CGMouseButton::Left)
                 .map_err(|_| BodyError::Backend("CGEventCreateMouseEvent failed".to_string()))?;
+        event.post(CGEventTapLocation::HID);
+        Ok(())
+    }
+
+    /// Post a mouse button event with an explicit click state (1 =
+    /// single click), so the target never has to guess whether a
+    /// down/up pair is one click or part of a multi-click.
+    fn post_click(&self, kind: CGEventType, point: CGPoint) -> Result<(), BodyError> {
+        let event =
+            CGEvent::new_mouse_event(Self::event_source()?, kind, point, CGMouseButton::Left)
+                .map_err(|_| BodyError::Backend("CGEventCreateMouseEvent failed".to_string()))?;
+        event.set_integer_value_field(EventField::MOUSE_EVENT_CLICK_STATE, 1);
         event.post(CGEventTapLocation::HID);
         Ok(())
     }
@@ -191,10 +293,13 @@ impl Body for MacOsBody {
     }
 
     fn display_size(&mut self) -> Result<(u32, u32), BodyError> {
+        self.refresh_geometry();
         Ok((self.width_px, self.height_px))
     }
 
     fn screenshot(&mut self) -> Result<Framebuffer, BodyError> {
+        self.require_screen_capture()?;
+        self.refresh_geometry();
         let bounds = CGDisplay::main().bounds();
         let image = create_image(
             bounds,
@@ -242,23 +347,41 @@ impl Body for MacOsBody {
                 rgba.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
             }
         }
-        Framebuffer::new(width as u32, height as u32, rgba)
+        let frame =
+            Framebuffer::with_geometry(width as u32, height as u32, rgba, self.scale, (0, 0))?;
+        Ok(match self.max_capture_dimension {
+            Some(max) => frame.downscale(max),
+            None => frame,
+        })
     }
 
     fn click(&mut self, x: i32, y: i32) -> Result<(), BodyError> {
+        self.refresh_geometry();
         self.check_bounds(x, y)?;
+        self.check_target(x, y)?;
+        self.require_input_control()?;
+        self.verify_focus()?;
         let point = pixels_to_points(x, y, self.scale);
-        self.post_mouse(CGEventType::LeftMouseDown, point)?;
+        // Move first, so the down/up pair lands where the pointer
+        // already is; then down/up with click state 1 and a short
+        // gap, so fast sequences are neither dropped nor reordered.
+        self.post_mouse(CGEventType::MouseMoved, point)?;
+        self.post_click(CGEventType::LeftMouseDown, point)?;
         std::thread::sleep(Duration::from_millis(5));
-        self.post_mouse(CGEventType::LeftMouseUp, point)
+        self.post_click(CGEventType::LeftMouseUp, point)
     }
 
     fn mouse_move(&mut self, x: i32, y: i32) -> Result<(), BodyError> {
+        self.refresh_geometry();
         self.check_bounds(x, y)?;
+        self.check_target(x, y)?;
+        self.require_input_control()?;
         self.post_mouse(CGEventType::MouseMoved, pixels_to_points(x, y, self.scale))
     }
 
     fn type_text(&mut self, text: &str) -> Result<(), BodyError> {
+        self.require_input_control()?;
+        self.verify_focus()?;
         // Validate everything first: control characters other than
         // newline/tab have no meaning as typed input.
         for ch in text.chars() {
@@ -285,6 +408,8 @@ impl Body for MacOsBody {
     }
 
     fn key(&mut self, key: Key) -> Result<(), BodyError> {
+        self.require_input_control()?;
+        self.verify_focus()?;
         self.press_keycode(keycode_for(key))
     }
 
@@ -301,6 +426,45 @@ impl Body for MacOsBody {
                 PermissionState::Denied
             },
         }
+    }
+
+    fn excluded_rects(&self) -> &[ScreenRect] {
+        &self.excluded
+    }
+
+    fn set_excluded_rects(&mut self, rects: Vec<ScreenRect>) {
+        self.excluded = rects;
+    }
+
+    fn expected_focus(&self) -> Option<u64> {
+        self.expected_focus
+    }
+
+    fn set_expected_focus(&mut self, window: Option<u64>) {
+        self.expected_focus = window;
+    }
+
+    /// Focus verification is NOT implemented on macOS: reading the
+    /// focused window needs Accessibility APIs (`AXUIElement`) that
+    /// this body does not wrap yet. Setting an expectation fails
+    /// loudly instead of pretending the check passed; with no
+    /// expectation set, input proceeds (the Phase 3 behavior).
+    /// Phase 4 work: wrap the AX focused-window query.
+    fn verify_focus(&mut self) -> Result<(), BodyError> {
+        if self.expected_focus.is_some() {
+            return Err(BodyError::Unsupported(
+                "focus verification is not implemented on macOS yet (needs the AX focused-window query, Phase 4)",
+            ));
+        }
+        Ok(())
+    }
+
+    fn max_capture_dimension(&self) -> Option<u32> {
+        self.max_capture_dimension
+    }
+
+    fn set_max_capture_dimension(&mut self, max: Option<u32>) {
+        self.max_capture_dimension = max;
     }
 }
 
