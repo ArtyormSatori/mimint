@@ -29,7 +29,7 @@
 
 use crate::registry::{BackendSpec, CostCap};
 use crate::soul::{is_valid_soul_file_name, DEFAULT_SOUL_FILE};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Name of the implicit profile built from the top-level config
 /// when no `[[profile]]` tables exist (or none survive
@@ -39,7 +39,7 @@ pub const DEFAULT_PROFILE_NAME: &str = "Mặc định";
 /// One `[[profile]]` table, as parsed from TOML. Only `name` is
 /// required; every other field inherits from the top-level
 /// config or a default when absent.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProfileEntry {
     /// Profile name, shown in the UI and used by `--profile`.

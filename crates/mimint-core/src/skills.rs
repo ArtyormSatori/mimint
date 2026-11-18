@@ -650,6 +650,23 @@ impl SkillStore {
         Ok(())
     }
 
+    /// Delete a skill file (Phase 7: tombstone apply path).
+    /// Returns false when the skill did not exist. The name is
+    /// validated exactly like every other store operation.
+    pub fn remove(&self, name: &str) -> Result<bool, MimintError> {
+        let path = self.path_for(name)?;
+        if !path.exists() {
+            return Ok(false);
+        }
+        std::fs::remove_file(&path).map_err(|err| {
+            MimintError::Io(format!(
+                "cannot delete skill file {}: {err}",
+                path.display()
+            ))
+        })?;
+        Ok(true)
+    }
+
     /// Create a new skill as a draft. Fails when a skill with the
     /// name already exists; the status is forced to Draft and any
     /// supplied history is dropped (a new skill has no runs).

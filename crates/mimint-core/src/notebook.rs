@@ -140,6 +140,19 @@ fn note_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Note> {
     })
 }
 
+/// A fresh random sync id: 32 lowercase hex characters (128
+/// bits of system randomness).
+fn new_sync_id() -> String {
+    let rng = ring::rand::SystemRandom::new();
+    let mut bytes = [0u8; 16];
+    let _ = ring::rand::SecureRandom::fill(&rng, &mut bytes);
+    let mut out = String::with_capacity(32);
+    for byte in bytes {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
+}
+
 /// Columns selected by every note query, in `note_from_row` order.
 const NOTE_COLUMNS: &str = "id, title, body, created_ms, updated_ms, owner_agent_id, shared";
 
@@ -433,6 +446,22 @@ impl Notebook {
             "shared",
             "ALTER TABLE notes ADD COLUMN shared INTEGER NOT NULL DEFAULT 1",
         )?;
+        // Phase 7 migration (§4.3): stable sync ids. Existing
+        // rows get random ids; new rows get one in `add_for`.
+        ensure_column(
+            &conn,
+            "notes",
+            "sync_id",
+            "ALTER TABLE notes ADD COLUMN sync_id TEXT",
+        )?;
+        conn.execute(
+            "UPDATE notes SET sync_id = lower(hex(randomblob(16))) WHERE sync_id IS NULL OR sync_id = ''",
+            [],
+        )?;
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_notes_sync_id ON notes(sync_id)",
+            [],
+        )?;
         Ok(Self {
             conn: Mutex::new(conn),
             index: Mutex::new(None),
@@ -499,11 +528,12 @@ impl Notebook {
         shared: bool,
     ) -> Result<i64, MimintError> {
         let now = now_ms() as i64;
+        let sync_id = new_sync_id();
         let id = {
             let conn = self.connection();
             conn.execute(
-                "INSERT INTO notes (title, body, created_ms, updated_ms, owner_agent_id, shared) VALUES (?1, ?2, ?3, ?3, ?4, ?5)",
-                params![title, body, now, agent_id, shared as i64],
+                "INSERT INTO notes (title, body, created_ms, updated_ms, owner_agent_id, shared, sync_id) VALUES (?1, ?2, ?3, ?3, ?4, ?5, ?6)",
+                params![title, body, now, agent_id, shared as i64, sync_id],
             )?;
             conn.last_insert_rowid()
         };
@@ -545,6 +575,102 @@ impl Notebook {
             .query_map([], note_from_row)?
             .collect::<Result<Vec<Note>, _>>()?;
         Ok(notes)
+    }
+
+    // -- Phase 7 sync access (sync_id-keyed) ------------------------
+    //
+    // The `Note` struct is unchanged: sync ids travel beside
+    // notes, never inside them. Only SHARED notes are visible
+    // to sync; private notes never leave the body.
+
+    /// The sync id of one note, if it has one.
+    pub fn note_sync_id(&self, id: i64) -> Result<Option<String>, MimintError> {
+        let conn = self.connection();
+        let sync_id = conn
+            .query_row(
+                "SELECT sync_id FROM notes WHERE id = ?1",
+                params![id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten();
+        Ok(sync_id)
+    }
+
+    /// One note by sync id (any owner; sync is a privileged
+    /// whole-notebook view like `all_notes`).
+    pub fn get_note_by_sync_id(&self, sync_id: &str) -> Result<Option<Note>, MimintError> {
+        let conn = self.connection();
+        let note = conn
+            .query_row(
+                &format!("SELECT {NOTE_COLUMNS} FROM notes WHERE sync_id = ?1"),
+                params![sync_id],
+                note_from_row,
+            )
+            .optional()?;
+        Ok(note)
+    }
+
+    /// All shared notes with their sync ids, in id order.
+    pub fn list_shared_notes_with_sync_ids(&self) -> Result<Vec<(Note, String)>, MimintError> {
+        let conn = self.connection();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {NOTE_COLUMNS}, sync_id FROM notes WHERE shared != 0 ORDER BY id ASC"
+        ))?;
+        let rows = stmt.query_map([], |row| {
+            let note = note_from_row(row)?;
+            let sync_id: Option<String> = row.get(7)?;
+            Ok((note, sync_id.unwrap_or_default()))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Insert or replace a note by sync id (sync apply path).
+    /// Synced notes are shared and owned by the default agent;
+    /// `created_ms` is kept from the first insert. Returns the
+    /// note id.
+    pub fn upsert_note_by_sync_id(
+        &self,
+        sync_id: &str,
+        title: &str,
+        body: &str,
+        created_ms: u64,
+    ) -> Result<i64, MimintError> {
+        let now = now_ms() as i64;
+        let id = {
+            let conn = self.connection();
+            conn.execute(
+                "INSERT INTO notes (title, body, created_ms, updated_ms, owner_agent_id, shared, sync_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6)
+                 ON CONFLICT(sync_id) DO UPDATE SET title = excluded.title,
+                    body = excluded.body, updated_ms = excluded.updated_ms, shared = 1",
+                params![title, body, created_ms as i64, now, AGENT_DEFAULT, sync_id],
+            )?;
+            let id: i64 = conn.query_row(
+                "SELECT id FROM notes WHERE sync_id = ?1",
+                params![sync_id],
+                |row| row.get(0),
+            )?;
+            id
+        };
+        self.invalidate_index();
+        Ok(id)
+    }
+
+    /// Delete a note by sync id (sync tombstone apply path).
+    pub fn delete_note_by_sync_id(&self, sync_id: &str) -> Result<bool, MimintError> {
+        let deleted = {
+            let conn = self.connection();
+            conn.execute("DELETE FROM notes WHERE sync_id = ?1", params![sync_id])? > 0
+        };
+        if deleted {
+            self.invalidate_index();
+        }
+        Ok(deleted)
     }
 
     /// BM25-ranked search over titles and bodies, as the default

@@ -416,6 +416,36 @@ impl SoulStore {
         self.load(file)
     }
 
+    /// Delete a SOUL file, recording the deletion in the history
+    /// (Phase 7: tombstone apply path). Returns false when the
+    /// file did not exist. The name is validated exactly like
+    /// every other store operation.
+    pub fn remove(&self, actor: &str, file: &str) -> Result<bool, MimintError> {
+        let path = self.resolve(file)?;
+        if !path.exists() {
+            return Ok(false);
+        }
+        let old_body = fs::read_to_string(&path)
+            .map_err(|err| {
+                MimintError::Config(format!("cannot read SOUL file {}: {err}", path.display()))
+            })
+            .and_then(|text| parse_soul_file(&text).map(|(_, body)| body))
+            .unwrap_or_default();
+        fs::remove_file(&path).map_err(|err| {
+            MimintError::Io(format!("cannot delete SOUL file {}: {err}", path.display()))
+        })?;
+        let (added, removed) = line_diff(&old_body, "");
+        self.append_history(&SoulChange {
+            ts_ms: now_ms(),
+            actor: actor.to_string(),
+            file: file.to_string(),
+            action: "deleted".to_string(),
+            added_lines: added,
+            removed_lines: removed,
+        })?;
+        Ok(true)
+    }
+
     /// Read the change history, oldest first. An absent history
     /// file means no changes yet. A malformed line is an error:
     /// the history is an audit trail, not a best-effort log.

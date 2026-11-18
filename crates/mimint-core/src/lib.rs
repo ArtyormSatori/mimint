@@ -21,6 +21,7 @@ pub mod error;
 pub mod evolve;
 pub mod fallback;
 pub mod finetune;
+pub mod friends;
 pub mod guards;
 pub mod keychain;
 pub mod ledger;
