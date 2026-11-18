@@ -32,8 +32,10 @@ use mimint_control::{
 };
 use mimint_core::audit::now_ms;
 use mimint_core::{
-    default_registry, default_vault, AuditLog, BackendSpec, Brain, BrainProgress, CancelToken,
-    CostCap, EgressPolicy, FallbackChain, Notebook, Provider, Registry, RetryPolicy,
+    build_system_prompt, default_greeting, default_registry, default_soul_text, default_vault,
+    soul_may_be_sent, url_is_loopback, AuditLog, BackendSpec, Brain, BrainProgress, CancelToken,
+    CostCap, EgressPolicy, ExperienceStore, FallbackChain, Notebook, Profile, ProfileSet, Provider,
+    Registry, RetryPolicy, SkillDef, SkillStore, SoulDoc, SoulStore, SOUL_FORMAT_VERSION,
 };
 use serde_json::json;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -48,10 +50,17 @@ pub enum WorkerRequest {
     /// Run one brain turn for this prompt.
     RunTurn { prompt: String },
     /// Rebuild the provider chain with a new Privacy Mode and order.
+    /// The active profile stays: only the Privacy Mode and the
+    /// chain order change (the header toggle / backend picker).
     Rebuild {
         privacy_on: bool,
         order: Vec<String>,
     },
+    /// Switch to a named profile: rebuild the chain from the
+    /// profile's chain, Privacy Mode, and cost cap, reload SOUL
+    /// and the skill filter, and audit the switch. An unknown
+    /// name falls closed to the default profile with a warning.
+    SwitchProfile { name: String },
     /// Stop the worker thread.
     Shutdown,
 }
@@ -132,6 +141,19 @@ pub enum WorkerEvent {
         names: Vec<String>,
         error: Option<String>,
     },
+    /// A profile switch completed: the chain was rebuilt from the
+    /// new profile. The UI updates its header, sidebar, greeting,
+    /// Privacy Mode, and backend list from this event — never
+    /// optimistically. `warning` is set when the requested name
+    /// was unknown and the switch fell closed to the default.
+    ProfileSwitched {
+        name: String,
+        greeting: String,
+        soul_sent: bool,
+        privacy_on: bool,
+        order: Vec<String>,
+        warning: Option<String>,
+    },
     /// The worker thread caught a panic inside a turn. The loop
     /// keeps serving; the UI shows the control error state.
     WorkerFault { error: String },
@@ -143,12 +165,13 @@ pub enum WorkerEvent {
     StopTripped { reason: String },
 }
 
-/// What a rebuild needs: the specs to build from, the retry policy,
-/// and the cost cap. Absent in tests, where rebuilds are rejected.
+/// What a rebuild needs: the specs to build from and the retry
+/// policy. The cost cap comes from the active profile at rebuild
+/// time, not from here. Absent in tests, where rebuilds are
+/// rejected.
 pub struct RebuildConfig {
     pub specs: Vec<BackendSpec>,
     pub retry: RetryPolicy,
-    pub cost_cap: CostCap,
 }
 
 /// Everything the worker thread owns.
@@ -193,6 +216,25 @@ pub struct WorkerDeps {
     /// Shared approval-pending flag: the SAME `Arc<AtomicBool>`
     /// the body guard consults. Set while a card waits.
     pub approval_pending: Option<Arc<AtomicBool>>,
+    /// Effective Privacy Mode for the initial chain (the active
+    /// profile's value, as the caller built the chain).
+    pub privacy_on: bool,
+    /// All resolved profiles. The worker resolves switches
+    /// against this set and falls closed to the default.
+    pub profiles: ProfileSet,
+    /// Active profile name at startup (already resolved by the
+    /// caller; an unknown name falls closed to the default).
+    pub active_profile: String,
+    /// SOUL store for the active profile's persona. `None` in
+    /// tests: turns run with the built-in default prompt.
+    pub soul_store: Option<SoulStore>,
+    /// Skill store for the promoted-skill catalog. `None` in
+    /// tests: no skills are retrieved.
+    pub skill_store: Option<SkillStore>,
+    /// Experience store for retrieval before planning. Only set
+    /// on the brain when the egress rule allows user data to
+    /// reach the backends. `None` in tests.
+    pub experience: Option<Arc<ExperienceStore>>,
 }
 
 /// Handle for the UI thread: send requests, poll events, trip the
@@ -213,6 +255,13 @@ impl WorkerHandle {
         let _ = self
             .request_tx
             .send(WorkerRequest::Rebuild { privacy_on, order });
+    }
+
+    /// Switch to a named profile (sidebar). The worker resolves
+    /// the name, rebuilds, and reports
+    /// [`WorkerEvent::ProfileSwitched`].
+    pub fn switch_profile(&self, name: String) {
+        let _ = self.request_tx.send(WorkerRequest::SwitchProfile { name });
     }
 
     /// Cancel the running turn (cooperative: checked before the next
@@ -247,6 +296,123 @@ impl WorkerHandle {
 impl Drop for WorkerHandle {
     fn drop(&mut self) {
         let _ = self.request_tx.send(WorkerRequest::Shutdown);
+    }
+}
+
+/// Everything a turn needs from the active profile, recomputed
+/// on every successful (re)build: the chain's endpoints decide
+/// the egress rule, so SOUL/experience availability is re-derived
+/// whenever the chain changes. A failed rebuild keeps the old
+/// runtime, like it keeps the old chain.
+struct ProfileRuntime {
+    profile: Profile,
+    privacy_on: bool,
+    order: Vec<String>,
+    /// The system prompt for turns, or `None` when SOUL must be
+    /// withheld (Privacy Mode + a remote backend in the chain).
+    /// Withholding is audited at rebuild time, not per turn.
+    soul_prompt: Option<String>,
+    /// True when user data (SOUL, experience) may reach the
+    /// backends. Gates both the SOUL prompt and the experience
+    /// store on the brain.
+    may_send_user_data: bool,
+    greeting: String,
+    /// Promoted skills, filtered by the profile's selection
+    /// (`None` means all promoted skills).
+    skills: Vec<SkillDef>,
+}
+
+/// Build the runtime for one profile against a built chain.
+/// SOUL load/skill catalog failures fall back to the built-in
+/// default / no skills and are audited; they never fail the
+/// rebuild, because the chain itself is usable without them.
+#[allow(clippy::too_many_arguments)]
+fn compute_runtime(
+    profile: &Profile,
+    privacy_on: bool,
+    order: Vec<String>,
+    endpoints: &[&str],
+    soul_store: Option<&SoulStore>,
+    skill_store: Option<&SkillStore>,
+    audit: &AuditLog,
+) -> ProfileRuntime {
+    let all_loopback = endpoints
+        .iter()
+        .all(|url| url_is_loopback(url).unwrap_or(false));
+    let may_send = soul_may_be_sent(privacy_on, all_loopback);
+    // SOUL: load (creating the default file on first use) when a
+    // store exists; otherwise the built-in default text, held in
+    // memory only and never written anywhere.
+    let fallback_doc = || SoulDoc {
+        version: SOUL_FORMAT_VERSION,
+        body: default_soul_text().to_string(),
+        path: None,
+    };
+    let (doc, greeting) = match soul_store {
+        Some(store) => match store.load_or_create(&profile.soul_file) {
+            Ok(doc) => {
+                let greeting = doc.greeting().to_string();
+                (doc, greeting)
+            }
+            Err(err) => {
+                let _ = audit.log(
+                    "ui-profile",
+                    "soul_load_failed",
+                    None,
+                    Some("fallback"),
+                    json!({"profile": profile.name, "error": err.to_string()}),
+                );
+                (fallback_doc(), default_greeting().to_string())
+            }
+        },
+        None => (fallback_doc(), default_greeting().to_string()),
+    };
+    let soul_prompt = if may_send {
+        Some(build_system_prompt(&doc, &[]))
+    } else {
+        let _ = audit.log(
+            "ui-profile",
+            "soul_withheld",
+            None,
+            Some("withheld"),
+            json!({
+                "profile": profile.name,
+                "privacy_on": privacy_on,
+                "all_loopback": all_loopback,
+            }),
+        );
+        None
+    };
+    let skills = match skill_store {
+        Some(store) => match store.catalog() {
+            Ok(catalog) => match &profile.skills {
+                None => catalog,
+                Some(selected) => catalog
+                    .into_iter()
+                    .filter(|def| selected.iter().any(|name| name == &def.name))
+                    .collect(),
+            },
+            Err(err) => {
+                let _ = audit.log(
+                    "ui-profile",
+                    "skill_catalog_failed",
+                    None,
+                    Some("empty"),
+                    json!({"profile": profile.name, "error": err.to_string()}),
+                );
+                Vec::new()
+            }
+        },
+        None => Vec::new(),
+    };
+    ProfileRuntime {
+        profile: profile.clone(),
+        privacy_on,
+        order,
+        soul_prompt,
+        may_send_user_data: may_send,
+        greeting,
+        skills,
     }
 }
 
@@ -306,6 +472,12 @@ fn worker_loop(
         max_observation_age,
         body,
         approval_pending,
+        privacy_on: initial_privacy_on,
+        profiles,
+        active_profile,
+        soul_store,
+        skill_store,
+        experience,
     } = deps;
     // One snapshot slot shared by the approver (fills it at
     // request time) and the body tools (consume it at execution
@@ -407,6 +579,36 @@ fn worker_loop(
             None
         }
     };
+    // Initial profile runtime, from the chain the caller built.
+    // An unknown startup name falls closed to the default, audited.
+    let (initial_profile, initial_warning) = profiles.resolve_or_default(&active_profile);
+    if let Some(warning) = &initial_warning {
+        let _ = audit.log(
+            "ui-profile",
+            "profile_fallback",
+            None,
+            Some("default"),
+            json!({
+                "requested": active_profile,
+                "warning": warning,
+                "profile": initial_profile.name,
+            }),
+        );
+    }
+    let initial_profile = initial_profile.clone();
+    let endpoints: Vec<&str> = chain
+        .as_ref()
+        .map(|built| built.provider_endpoints())
+        .unwrap_or_default();
+    let mut profile_runtime = compute_runtime(
+        &initial_profile,
+        initial_privacy_on,
+        initial_profile.chain.clone(),
+        &endpoints,
+        soul_store.as_ref(),
+        skill_store.as_ref(),
+        &audit,
+    );
 
     while let Ok(request) = request_rx.recv() {
         match request {
@@ -421,6 +623,8 @@ fn worker_loop(
                     stop_slot: &stop_slot,
                     turn_slot: &turn_slot,
                     body: body.as_ref(),
+                    runtime: &profile_runtime,
+                    experience: experience.as_ref(),
                 };
                 // A panic in a turn must not kill the worker or
                 // leave the UI stuck on "thinking": catch it,
@@ -454,10 +658,95 @@ fn worker_loop(
                     stack.privacy.set(privacy_on);
                     stack.frames.purge_tainted();
                 }
-                let event =
-                    rebuild_chain(&mut chain, &rebuild, &audit, &event_tx, privacy_on, &order);
+                let profile = profile_runtime.profile.clone();
+                let event = rebuild_chain(
+                    &mut chain,
+                    &rebuild,
+                    &audit,
+                    &event_tx,
+                    privacy_on,
+                    &order,
+                    profile.cost_cap,
+                    &profile.name,
+                );
+                if matches!(&event, WorkerEvent::ChainRebuilt { error: None, .. }) {
+                    let endpoints: Vec<&str> = chain
+                        .as_ref()
+                        .map(|built| built.provider_endpoints())
+                        .unwrap_or_default();
+                    profile_runtime = compute_runtime(
+                        &profile,
+                        privacy_on,
+                        order,
+                        &endpoints,
+                        soul_store.as_ref(),
+                        skill_store.as_ref(),
+                        &audit,
+                    );
+                }
                 if event_tx.send(event).is_err() {
                     break;
+                }
+            }
+            WorkerRequest::SwitchProfile { name } => {
+                let (profile, warning) = profiles.resolve_or_default(&name);
+                let profile = profile.clone();
+                if let Some(stack) = &body {
+                    stack.privacy.set(profile.privacy);
+                    stack.frames.purge_tainted();
+                }
+                let from = profile_runtime.profile.name.clone();
+                let event = rebuild_chain(
+                    &mut chain,
+                    &rebuild,
+                    &audit,
+                    &event_tx,
+                    profile.privacy,
+                    &profile.chain,
+                    profile.cost_cap,
+                    &profile.name,
+                );
+                let switched = matches!(&event, WorkerEvent::ChainRebuilt { error: None, .. });
+                if event_tx.send(event).is_err() {
+                    break;
+                }
+                if switched {
+                    let _ = audit.log(
+                        "ui-profile",
+                        "profile_switch",
+                        None,
+                        Some("switched"),
+                        json!({
+                            "from": from,
+                            "to": profile.name,
+                            "warning": warning,
+                            "profile": profile.name,
+                        }),
+                    );
+                    let endpoints: Vec<&str> = chain
+                        .as_ref()
+                        .map(|built| built.provider_endpoints())
+                        .unwrap_or_default();
+                    profile_runtime = compute_runtime(
+                        &profile,
+                        profile.privacy,
+                        profile.chain.clone(),
+                        &endpoints,
+                        soul_store.as_ref(),
+                        skill_store.as_ref(),
+                        &audit,
+                    );
+                    let event = WorkerEvent::ProfileSwitched {
+                        name: profile_runtime.profile.name.clone(),
+                        greeting: profile_runtime.greeting.clone(),
+                        soul_sent: profile_runtime.may_send_user_data,
+                        privacy_on: profile_runtime.privacy_on,
+                        order: profile_runtime.order.clone(),
+                        warning,
+                    };
+                    if event_tx.send(event).is_err() {
+                        break;
+                    }
                 }
             }
         }
@@ -478,6 +767,8 @@ struct TurnCtx<'a> {
     stop_slot: &'a Arc<TokenSlot>,
     turn_slot: &'a Arc<TokenSlot>,
     body: Option<&'a BodyStack>,
+    runtime: &'a ProfileRuntime,
+    experience: Option<&'a Arc<ExperienceStore>>,
 }
 
 fn run_one_turn(
@@ -517,6 +808,20 @@ fn run_one_turn(
     };
     brain.add_cancel_token(turn_token);
     brain.add_cancel_token(ctx.stop_slot.get());
+    // Phase 5 profile wiring: the profile name tags every audit
+    // record; the SOUL prompt (when egress allows) replaces the
+    // built-in prompt; promoted skills and experience retrieval
+    // follow the same egress rule as SOUL.
+    brain.set_profile(ctx.runtime.profile.name.clone());
+    if let Some(prompt) = &ctx.runtime.soul_prompt {
+        brain.set_system_prompt(prompt.clone());
+    }
+    brain.set_skills(ctx.runtime.skills.clone());
+    if ctx.runtime.may_send_user_data {
+        if let Some(store) = ctx.experience {
+            brain.set_experience_store(Arc::clone(store));
+        }
+    }
     // Phase reports for the status line (F4-17): the hook only
     // sends on a channel, so it cannot block the turn.
     let progress_tx = event_tx.clone();
@@ -550,6 +855,7 @@ fn run_one_turn(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn rebuild_chain(
     chain: &mut Option<FallbackChain>,
     rebuild: &Option<RebuildConfig>,
@@ -557,6 +863,8 @@ fn rebuild_chain(
     event_tx: &Sender<WorkerEvent>,
     privacy_on: bool,
     order: &[String],
+    cost_cap: CostCap,
+    profile_name: &str,
 ) -> WorkerEvent {
     let Some(rebuild) = rebuild else {
         return WorkerEvent::ChainRebuilt {
@@ -576,6 +884,7 @@ fn rebuild_chain(
             "enabled": privacy_on,
             "source": "ui toggle",
             "order": order,
+            "profile": profile_name,
         }),
     ) {
         return WorkerEvent::ChainRebuilt {
@@ -585,7 +894,7 @@ fn rebuild_chain(
     }
     let policy = EgressPolicy::new(privacy_on);
     let vault = default_vault();
-    match mimint_core::build_chain(&rebuild.specs, order, &vault, policy, rebuild.cost_cap) {
+    match mimint_core::build_chain(&rebuild.specs, order, &vault, policy, cost_cap) {
         Ok(providers) => match FallbackChain::new(providers, rebuild.retry) {
             Ok(mut new_chain) => {
                 attach_progress_hook(&mut new_chain, event_tx);
@@ -610,7 +919,8 @@ mod tests {
     use super::*;
     use crate::approver::approval_channel;
     use mimint_core::{
-        ApprovalDecision, BoxFuture, CallContext, ChatMessage, FunctionCall, MimintError, ToolCall,
+        ApprovalDecision, BackendKind, BoxFuture, CallContext, ChatMessage, FunctionCall,
+        MimintError, ProfileEntry, ToolCall,
     };
     use std::time::Duration;
 
@@ -711,6 +1021,8 @@ mod tests {
         let (db_path, audit_path) = temp_paths("fake");
         let dir = db_path.parent().unwrap().to_path_buf();
         let (approval_tx, approval_rx) = approval_channel();
+        let profiles = ProfileSet::resolve(&[], None, &[], &[], true, CostCap { cap_usd: None });
+        let active_profile = profiles.default_profile().name.clone();
         let deps = WorkerDeps {
             initial_providers: vec![Box::new(provider)],
             retry: RetryPolicy::default(),
@@ -726,6 +1038,12 @@ mod tests {
             max_observation_age: Duration::from_secs(300),
             body: None,
             approval_pending: None,
+            privacy_on: true,
+            profiles,
+            active_profile,
+            soul_store: None,
+            skill_store: None,
+            experience: None,
         };
         (spawn_worker(deps), approval_rx, dir)
     }
@@ -887,5 +1205,120 @@ mod tests {
             FailureKind::OutOfBackends
         );
         assert_eq!(classify_error("weird"), FailureKind::Other);
+    }
+
+    #[test]
+    fn profile_switch_rebuilds_and_tags_turn_audit() {
+        let (db_path, audit_path) = temp_paths("switch");
+        let dir = db_path.parent().unwrap().to_path_buf();
+        std::fs::write(dir.join("SOUL.md"), "Chào mặc định\n").unwrap();
+        std::fs::write(dir.join("work.md"), "Chào làm việc\n").unwrap();
+        // A dead loopback port: the rebuilt chain constructs
+        // offline, and a turn through it fails fast without
+        // touching any real backend.
+        let specs = vec![BackendSpec {
+            name: "local".to_string(),
+            kind: BackendKind::Ollama,
+            model: "dead-model".to_string(),
+            base_url: Some("http://127.0.0.1:9".to_string()),
+            key_env: None,
+            key_file: None,
+            key_keychain: None,
+            timeout: Duration::from_secs(5),
+            max_tokens: None,
+            allow_plaintext_auth: false,
+        }];
+        let entry = |name: &str, soul: Option<&str>| ProfileEntry {
+            name: name.to_string(),
+            soul: soul.map(str::to_string),
+            chain: Some(vec!["local".to_string()]),
+            voice: None,
+            skills: None,
+            proactive: None,
+            budget_usd: None,
+            privacy: None,
+            cost_cap_usd: None,
+            avatar: None,
+        };
+        let profiles = ProfileSet::resolve(
+            &[entry("Mặc định", None), entry("Làm việc", Some("work.md"))],
+            None,
+            &specs,
+            &["local".to_string()],
+            true,
+            CostCap { cap_usd: None },
+        );
+        let (approval_tx, _approval_rx) = approval_channel();
+        let deps = WorkerDeps {
+            initial_providers: vec![Box::new(FakeProvider::answering("hi"))],
+            retry: RetryPolicy::default(),
+            rebuild: Some(RebuildConfig {
+                specs: specs.clone(),
+                retry: RetryPolicy::default(),
+            }),
+            notebook: Arc::new(Notebook::open(&db_path).unwrap()),
+            audit: Arc::new(AuditLog::open(&audit_path).unwrap()),
+            max_steps: 5,
+            approval_tx,
+            stop_slot: TokenSlot::new(),
+            turn_slot: TokenSlot::new(),
+            repaint: RepaintSignal::new(),
+            approval_timeout: Duration::from_secs(60),
+            max_observation_age: Duration::from_secs(300),
+            body: None,
+            approval_pending: None,
+            privacy_on: true,
+            profiles,
+            active_profile: "Mặc định".to_string(),
+            soul_store: Some(SoulStore::new(dir.clone())),
+            skill_store: None,
+            experience: None,
+        };
+        let handle = spawn_worker(deps);
+        let _ = wait_event(&handle);
+        handle.switch_profile("Làm việc".to_string());
+        match wait_event(&handle) {
+            WorkerEvent::ChainRebuilt { error: None, .. } => {}
+            other => panic!("expected ChainRebuilt ok, got: {other:?}"),
+        }
+        match wait_event(&handle) {
+            WorkerEvent::ProfileSwitched {
+                name,
+                greeting,
+                soul_sent,
+                privacy_on,
+                order,
+                warning,
+            } => {
+                assert_eq!(name, "Làm việc");
+                assert_eq!(greeting, "Chào làm việc");
+                assert!(soul_sent);
+                assert!(privacy_on);
+                assert_eq!(order, vec!["local".to_string()]);
+                assert_eq!(warning, None);
+            }
+            other => panic!("expected ProfileSwitched, got: {other:?}"),
+        }
+        // A turn through the dead backend fails fast; its
+        // provider records must carry the new profile's tag.
+        handle.run_turn("hi".to_string());
+        assert!(matches!(
+            wait_terminal(&handle),
+            WorkerEvent::TurnFailed { .. }
+        ));
+        drop(handle);
+        let audit_text = std::fs::read_to_string(&audit_path).unwrap();
+        let tagged = audit_text
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .any(|record| {
+                (record["kind"] == "provider_attempt" || record["kind"] == "provider_failure")
+                    && record["detail"]["profile"] == "Làm việc"
+            });
+        assert!(
+            tagged,
+            "no provider record tagged with the switched profile:\n{audit_text}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

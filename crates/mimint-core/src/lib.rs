@@ -73,10 +73,10 @@ pub use skills::{
     ValidationRun, ValidationTask,
 };
 pub use soul::{
-    build_system_prompt, default_data_dir, default_soul_path, default_soul_text, drift_findings,
-    evaluate_golden, is_valid_soul_file_name, parse_soul_file, render_soul_file, soul_may_be_sent,
-    DriftFinding, DriftKind, GoldenPrompt, SoulChange, SoulDoc, SoulStore, GOLDEN_PROMPTS,
-    SOUL_FORMAT_VERSION,
+    build_system_prompt, default_data_dir, default_greeting, default_soul_path, default_soul_text,
+    drift_findings, evaluate_golden, is_valid_soul_file_name, parse_soul_file, render_soul_file,
+    soul_may_be_sent, DriftFinding, DriftKind, GoldenPrompt, SoulChange, SoulDoc, SoulStore,
+    GOLDEN_PROMPTS, SOUL_FORMAT_VERSION,
 };
 pub use tools::{
     default_registry, NotebookAddTool, NotebookReadTool, NotebookSearchTool, Registry,

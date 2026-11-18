@@ -3,12 +3,20 @@
 //! Usage:
 //!   mimint-app [--config PATH] [--db PATH] [--audit PATH]
 //!              [--max-steps N] [--degraded] [--body]
+//!              [--profile NAME] [--data-dir PATH]
 //!
 //! `--body` (Linux/X11 only) wires the real body through the
 //! worker: the brain gets the `body_*` tools, guarded by the
 //! approval card, the self-exclusion zone (this window), the
 //! rate limits, and the global STOP hotkey (Ctrl+Alt+Shift+
 //! Escape). Without `--body` the brain cannot touch the screen.
+//!
+//! `--profile` selects a named profile from the config file
+//! (Phase 5): the profile's SOUL, chain, Privacy Mode, cost
+//! cap, and skill selection apply to the whole run. An unknown
+//! name falls closed to the default profile with a warning.
+//! `--data-dir` holds SOUL.md, skills/, and experience.db
+//! (default: the platform data directory).
 //!
 //! Config semantics match the CLI: an explicit `--config` file is
 //! required, the default path is optional (absent means an empty
@@ -32,9 +40,10 @@
 use mimint_body::ScreenRect;
 use mimint_control::DEFAULT_MAX_OBSERVATION_AGE;
 use mimint_core::{
-    build_chain, default_config_path, default_vault, egress::url_is_loopback, load_config_file,
-    probe_local_backends, suggestion_text, AuditLog, EgressPolicy, FileConfig, MimintError,
-    Notebook, ResolvedConfig,
+    build_chain, default_config_path, default_data_dir, default_vault, egress::url_is_loopback,
+    evaluate_finetune, load_config_file, probe_finetune, probe_local_backends, suggestion_text,
+    AuditLog, EgressPolicy, ExperienceStore, FileConfig, MimintError, Notebook, ResolvedConfig,
+    SkillStore, SoulStore,
 };
 use mimint_ui::app::{AppOptions, BackendInfo};
 use mimint_ui::approver::{approval_channel, RepaintSignal, TokenSlot, DEFAULT_APPROVAL_TIMEOUT};
@@ -48,7 +57,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-const USAGE: &str = "mimint-app: the Mimint desktop app.\n\nUsage:\n  mimint-app [--config PATH] [--db PATH] [--audit PATH] [--max-steps N] [--degraded] [--body]\n\n  --config PATH     Config file (default: $XDG_CONFIG_HOME/mimint/config.toml or ~/.config/mimint/config.toml)\n  --db PATH         Notebook SQLite path (default: mimint.db)\n  --audit PATH      Audit JSONL path (default: mimint-audit.jsonl)\n  --max-steps N     Max brain steps per turn (default: 5)\n  --degraded        Static face + visible simple-mode label (weak machines)\n  --body            Wire the real body (Linux/X11 only): brain gets body_* tools + STOP hotkey\n  --help            Show this help\n";
+const USAGE: &str = "mimint-app: the Mimint desktop app.\n\nUsage:\n  mimint-app [--config PATH] [--db PATH] [--audit PATH] [--max-steps N] [--degraded] [--body] [--profile NAME] [--data-dir PATH]\n\n  --config PATH     Config file (default: $XDG_CONFIG_HOME/mimint/config.toml or ~/.config/mimint/config.toml)\n  --db PATH         Notebook SQLite path (default: mimint.db)\n  --audit PATH      Audit JSONL path (default: mimint-audit.jsonl)\n  --max-steps N     Max brain steps per turn (default: 5)\n  --degraded        Static face + visible simple-mode label (weak machines)\n  --body            Wire the real body (Linux/X11 only): brain gets body_* tools + STOP hotkey\n  --profile NAME    Named profile from the config file (default: the configured default profile)\n  --data-dir PATH   User data directory for SOUL.md, skills/, experience.db (default: platform data dir)\n  --help            Show this help\n";
 
 struct Args {
     config: Option<PathBuf>,
@@ -57,6 +66,8 @@ struct Args {
     max_steps: usize,
     degraded: bool,
     body: bool,
+    profile: Option<String>,
+    data_dir: Option<PathBuf>,
 }
 
 fn parse_args(argv: &[String]) -> Result<Args, String> {
@@ -66,6 +77,8 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
     let mut max_steps = 5usize;
     let mut degraded = false;
     let mut body = false;
+    let mut profile = None;
+    let mut data_dir = None;
     let mut i = 1;
     while i < argv.len() {
         let arg = &argv[i];
@@ -93,6 +106,8 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
             }
             "--degraded" => degraded = true,
             "--body" => body = true,
+            "--profile" => profile = Some(value(&mut i)?),
+            "--data-dir" => data_dir = Some(PathBuf::from(value(&mut i)?)),
             other => return Err(format!("unknown argument: {other}\n{USAGE}")),
         }
         i += 1;
@@ -104,6 +119,8 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
         max_steps,
         degraded,
         body,
+        profile,
+        data_dir,
     })
 }
 
@@ -168,7 +185,21 @@ fn run() -> Result<(), MimintError> {
         .map(|path| path.display().to_string())
         .unwrap_or_else(|| "(no config file: home directory not found)".to_string());
 
-    let privacy_on = resolved.privacy_enabled;
+    // Active profile (Phase 5): the profile's Privacy Mode,
+    // chain, and cost cap drive the whole run. An unknown
+    // --profile name falls closed to the default with a warning
+    // on stderr; the default profile inherits the top-level
+    // settings, so a config without [[profile]] tables behaves
+    // exactly as before.
+    let (profile, profile_warning) = match &args.profile {
+        Some(name) => resolved.profiles.resolve_or_default(name),
+        None => (resolved.profiles.default_profile(), None),
+    };
+    let profile = profile.clone();
+    if let Some(warning) = &profile_warning {
+        eprintln!("mimint-app: {warning}");
+    }
+    let privacy_on = profile.privacy;
     let policy = EgressPolicy::new(privacy_on);
 
     let notebook = Arc::new(Notebook::open(&args.db)?);
@@ -182,21 +213,23 @@ fn run() -> Result<(), MimintError> {
         Some(if privacy_on { "on" } else { "off" }),
         json!({
             "enabled": privacy_on,
-            "source": "config file",
+            "source": if args.profile.is_some() { "command line --profile" } else { "config file" },
             "config_path": config_display,
+            "profile": profile.name,
         }),
     )?;
 
-    // Initial chain. A failure does not stop the window: the worker
-    // reports it, and the UI shows an onboarding suggestion.
+    // Initial chain, from the active profile. A failure does not
+    // stop the window: the worker reports it, and the UI shows an
+    // onboarding suggestion.
     let vault = default_vault();
     let mut onboarding_text = None;
     let initial_providers = match build_chain(
         &resolved.backends,
-        &resolved.chain,
+        &profile.chain,
         &vault,
         policy,
-        resolved.cost_cap,
+        profile.cost_cap,
     ) {
         Ok(providers) => providers,
         Err(err) => {
@@ -205,11 +238,9 @@ fn run() -> Result<(), MimintError> {
             Vec::new()
         }
     };
-    let backend_names: Vec<String> = resolved
-        .backends
-        .iter()
-        .map(|spec| spec.name.clone())
-        .collect();
+    // The backend picker lists the active profile's chain, in
+    // chain order; switching profiles replaces this list.
+    let backend_names: Vec<String> = profile.chain.clone();
     // Info about the providers that actually built, for the UI's
     // backend-change warning and "backend in use" line. A backend
     // that failed to build has no entry (unknown, not assumed).
@@ -245,6 +276,25 @@ fn run() -> Result<(), MimintError> {
         None => None,
     };
 
+    // User data (Phase 5): SOUL, skills, experience. Built-in
+    // skills are installed as drafts when absent; they must pass
+    // validation before use (see `mimint-eval skill`). The SOUL
+    // greeting is loaded here so the first frame already greets
+    // with the active profile's persona; the worker reloads
+    // SOUL on every rebuild/switch.
+    let data_dir = args
+        .data_dir
+        .clone()
+        .or_else(default_data_dir)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let soul_store = SoulStore::new(&data_dir);
+    let soul_doc = soul_store.load_or_create(&profile.soul_file)?;
+    let greeting = soul_doc.greeting().to_string();
+    let skill_store = SkillStore::new(data_dir.join("skills"));
+    skill_store.install_builtins()?;
+    let experience = Arc::new(ExperienceStore::open(data_dir.join("experience.db"))?);
+    let finetune = evaluate_finetune(&probe_finetune());
+
     let (approval_tx, approval_rx) = approval_channel();
     let approval_timeout = env::var("MIMINT_APPROVAL_TIMEOUT_SECS")
         .ok()
@@ -260,13 +310,15 @@ fn run() -> Result<(), MimintError> {
     // clone the Arc before the stack moves into the worker.
     let body_frames = body_stack.as_ref().map(|stack| Arc::clone(&stack.frames));
     let repaint = RepaintSignal::new();
+    // Capture the warnings before `resolved.profiles` moves into
+    // the app options below.
+    let profile_warnings = resolved.profiles.warnings.clone();
     let deps = WorkerDeps {
         initial_providers,
         retry: resolved.retry,
         rebuild: Some(RebuildConfig {
             specs: resolved.backends,
             retry: resolved.retry,
-            cost_cap: resolved.cost_cap,
         }),
         notebook,
         audit,
@@ -279,6 +331,12 @@ fn run() -> Result<(), MimintError> {
         max_observation_age,
         body: body_stack,
         approval_pending,
+        privacy_on,
+        profiles: resolved.profiles.clone(),
+        active_profile: profile.name.clone(),
+        soul_store: Some(soul_store),
+        skill_store: Some(skill_store),
+        experience: Some(experience),
     };
     let worker = mimint_ui::worker::spawn_worker(deps);
 
@@ -297,6 +355,11 @@ fn run() -> Result<(), MimintError> {
         repaint,
         shared_exclusion,
         frame_store: body_frames,
+        greeting,
+        profiles: resolved.profiles,
+        active_profile: profile.name,
+        profile_warnings,
+        finetune,
     };
     let app = MimintApp::new(worker, approval_rx, options);
     let pixels_per_point = env::var("MIMINT_UI_PIXELS_PER_POINT")

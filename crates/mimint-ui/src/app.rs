@@ -34,7 +34,9 @@ use crate::worker::{FailureKind, WorkerEvent, WorkerHandle};
 use egui::{Color32, Pos2, Rect, Stroke, Vec2};
 use mimint_body::ScreenRect;
 use mimint_control::FrameStore;
-use mimint_core::{ApprovalDecision, BrainProgress};
+use mimint_core::{
+    evaluate_finetune, probe_finetune, ApprovalDecision, BrainProgress, FineTuneStatus, ProfileSet,
+};
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
@@ -88,6 +90,18 @@ pub struct AppOptions {
     /// card crops its preview from the newest stored frame.
     /// `None` without `--body`.
     pub frame_store: Option<Arc<FrameStore>>,
+    /// Greeting shown at startup: the active profile's SOUL
+    /// first line, loaded by `main` before the worker starts.
+    pub greeting: String,
+    /// All resolved profiles, for the sidebar switcher.
+    pub profiles: ProfileSet,
+    /// Active profile name at startup.
+    pub active_profile: String,
+    /// Profile-resolution warnings to surface in the sidebar.
+    pub profile_warnings: Vec<String>,
+    /// Fine-tune hardware status, probed once at startup; the
+    /// sidebar re-probes on demand.
+    pub finetune: FineTuneStatus,
 }
 
 pub struct MimintApp {
@@ -140,6 +154,15 @@ pub struct MimintApp {
     /// Keyed so the preview freezes at card time instead of
     /// tracking newer frames while the user decides.
     approval_crop: Option<(u64, Option<egui::TextureHandle>)>,
+    /// All resolved profiles (sidebar switcher).
+    profiles: ProfileSet,
+    /// Active profile name, updated only on
+    /// [`WorkerEvent::ProfileSwitched`] — never optimistically.
+    active_profile: String,
+    /// Profile-resolution warnings, shown in the sidebar.
+    profile_warnings: Vec<String>,
+    /// Fine-tune hardware status (sidebar, re-probed on demand).
+    finetune: FineTuneStatus,
 }
 
 impl MimintApp {
@@ -150,8 +173,10 @@ impl MimintApp {
     ) -> Self {
         let now = Instant::now();
         let mut chat = ChatState::new();
-        // The settled greeting, from the design spec.
-        chat.add_system("Hôm nay bạn muốn làm gì nào? Mình có thể giúp gì cho bạn".to_string());
+        // The greeting comes from the active profile's SOUL
+        // (first line), loaded by `main`; the default SOUL's
+        // first line is the settled greeting from the design spec.
+        chat.add_system(options.greeting.clone());
         Self {
             chat,
             face: FaceMachine::new(now),
@@ -191,6 +216,10 @@ impl MimintApp {
             last_exclusion: None,
             frame_store: options.frame_store,
             approval_crop: None,
+            profiles: options.profiles,
+            active_profile: options.active_profile,
+            profile_warnings: options.profile_warnings,
+            finetune: options.finetune,
         }
     }
 
@@ -329,6 +358,32 @@ impl MimintApp {
                             self.onboarding_shown = true;
                         }
                     }
+                }
+                WorkerEvent::ProfileSwitched {
+                    name,
+                    greeting,
+                    soul_sent,
+                    privacy_on,
+                    order,
+                    warning,
+                } => {
+                    self.active_profile = name.clone();
+                    self.privacy_on = privacy_on;
+                    self.backend_names = order;
+                    self.selected_backend = String::new();
+                    self.pending_backend_change = None;
+                    self.chat
+                        .add_system(format!("Đã chuyển sang hồ sơ \"{name}\". {greeting}"));
+                    if !soul_sent {
+                        self.chat.add_system(
+                            "SOUL của hồ sơ này đang bị giữ lại (Chế độ riêng tư + backend ở xa): Mimint trả lời bằng câu nhắc mặc định."
+                                .to_string(),
+                        );
+                    }
+                    if let Some(warning) = warning {
+                        self.chat.add_system(format!("Cảnh báo hồ sơ: {warning}"));
+                    }
+                    self.log_event("profile_switched");
                 }
                 WorkerEvent::StopTripped { reason } => {
                     // The body's emergency stop latched: the lamp
@@ -647,15 +702,16 @@ impl eframe::App for MimintApp {
                     if minimal {
                         // Everything else hides behind one menu.
                         ui.menu_button("⋯", |ui| {
-                            ui.label("Hồ sơ: Mặc định");
+                            ui.label(format!("Hồ sơ: {}", self.active_profile));
                             self.backend_picker_ui(ui);
                             self.privacy_ui(ui);
                         });
                     } else {
                         if compact {
-                            ui.label("👤").on_hover_text("Hồ sơ: Mặc định");
+                            ui.label("👤")
+                                .on_hover_text(format!("Hồ sơ: {}", self.active_profile));
                         } else {
-                            ui.label("Hồ sơ: Mặc định");
+                            ui.label(format!("Hồ sơ: {}", self.active_profile));
                         }
                         ui.separator();
                         self.backend_picker_ui(ui);
@@ -699,8 +755,77 @@ impl eframe::App for MimintApp {
                     ui.label("• Phiên hiện tại");
                     ui.separator();
                     ui.heading("Hồ sơ");
-                    ui.label("• Mặc định (đang dùng)");
-                    ui.label("Quản lý hồ sơ đầy đủ là việc Phase 5+.");
+                    // One row per profile; clicking sends the
+                    // switch request. The active row only moves
+                    // when the worker confirms the switch, so a
+                    // failed rebuild never shows the wrong
+                    // profile as active.
+                    let mut switch_to: Option<String> = None;
+                    for profile in self.profiles.profiles.clone() {
+                        let active = profile.name == self.active_profile;
+                        let label = if active {
+                            format!("• {} (đang dùng)", profile.name)
+                        } else {
+                            format!("• {}", profile.name)
+                        };
+                        if ui.selectable_label(active, label).clicked() && !active {
+                            switch_to = Some(profile.name.clone());
+                        }
+                        // Stored profile attributes, displayed
+                        // as labels. Voice, proactive mode,
+                        // budget, and avatar have no execution
+                        // engine yet: the labels describe the
+                        // profile, they do not claim behavior.
+                        let mut details: Vec<String> = Vec::new();
+                        details.push(format!(
+                            "riêng tư: {}",
+                            if profile.privacy { "BẬT" } else { "TẮT" }
+                        ));
+                        if let Some(voice) = &profile.voice {
+                            details.push(format!("giọng: {voice}"));
+                        }
+                        if let Some(avatar) = &profile.avatar {
+                            details.push(format!("avatar: {avatar}"));
+                        }
+                        if profile.proactive {
+                            details.push("chủ động: BẬT".to_string());
+                        }
+                        ui.label(format!("    {}", details.join(" · ")));
+                    }
+                    if let Some(name) = switch_to {
+                        self.worker.switch_profile(name);
+                    }
+                    for warning in &self.profile_warnings {
+                        ui.colored_label(
+                            Color32::from_rgb(0xB4, 0x53, 0x09),
+                            format!("Cảnh báo: {warning}"),
+                        );
+                    }
+                    ui.separator();
+                    ui.heading("Fine-tune");
+                    if self.finetune.available {
+                        ui.label("Trạng thái: khả dụng trên phần cứng này.");
+                    } else {
+                        ui.label("Trạng thái: không khả dụng trên phần cứng này.");
+                    }
+                    for gate in &self.finetune.gates {
+                        ui.label(format!(
+                            "• {}: {} (đo được: {})",
+                            gate.gate.label(),
+                            if gate.passed { "ĐẠT" } else { "KHÔNG ĐẠT" },
+                            gate.measured
+                        ));
+                    }
+                    for reason in &self.finetune.reasons {
+                        ui.label(format!("Lý do: {reason}"));
+                    }
+                    ui.label("Huấn luyện thật bị chặn trong bản này.");
+                    if ui.button("Kiểm tra lại").clicked() {
+                        // Bounded probe (the GPU query has a 5s
+                        // cap; on machines without NVIDIA tooling
+                        // it returns immediately).
+                        self.finetune = evaluate_finetune(&probe_finetune());
+                    }
                     ui.separator();
                     ui.heading("Cài đặt");
                     ui.checkbox(&mut self.show_audit, "Nhật ký kiểm tra");
@@ -829,10 +954,21 @@ impl eframe::App for MimintApp {
                         ui.label(format!("Còn {left} giây — hết giờ sẽ tự từ chối."));
                     }
                     ui.horizontal(|ui| {
-                        if ui.button("Cho phép").clicked() {
+                        // P5.8 (F5-CARRY-1): the labels name the
+                        // one-time scope; the hover texts spell
+                        // it out. The decision itself is
+                        // unchanged: allow runs this one action,
+                        // deny runs nothing.
+                        let allow = ui
+                            .button("Cho phép thực hiện hành động này")
+                            .on_hover_text("Chỉ cho phép MỘT lần này: hành động này sẽ chạy ngay, và lần sau công cụ này vẫn cần bạn phê duyệt lại.");
+                        if allow.clicked() {
                             self.decide_approval(req.id, ApprovalDecision::Allow);
                         }
-                        if ui.button("Từ chối").clicked() {
+                        let deny = ui
+                            .button("Từ chối hành động này")
+                            .on_hover_text("Công cụ sẽ không chạy. Bạn có thể yêu cầu lại sau — mỗi lần đều cần phê duyệt riêng.");
+                        if deny.clicked() {
                             self.decide_approval(req.id, ApprovalDecision::Deny);
                         }
                     });

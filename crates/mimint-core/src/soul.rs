@@ -81,6 +81,13 @@ pub fn default_soul_path() -> Option<PathBuf> {
     default_data_dir().map(|dir| dir.join(DEFAULT_SOUL_FILE))
 }
 
+/// The settled greeting: the first line of the default SOUL
+/// text. The UI shows this when no SOUL file has been loaded
+/// yet; once a profile's SOUL loads, its first line replaces it.
+pub fn default_greeting() -> &'static str {
+    "Hôm nay bạn muốn làm gì nào? Mình có thể giúp gì cho bạn"
+}
+
 /// The default persona, written fresh for Mimint. The first line is
 /// the settled greeting (see the design spec); it doubles as the
 /// UI greeting by the first-line convention.
@@ -652,6 +659,12 @@ mod tests {
             doc.greeting(),
             "Hôm nay bạn muốn làm gì nào? Mình có thể giúp gì cho bạn"
         );
+    }
+
+    #[test]
+    fn default_greeting_is_the_first_line_of_default_soul() {
+        let first_line = default_soul_text().lines().next().unwrap_or("");
+        assert_eq!(default_greeting(), first_line);
     }
 
     #[test]

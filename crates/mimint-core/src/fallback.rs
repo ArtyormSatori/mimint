@@ -184,6 +184,15 @@ impl FallbackChain {
         self.providers.iter().map(|p| p.name()).collect()
     }
 
+    /// Provider endpoint URLs in chain order. The worker uses
+    /// these for the Phase 5 egress decision (SOUL and experience
+    /// retrieval may only be sent when every backend is loopback
+    /// under Privacy Mode); the URLs are the providers' own
+    /// authoritative endpoints, not guesses from config.
+    pub fn provider_endpoints(&self) -> Vec<&str> {
+        self.providers.iter().map(|p| p.endpoint_url()).collect()
+    }
+
     /// The retry policy this chain enforces.
     pub fn retry_policy(&self) -> RetryPolicy {
         self.retry
