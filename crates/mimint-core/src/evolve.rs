@@ -13,9 +13,15 @@
 //! - The held-out set is evaluated ONCE per variant. No variant
 //!   is changed after seeing scores; a second run with tuned
 //!   variants would measure tuning, not the skill.
-//! - The winner is the variant that STRICTLY beats the base
-//!   score. Ties keep the base (no churn for no gain).
-//!   Variants scoring strictly below the base are eliminated.
+//! - The winner is the variant that beats the base by MORE
+//!   than the control-rerun variance (F5-19): the control
+//!   measures run-to-run noise of the same content, and a win
+//!   within noise is not a win. Ties keep the base (no churn
+//!   for no gain). Variants scoring strictly below the base are
+//!   eliminated (the control-rerun is not a contestant).
+//! - When every variant passes every task, the verdict is
+//!   `inconclusive (ceiling)`: the set cannot discriminate, so
+//!   no conclusion is drawn and the base stays.
 //! - [`evolve_skill`] is read-only with respect to the skill
 //!   store: it evaluates and reports. Adopting the winner is a
 //!   separate, explicit step ([`winner_def`] + the normal
@@ -31,9 +37,11 @@ use crate::audit::AuditLog;
 use crate::error::MimintError;
 use crate::notebook::Notebook;
 use crate::provider::Provider;
-use crate::skills::{run_one_task, SkillDef, TaskResult, ValidationTask};
+use crate::skills::{run_one_task_detailed, SkillDef, TaskResult, ValidationTask};
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::Arc;
+use std::time::Instant;
 
 /// One variant: a named mutation of a skill's content.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,6 +99,33 @@ pub struct VariantScore {
     pub passed: usize,
     pub total: usize,
     pub results: Vec<TaskResult>,
+    /// Total brain steps across the variant's tasks: a
+    /// SECONDARY metric, recorded for reference only. It NEVER
+    /// breaks ties and NEVER decides the winner (locked by test).
+    pub total_steps: usize,
+    /// Total wall time across the variant's tasks, in
+    /// milliseconds: reference only, like `total_steps`.
+    pub total_elapsed_ms: u64,
+}
+
+/// The verdict of one evolution run (F5-19). The old report
+/// distinguished only "winner" vs "base stays"; a tie at the
+/// ceiling (every variant passing everything) looked identical
+/// to "no improvement", and a win by one task looked identical
+/// to a win beyond run-to-run noise. The verdict says which.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvolveVerdict {
+    /// A variant beat the base by more than the control-rerun
+    /// variance (see `decide`).
+    Winner,
+    /// No variant beat the base beyond variance; the base stays.
+    BaseStays,
+    /// Every variant passed every task: the set cannot
+    /// discriminate, so no conclusion is drawn.
+    InconclusiveCeiling,
+    /// The time budget ran out before all pairs completed.
+    BudgetExhausted,
 }
 
 /// Outcome of one evolution run.
@@ -99,13 +134,21 @@ pub struct EvolveReport {
     pub skill: String,
     pub task_ids: Vec<String>,
     pub scores: Vec<VariantScore>,
-    /// The winning variant id, when one strictly beat the base.
-    /// `None` means the base stays (tie or no variant better).
+    /// The winning variant id, when the verdict is `Winner`.
+    /// `None` for every other verdict.
     pub winner: Option<String>,
-    /// Variants that scored strictly below the base.
+    /// Variants that scored strictly below the base (the
+    /// control-rerun is a measurement instrument, not a
+    /// contestant, and is never eliminated).
     pub eliminated: Vec<String>,
     /// One-line decision reason, for the report.
     pub decision: String,
+    /// The verdict (F5-19).
+    pub verdict: EvolveVerdict,
+    /// (variant, task) pairs completed vs planned. Equal unless
+    /// the time budget cut the run short.
+    pub pairs_completed: usize,
+    pub pairs_planned: usize,
 }
 
 impl EvolveReport {
@@ -116,11 +159,110 @@ impl EvolveReport {
 }
 
 /// Run configuration for [`evolve_skill`]: the turn-id prefix
-/// for the evaluation turns and the per-turn step budget.
+/// for the evaluation turns, the per-turn step budget, and the
+/// optional TOTAL time budget for the whole run (F5-15). When
+/// the budget runs out, the run stops and returns a report with
+/// verdict [`EvolveVerdict::BudgetExhausted`] and the completed
+/// pairs — it never fabricates scores for pairs that did not run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EvolveConfig {
     pub turn_prefix: String,
     pub max_steps: usize,
+    pub time_budget: Option<std::time::Duration>,
+}
+
+/// Decide the verdict from completed scores (pure, tested
+/// separately from the runner).
+///
+/// - Ceiling: every scored variant passed every task it ran,
+///   and every variant ran every task → `InconclusiveCeiling`.
+/// - Variance: the control-rerun measures run-to-run noise of
+///   the base content: `variance = |control - base|`. A variant
+///   wins only when `passed > base + variance`. With no
+///   control-rerun score present, variance is 0 (the old strict
+///   rule). The highest qualifying score wins; the first listed
+///   wins a tie between qualifying variants. Secondary metrics
+///   (steps, elapsed time) NEVER influence this decision.
+/// - Otherwise: `BaseStays`, with below-base variants eliminated
+///   (control-rerun excluded: it is not a contestant).
+fn decide(
+    scores: &[VariantScore],
+    task_count: usize,
+    budget_exhausted: bool,
+) -> (EvolveVerdict, Option<String>, Vec<String>, String) {
+    let base_passed = scores
+        .iter()
+        .find(|score| score.variant_id == "base")
+        .map(|score| score.passed)
+        .unwrap_or(0);
+    if budget_exhausted {
+        let completed: usize = scores.iter().map(|score| score.total).sum();
+        return (
+            EvolveVerdict::BudgetExhausted,
+            None,
+            Vec::new(),
+            format!(
+                "time budget exhausted after {completed} pair(s); no verdict drawn, base stays; re-run with a larger budget"
+            ),
+        );
+    }
+    let all_ran_everything = scores.iter().all(|score| score.total == task_count);
+    if all_ran_everything
+        && !scores.is_empty()
+        && scores.iter().all(|score| score.passed == score.total)
+    {
+        return (
+            EvolveVerdict::InconclusiveCeiling,
+            None,
+            Vec::new(),
+            format!(
+                "inconclusive (ceiling): every variant passed all {task_count} task(s); the set cannot discriminate, base stays"
+            ),
+        );
+    }
+    let variance = scores
+        .iter()
+        .find(|score| score.variant_id == "control-rerun")
+        .map(|score| score.passed.abs_diff(base_passed))
+        .unwrap_or(0);
+    let threshold = base_passed + variance;
+    let mut winner: Option<String> = None;
+    let mut best = threshold;
+    for score in scores {
+        if score.variant_id != "base" && score.variant_id != "control-rerun" && score.passed > best
+        {
+            best = score.passed;
+            winner = Some(score.variant_id.clone());
+        }
+    }
+    let eliminated: Vec<String> = scores
+        .iter()
+        .filter(|score| {
+            score.variant_id != "base"
+                && score.variant_id != "control-rerun"
+                && score.passed < base_passed
+        })
+        .map(|score| score.variant_id.clone())
+        .collect();
+    match &winner {
+        Some(id) => (
+            EvolveVerdict::Winner,
+            Some(id.clone()),
+            eliminated,
+            format!(
+                "variant {id} beat base {best}/{task_count} vs {base_passed}/{task_count} beyond control variance {variance} and is the winner; it must still pass the skill's own validation before promotion"
+            ),
+        ),
+        None => {
+            let mut decision = format!(
+                "no variant beat base ({base_passed}/{task_count}) beyond control variance {variance}; base stays"
+            );
+            if !eliminated.is_empty() {
+                decision.push_str(&format!("; eliminated: {}", eliminated.join(", ")));
+            }
+            (EvolveVerdict::BaseStays, None, eliminated, decision)
+        }
+    }
 }
 
 /// Evaluate variants of a skill on held-out tasks.
@@ -156,17 +298,29 @@ pub async fn evolve_skill(
             "evolve_skill needs a 'base' variant as the reference".to_string(),
         ));
     }
+    let pairs_planned = variants.len() * tasks.len();
+    let started = Instant::now();
     let mut scores = Vec::new();
-    for variant in variants {
+    let mut budget_exhausted = false;
+    'variants: for variant in variants {
         let system_prompt = format!(
             "You are Mimint, a local-first personal assistant. Use the provided tools when they help answer. Keep answers short.\n\nKỹ năng đang bật: {} — {}\n{}",
             skill.name, skill.description, variant.content
         );
         let mut results = Vec::new();
+        let mut total_steps = 0usize;
+        let mut total_elapsed_ms = 0u64;
         for task in tasks {
+            if let Some(budget) = config.time_budget {
+                if started.elapsed() >= budget {
+                    budget_exhausted = true;
+                    break;
+                }
+            }
             let notebook = notebook_for(&format!("{}-{}", variant.id, task.id))?;
             let turn_id = format!("{}-{}-{}", config.turn_prefix, variant.id, task.id);
-            let result = run_one_task(
+            let task_started = Instant::now();
+            let run = run_one_task_detailed(
                 provider,
                 &system_prompt,
                 task,
@@ -176,7 +330,11 @@ pub async fn evolve_skill(
                 config.max_steps,
             )
             .await?;
-            results.push(result);
+            total_elapsed_ms += task_started.elapsed().as_millis() as u64;
+            if let Some(outcome) = &run.outcome {
+                total_steps += outcome.steps;
+            }
+            results.push(run.result);
         }
         let passed = results.iter().filter(|result| result.passed).count();
         scores.push(VariantScore {
@@ -184,67 +342,39 @@ pub async fn evolve_skill(
             passed,
             total: results.len(),
             results,
+            total_steps,
+            total_elapsed_ms,
         });
-    }
-    let base_passed = scores
-        .iter()
-        .find(|score| score.variant_id == "base")
-        .map(|score| score.passed)
-        .unwrap_or(0);
-    // Winner: strictly above base; the highest score wins, and
-    // the first listed wins a tie between non-base variants.
-    let mut winner: Option<String> = None;
-    let mut best = base_passed;
-    for score in &scores {
-        if score.variant_id != "base" && score.variant_id != "control-rerun" && score.passed > best
-        {
-            best = score.passed;
-            winner = Some(score.variant_id.clone());
+        if budget_exhausted {
+            break 'variants;
         }
     }
-    let eliminated: Vec<String> = scores
-        .iter()
-        .filter(|score| score.variant_id != "base" && score.passed < base_passed)
-        .map(|score| score.variant_id.clone())
-        .collect();
-    let decision = match &winner {
-        Some(id) => format!(
-            "variant {id} beat base {best}/{0} vs {base_passed}/{0} and is the winner; it must still pass the skill's own validation before promotion",
-            tasks.len()
-        ),
-        None => {
-            if eliminated.is_empty() {
-                format!(
-                    "no variant strictly beat base ({base_passed}/{}); base stays",
-                    tasks.len()
-                )
-            } else {
-                format!(
-                    "no variant strictly beat base ({base_passed}/{}); base stays; eliminated: {}",
-                    tasks.len(),
-                    eliminated.join(", ")
-                )
-            }
-        }
-    };
+    let pairs_completed: usize = scores.iter().map(|score| score.total).sum();
+    let (verdict, winner, eliminated, decision) = decide(&scores, tasks.len(), budget_exhausted);
     audit.log(
         &config.turn_prefix,
         "skill_evolve",
         None,
-        Some(if winner.is_some() {
-            "winner"
-        } else {
-            "base_kept"
+        Some(match verdict {
+            EvolveVerdict::Winner => "winner",
+            EvolveVerdict::BaseStays => "base_kept",
+            EvolveVerdict::InconclusiveCeiling => "inconclusive_ceiling",
+            EvolveVerdict::BudgetExhausted => "budget_exhausted",
         }),
         json!({
             "skill": skill.name,
+            "verdict": format!("{:?}", verdict),
             "scores": scores.iter().map(|score| json!({
                 "variant": score.variant_id,
                 "passed": score.passed,
                 "total": score.total,
+                "total_steps": score.total_steps,
+                "total_elapsed_ms": score.total_elapsed_ms,
             })).collect::<Vec<_>>(),
             "winner": winner,
             "eliminated": eliminated,
+            "pairs_completed": pairs_completed,
+            "pairs_planned": pairs_planned,
         }),
     )?;
     Ok(EvolveReport {
@@ -254,6 +384,9 @@ pub async fn evolve_skill(
         winner,
         eliminated,
         decision,
+        verdict,
+        pairs_completed,
+        pairs_planned,
     })
 }
 
@@ -267,6 +400,10 @@ pub fn winner_def(base: &SkillDef, winner: &SkillVariant) -> SkillDef {
     def.version = base.version.saturating_add(1);
     def.status = crate::skills::SkillStatus::Draft;
     def.validation_history = Vec::new();
+    // The winner's content is locally generated, not the imported
+    // file's content: it is a fresh local draft, not an import.
+    def.imported = false;
+    def.import_approved = false;
     def
 }
 
@@ -310,6 +447,8 @@ mod tests {
             }],
             status: SkillStatus::Promoted,
             validation_history: Vec::new(),
+            imported: false,
+            import_approved: false,
         }
     }
 
@@ -421,11 +560,13 @@ mod tests {
             &EvolveConfig {
                 turn_prefix: "evolve-1".to_string(),
                 max_steps: 3,
+                time_budget: None,
             },
         )
         .await
         .unwrap();
         assert_eq!(report.winner.as_deref(), Some("tool-mandate"));
+        assert_eq!(report.verdict, EvolveVerdict::Winner);
         assert_eq!(report.base_score().unwrap().passed, 0);
         // The control rerun matches the base (same content).
         let control = report
@@ -490,12 +631,14 @@ mod tests {
             &EvolveConfig {
                 turn_prefix: "evolve-2".to_string(),
                 max_steps: 3,
+                time_budget: None,
             },
         )
         .await
         .unwrap();
         // Tie with base: no winner, base stays.
         assert_eq!(report.winner, None);
+        assert_eq!(report.verdict, EvolveVerdict::BaseStays);
         assert!(report.decision.contains("base stays"));
         // The variant below base is eliminated.
         assert_eq!(report.eliminated, vec!["worse".to_string()]);
@@ -540,6 +683,7 @@ mod tests {
             &EvolveConfig {
                 turn_prefix: "evolve-3".to_string(),
                 max_steps: 3,
+                time_budget: None,
             },
         )
         .await
@@ -550,6 +694,131 @@ mod tests {
             .find(|score| score.variant_id == "other")
             .unwrap();
         assert_eq!(other.passed, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn score(id: &str, passed: usize, total: usize, steps: usize) -> VariantScore {
+        VariantScore {
+            variant_id: id.to_string(),
+            passed,
+            total,
+            results: Vec::new(),
+            total_steps: steps,
+            total_elapsed_ms: 0,
+        }
+    }
+
+    #[test]
+    fn decide_requires_a_win_beyond_control_variance() {
+        // Base 1/3, control 2/3 (variance 1): a variant at 2/3
+        // does NOT win — its edge is within run-to-run noise.
+        let scores = vec![
+            score("base", 1, 3, 3),
+            score("control-rerun", 2, 3, 3),
+            score("candidate", 2, 3, 3),
+        ];
+        let (verdict, winner, _, decision) = decide(&scores, 3, false);
+        assert_eq!(verdict, EvolveVerdict::BaseStays);
+        assert_eq!(winner, None);
+        assert!(decision.contains("variance 1"), "{decision}");
+        // A variant at 3/3 beats base + variance: winner.
+        let scores = vec![
+            score("base", 1, 3, 3),
+            score("control-rerun", 2, 3, 3),
+            score("candidate", 3, 3, 3),
+        ];
+        let (verdict, winner, _, _) = decide(&scores, 3, false);
+        assert_eq!(verdict, EvolveVerdict::Winner);
+        assert_eq!(winner.as_deref(), Some("candidate"));
+        // No control score: variance is 0, the old strict rule.
+        let scores = vec![score("base", 1, 3, 3), score("candidate", 2, 3, 3)];
+        let (verdict, winner, _, _) = decide(&scores, 3, false);
+        assert_eq!(verdict, EvolveVerdict::Winner);
+        assert_eq!(winner.as_deref(), Some("candidate"));
+    }
+
+    #[test]
+    fn decide_reports_inconclusive_at_the_ceiling() {
+        let scores = vec![
+            score("base", 3, 3, 3),
+            score("control-rerun", 3, 3, 3),
+            score("candidate", 3, 3, 3),
+        ];
+        let (verdict, winner, eliminated, decision) = decide(&scores, 3, false);
+        assert_eq!(verdict, EvolveVerdict::InconclusiveCeiling);
+        assert_eq!(winner, None);
+        assert!(eliminated.is_empty());
+        assert!(decision.contains("ceiling"), "{decision}");
+        // One variant below the ceiling: a real decision again.
+        let scores = vec![
+            score("base", 3, 3, 3),
+            score("control-rerun", 3, 3, 3),
+            score("candidate", 2, 3, 3),
+        ];
+        let (verdict, _, eliminated, _) = decide(&scores, 3, false);
+        assert_eq!(verdict, EvolveVerdict::BaseStays);
+        assert_eq!(eliminated, vec!["candidate".to_string()]);
+    }
+
+    #[test]
+    fn decide_never_tie_breaks_on_steps_or_time() {
+        // Same score, wildly different steps: no winner, and the
+        // decision never mentions steps.
+        let scores = vec![
+            score("base", 2, 3, 9),
+            score("control-rerun", 2, 3, 9),
+            score("fast", 2, 3, 1),
+            score("slow", 2, 3, 30),
+        ];
+        let (verdict, winner, _, decision) = decide(&scores, 3, false);
+        assert_eq!(verdict, EvolveVerdict::BaseStays);
+        assert_eq!(winner, None);
+        assert!(!decision.contains("step"), "{decision}");
+    }
+
+    #[test]
+    fn decide_excludes_the_control_from_elimination() {
+        // Control below base measures noise; it is not eliminated.
+        let scores = vec![
+            score("base", 2, 3, 3),
+            score("control-rerun", 1, 3, 3),
+            score("worse", 0, 3, 3),
+        ];
+        let (_, _, eliminated, _) = decide(&scores, 3, false);
+        assert_eq!(eliminated, vec!["worse".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn zero_time_budget_returns_a_budget_exhausted_report() {
+        let dir = temp_dir("budget");
+        let audit = AuditLog::open(dir.join("a.jsonl")).unwrap();
+        let skill = note_skill();
+        let variants = build_variants(&skill);
+        let factory = |key: &str| {
+            Ok(Arc::new(
+                Notebook::open(dir.join(format!("{key}.db"))).unwrap(),
+            ))
+        };
+        let report = evolve_skill(
+            &MarkerProvider,
+            &skill,
+            &variants,
+            &heldout_tasks(),
+            &factory,
+            &audit,
+            &EvolveConfig {
+                turn_prefix: "evolve-budget".to_string(),
+                max_steps: 3,
+                time_budget: Some(std::time::Duration::ZERO),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.verdict, EvolveVerdict::BudgetExhausted);
+        assert_eq!(report.winner, None);
+        assert_eq!(report.pairs_completed, 0);
+        assert_eq!(report.pairs_planned, variants.len() * heldout_tasks().len());
+        assert!(report.decision.contains("budget"), "{}", report.decision);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -565,5 +834,101 @@ mod tests {
                 variant.id
             );
         }
+    }
+
+    /// Collect every needle a checker looks for (recursively), so
+    /// the isolation test can assert none of them leak into
+    /// variant content.
+    fn checker_needles(checker: &Checker, out: &mut Vec<String>) {
+        match checker {
+            Checker::Contains { needle } | Checker::NoteCreated { needle } => {
+                out.push(needle.clone());
+            }
+            Checker::All { checks } => {
+                for check in checks {
+                    checker_needles(check, out);
+                }
+            }
+            Checker::ToolUsed { .. } | Checker::ResponseNonEmpty => {}
+        }
+    }
+
+    #[tokio::test]
+    async fn held_out_tasks_stay_out_of_variants_and_audit() {
+        // Loads the REAL sealed file from the crate tree (never a
+        // copy): if the file moves or changes shape, this test
+        // fails loudly instead of checking a stale fixture.
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("eval/heldout/note-tasks.toml");
+        let tasks = crate::skills::load_eval_tasks(&path).expect("sealed held-out file loads");
+        assert_eq!(tasks.len(), 3, "the sealed set has exactly 3 tasks");
+        assert_eq!(
+            tasks
+                .iter()
+                .map(|task| task.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["H1", "H2", "H3"],
+            "the sealed set keeps its task ids"
+        );
+        // The generator receives only the skill: no variant may
+        // contain a held-out prompt or a checker needle.
+        let skill = note_skill();
+        let variants = build_variants(&skill);
+        let mut needles = Vec::new();
+        for task in &tasks {
+            checker_needles(&task.checker, &mut needles);
+            for variant in &variants {
+                assert!(
+                    !variant.content.contains(&task.prompt),
+                    "variant {} contains held-out prompt {:?}",
+                    variant.id,
+                    task.id
+                );
+            }
+        }
+        for variant in &variants {
+            for needle in &needles {
+                assert!(
+                    !variant.content.contains(needle.as_str()),
+                    "variant {} contains held-out needle {needle:?}",
+                    variant.id
+                );
+            }
+        }
+        // The evolve audit record carries ids/scores only: no
+        // held-out prompt may appear in the audit trail the
+        // generator could (in principle) read back.
+        let dir = temp_dir("heldout-audit");
+        let audit_path = dir.join("a.jsonl");
+        let audit = AuditLog::open(&audit_path).unwrap();
+        let factory = |key: &str| {
+            Ok(Arc::new(
+                Notebook::open(dir.join(format!("{key}.db"))).unwrap(),
+            ))
+        };
+        evolve_skill(
+            &MarkerProvider,
+            &skill,
+            &variants,
+            &tasks,
+            &factory,
+            &audit,
+            &EvolveConfig {
+                turn_prefix: "evolve-heldout".to_string(),
+                max_steps: 3,
+                time_budget: None,
+            },
+        )
+        .await
+        .unwrap();
+        let audit_text = std::fs::read_to_string(&audit_path).unwrap();
+        for task in &tasks {
+            assert!(
+                !audit_text.contains(&task.prompt),
+                "audit trail contains held-out prompt {:?}",
+                task.id
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

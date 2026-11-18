@@ -68,7 +68,11 @@ pub enum RecordDecision {
     NotRecorded { reason: String },
 }
 
-/// One stored trajectory, with its retrieval score.
+/// One stored trajectory, with its retrieval score and its
+/// provenance (F5-18): which checker verified it, which skills
+/// the turn used, and when it was recorded. Provenance is what
+/// makes demotion possible: when a skill is quarantined, every
+/// trajectory that used it can be quarantined too.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Trajectory {
     pub id: i64,
@@ -79,6 +83,45 @@ pub struct Trajectory {
     pub reason: Option<String>,
     /// Token-overlap score against the retrieving prompt.
     pub score: usize,
+    /// Serialized checker that verified this turn (empty when
+    /// the turn was recorded without a checker evaluation, e.g.
+    /// a partial turn or a turn error).
+    pub checker_json: String,
+    /// FNV-1a hash of `checker_json` (change detection only).
+    /// Empty when `checker_json` is empty.
+    pub checker_hash: String,
+    /// Skill names the turn used (from `TurnOutcome::skills_used`).
+    /// Skill VERSIONS are not recorded: the turn outcome carries
+    /// names only, so provenance names the skill, not its version.
+    pub skills: Vec<String>,
+    /// Quarantined trajectories are never retrieved. Always
+    /// false for trajectories returned by `retrieve`.
+    pub quarantined: bool,
+    /// Recording time, milliseconds since the Unix epoch.
+    pub created_ms: i64,
+}
+
+/// FNV-1a hash, hex-encoded — the same change-detection hash the
+/// skill store uses for `content_hash`. NOT cryptographic; it
+/// only names a checker so provenance can be matched.
+fn fnv1a_hex(text: &str) -> String {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in text.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
+fn checker_provenance(checker: Option<&Checker>) -> (String, String) {
+    match checker {
+        Some(checker) => {
+            let json = serde_json::to_string(checker).unwrap_or_default();
+            let hash = fnv1a_hex(&json);
+            (json, hash)
+        }
+        None => (String::new(), String::new()),
+    }
 }
 
 /// What retrieval found for one prompt.
@@ -93,30 +136,52 @@ impl RetrievedExperience {
     /// sections. Successes first, then the labeled failure.
     /// Empty when nothing was retrieved.
     pub fn sections(&self) -> Vec<String> {
+        self.sections_labeled()
+            .into_iter()
+            .map(|(_, body)| body)
+            .collect()
+    }
+
+    /// Like [`Self::sections`], but each section carries its
+    /// source label (trajectory id + kind) for the delimited data
+    /// block (F5-02). The body text is unchanged.
+    pub fn sections_labeled(&self) -> Vec<(String, String)> {
         let mut sections = Vec::new();
         for trajectory in &self.successes {
-            sections.push(format!(
-                "Kinh nghiệm thành công trước đây (đã kiểm chứng):\nNgười dùng: {}\nCông cụ đã dùng: {}\nTrả lời: {}",
-                trajectory.prompt,
-                if trajectory.tools.is_empty() {
-                    "(không dùng công cụ)".to_string()
-                } else {
-                    trajectory.tools.join(", ")
-                },
-                trajectory.reply
+            sections.push((
+                format!(
+                    "kinh nghiệm đã kiểm chứng #{}",
+                    trajectory.id
+                ),
+                format!(
+                    "Kinh nghiệm thành công trước đây (đã kiểm chứng):\nNgười dùng: {}\nCông cụ đã dùng: {}\nTrả lời: {}",
+                    trajectory.prompt,
+                    if trajectory.tools.is_empty() {
+                        "(không dùng công cụ)".to_string()
+                    } else {
+                        trajectory.tools.join(", ")
+                    },
+                    trajectory.reply
+                ),
             ));
         }
         for trajectory in &self.failures {
-            sections.push(format!(
-                "Ví dụ THẤT BẠI trước đây — đừng lặp lại cách này (lý do: {}):\nNgười dùng: {}\nCông cụ đã dùng: {}\nTrả lời: {}",
-                trajectory.reason.clone().unwrap_or_default(),
-                trajectory.prompt,
-                if trajectory.tools.is_empty() {
-                    "(không dùng công cụ)".to_string()
-                } else {
-                    trajectory.tools.join(", ")
-                },
-                trajectory.reply
+            sections.push((
+                format!(
+                    "kinh nghiệm thất bại #{} (đừng lặp lại)",
+                    trajectory.id
+                ),
+                format!(
+                    "Ví dụ THẤT BẠI trước đây — đừng lặp lại cách này (lý do: {}):\nNgười dùng: {}\nCông cụ đã dùng: {}\nTrả lời: {}",
+                    trajectory.reason.clone().unwrap_or_default(),
+                    trajectory.prompt,
+                    if trajectory.tools.is_empty() {
+                        "(không dùng công cụ)".to_string()
+                    } else {
+                        trajectory.tools.join(", ")
+                    },
+                    trajectory.reply
+                ),
             ));
         }
         sections
@@ -128,8 +193,20 @@ fn truncate(text: &str, max_chars: usize) -> String {
 }
 
 /// One row of either trajectory table: id, prompt, tools JSON,
-/// reply, and the failure reason (always `None` for successes).
-type StoredRow = (i64, String, String, String, Option<String>);
+/// reply, failure reason (always `None` for successes), checker
+/// JSON, checker hash, skills JSON, quarantined flag, created_ms.
+type StoredRow = (
+    i64,
+    String,
+    String,
+    String,
+    Option<String>,
+    String,
+    String,
+    String,
+    bool,
+    i64,
+);
 
 /// The experience store: one SQLite file, two tables.
 pub struct ExperienceStore {
@@ -140,6 +217,12 @@ impl ExperienceStore {
     /// Open (or create) the database file and ensure the schema
     /// exists. The success and failure tables are separate by
     /// design: no query can confuse one for the other.
+    ///
+    /// Schema migration (F5-18): databases created before the
+    /// provenance columns existed are upgraded in place with
+    /// `ALTER TABLE ... ADD COLUMN` (defaults: empty provenance,
+    /// not quarantined). Old rows keep working; they simply carry
+    /// no provenance and can never be attributed to a skill.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, MimintError> {
         let conn = Connection::open(path.as_ref())?;
         conn.execute(
@@ -148,7 +231,11 @@ impl ExperienceStore {
                 prompt TEXT NOT NULL,
                 tools_json TEXT NOT NULL,
                 reply TEXT NOT NULL,
-                created_ms INTEGER NOT NULL
+                created_ms INTEGER NOT NULL,
+                checker_json TEXT NOT NULL DEFAULT '',
+                checker_hash TEXT NOT NULL DEFAULT '',
+                skills_json TEXT NOT NULL DEFAULT '[]',
+                quarantined INTEGER NOT NULL DEFAULT 0
             )",
             [],
         )?;
@@ -159,13 +246,47 @@ impl ExperienceStore {
                 tools_json TEXT NOT NULL,
                 reply TEXT NOT NULL,
                 reason TEXT NOT NULL,
-                created_ms INTEGER NOT NULL
+                created_ms INTEGER NOT NULL,
+                checker_json TEXT NOT NULL DEFAULT '',
+                checker_hash TEXT NOT NULL DEFAULT '',
+                skills_json TEXT NOT NULL DEFAULT '[]',
+                quarantined INTEGER NOT NULL DEFAULT 0
             )",
             [],
         )?;
+        for table in ["success_trajectories", "failed_trajectories"] {
+            Self::ensure_column(&conn, table, "checker_json", "TEXT NOT NULL DEFAULT ''")?;
+            Self::ensure_column(&conn, table, "checker_hash", "TEXT NOT NULL DEFAULT ''")?;
+            Self::ensure_column(&conn, table, "skills_json", "TEXT NOT NULL DEFAULT '[]'")?;
+            Self::ensure_column(&conn, table, "quarantined", "INTEGER NOT NULL DEFAULT 0")?;
+        }
         Ok(Self {
             conn: Mutex::new(conn),
         })
+    }
+
+    /// Add `column` to `table` when an older database lacks it.
+    /// A no-op when the column already exists.
+    fn ensure_column(
+        conn: &Connection,
+        table: &str,
+        column: &str,
+        ddl: &str,
+    ) -> Result<(), MimintError> {
+        let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let name: String = row.get(1)?;
+            if name == column {
+                return Ok(());
+            }
+        }
+        drop(rows);
+        conn.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {ddl}"),
+            [],
+        )?;
+        Ok(())
     }
 
     /// Record a finished turn through the verification gate.
@@ -183,6 +304,7 @@ impl ExperienceStore {
             return self.record_failure(
                 prompt,
                 outcome,
+                checker,
                 "partial: step budget exhausted before a final answer",
             );
         }
@@ -190,6 +312,7 @@ impl ExperienceStore {
             return self.record_failure(
                 prompt,
                 outcome,
+                checker,
                 "unverified step: a tool result did not verify",
             );
         }
@@ -200,17 +323,22 @@ impl ExperienceStore {
         };
         let evidence = checker.evaluate(&outcome.text, &outcome.tools_used, notebook)?;
         if evidence.passed {
+            let (checker_json, checker_hash) = checker_provenance(Some(checker));
             let conn = self.conn.lock().map_err(|err| {
                 MimintError::Notebook(format!("experience store lock poisoned: {err}"))
             })?;
             conn.execute(
-                "INSERT INTO success_trajectories (prompt, tools_json, reply, created_ms) VALUES (?1, ?2, ?3, ?4)",
+                "INSERT INTO success_trajectories (prompt, tools_json, reply, created_ms, checker_json, checker_hash, skills_json, quarantined) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0)",
                 params![
                     truncate(prompt, MAX_STORED_PROMPT),
                     serde_json::to_string(&outcome.tools_used)
                         .unwrap_or_else(|_| "[]".to_string()),
                     truncate(&outcome.text, MAX_STORED_REPLY),
                     now_ms() as i64,
+                    checker_json,
+                    checker_hash,
+                    serde_json::to_string(&outcome.skills_used)
+                        .unwrap_or_else(|_| "[]".to_string()),
                 ],
             )?;
             Ok(RecordDecision::RecordedSuccess)
@@ -218,6 +346,7 @@ impl ExperienceStore {
             self.record_failure(
                 prompt,
                 outcome,
+                Some(checker),
                 &format!("checker failed: {}", evidence.detail),
             )
         }
@@ -227,19 +356,25 @@ impl ExperienceStore {
         &self,
         prompt: &str,
         outcome: &TurnOutcome,
+        checker: Option<&Checker>,
         reason: &str,
     ) -> Result<RecordDecision, MimintError> {
+        let (checker_json, checker_hash) = checker_provenance(checker);
         let conn = self.conn.lock().map_err(|err| {
             MimintError::Notebook(format!("experience store lock poisoned: {err}"))
         })?;
         conn.execute(
-            "INSERT INTO failed_trajectories (prompt, tools_json, reply, reason, created_ms) VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO failed_trajectories (prompt, tools_json, reply, reason, created_ms, checker_json, checker_hash, skills_json, quarantined) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0)",
             params![
                 truncate(prompt, MAX_STORED_PROMPT),
                 serde_json::to_string(&outcome.tools_used).unwrap_or_else(|_| "[]".to_string()),
                 truncate(&outcome.text, MAX_STORED_REPLY),
                 reason,
                 now_ms() as i64,
+                checker_json,
+                checker_hash,
+                serde_json::to_string(&outcome.skills_used)
+                    .unwrap_or_else(|_| "[]".to_string()),
             ],
         )?;
         Ok(RecordDecision::RecordedFailure {
@@ -249,13 +384,13 @@ impl ExperienceStore {
 
     /// Record a turn that errored (provider failure, cancellation
     /// that surfaced as an error, ...). No outcome exists, so the
-    /// failure carries no tools or reply.
+    /// failure carries no tools or reply, and no provenance.
     pub fn record_error(&self, prompt: &str, error: &str) -> Result<(), MimintError> {
         let conn = self.conn.lock().map_err(|err| {
             MimintError::Notebook(format!("experience store lock poisoned: {err}"))
         })?;
         conn.execute(
-            "INSERT INTO failed_trajectories (prompt, tools_json, reply, reason, created_ms) VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO failed_trajectories (prompt, tools_json, reply, reason, created_ms, checker_json, checker_hash, skills_json, quarantined) VALUES (?1, ?2, ?3, ?4, ?5, '', '', '[]', 0)",
             params![
                 truncate(prompt, MAX_STORED_PROMPT),
                 "[]",
@@ -267,14 +402,76 @@ impl ExperienceStore {
         Ok(())
     }
 
+    /// Quarantine every trajectory (success and failure) that
+    /// used `skill_name`, in both tables. Quarantined trajectories
+    /// are never retrieved again, but stay stored for audit until
+    /// `purge_quarantined` deletes them. Returns the number of
+    /// rows quarantined. Called when a skill is quarantined, so
+    /// evidence produced with a bad skill stops influencing turns.
+    pub fn quarantine_trajectories_for_skill(
+        &self,
+        skill_name: &str,
+    ) -> Result<usize, MimintError> {
+        let conn = self.conn.lock().map_err(|err| {
+            MimintError::Notebook(format!("experience store lock poisoned: {err}"))
+        })?;
+        // skills_json is a JSON array of skill names; matching the
+        // quoted name avoids prefix collisions ("ghi-chu" must not
+        // match "ghi-chu-2"). Skill names cannot contain quotes.
+        let pattern = format!("%\"{skill_name}\"%");
+        let mut total = 0;
+        for table in ["success_trajectories", "failed_trajectories"] {
+            total += conn.execute(
+                &format!(
+                    "UPDATE {table} SET quarantined = 1 WHERE quarantined = 0 AND skills_json LIKE ?1"
+                ),
+                params![pattern],
+            )?;
+        }
+        Ok(total)
+    }
+
+    /// Delete all quarantined trajectories from both tables.
+    /// Returns the number of rows deleted. Quarantine is the
+    /// reversible step; this is the destructive one, and nothing
+    /// calls it automatically.
+    pub fn purge_quarantined(&self) -> Result<usize, MimintError> {
+        let conn = self.conn.lock().map_err(|err| {
+            MimintError::Notebook(format!("experience store lock poisoned: {err}"))
+        })?;
+        let mut total = 0;
+        for table in ["success_trajectories", "failed_trajectories"] {
+            total += conn.execute(&format!("DELETE FROM {table} WHERE quarantined = 1"), [])?;
+        }
+        Ok(total)
+    }
+
+    /// Number of quarantined trajectories (both tables).
+    pub fn quarantined_count(&self) -> Result<i64, MimintError> {
+        let conn = self.conn.lock().map_err(|err| {
+            MimintError::Notebook(format!("experience store lock poisoned: {err}"))
+        })?;
+        let mut total = 0i64;
+        for table in ["success_trajectories", "failed_trajectories"] {
+            total += conn.query_row(
+                &format!("SELECT COUNT(*) FROM {table} WHERE quarantined = 1"),
+                [],
+                |row| row.get::<_, i64>(0),
+            )?;
+        }
+        Ok(total)
+    }
+
     fn load_all(&self, table: &str, with_reason: bool) -> Result<Vec<StoredRow>, MimintError> {
         let conn = self.conn.lock().map_err(|err| {
             MimintError::Notebook(format!("experience store lock poisoned: {err}"))
         })?;
+        // Quarantined trajectories are excluded HERE, at the
+        // query: no retrieval path can see them again.
         let query = if with_reason {
-            format!("SELECT id, prompt, tools_json, reply, reason FROM {table} ORDER BY id ASC")
+            format!("SELECT id, prompt, tools_json, reply, reason, checker_json, checker_hash, skills_json, quarantined, created_ms FROM {table} WHERE quarantined = 0 ORDER BY id ASC")
         } else {
-            format!("SELECT id, prompt, tools_json, reply, NULL FROM {table} ORDER BY id ASC")
+            format!("SELECT id, prompt, tools_json, reply, NULL, checker_json, checker_hash, skills_json, quarantined, created_ms FROM {table} WHERE quarantined = 0 ORDER BY id ASC")
         };
         let mut stmt = conn.prepare(&query)?;
         let rows = stmt.query_map([], |row| {
@@ -284,6 +481,11 @@ impl ExperienceStore {
                 row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
                 row.get::<_, Option<String>>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, i64>(8)? != 0,
+                row.get::<_, i64>(9)?,
             ))
         })?;
         let mut out = Vec::new();
@@ -299,13 +501,26 @@ impl ExperienceStore {
         limit: usize,
     ) -> Vec<Trajectory> {
         let mut scored: Vec<Trajectory> = Vec::new();
-        for (id, prompt, tools_json, reply, reason) in rows {
+        for (
+            id,
+            prompt,
+            tools_json,
+            reply,
+            reason,
+            checker_json,
+            checker_hash,
+            skills_json,
+            quarantined,
+            created_ms,
+        ) in rows
+        {
             let stored_tokens: HashSet<String> = tokenize_baseline(&prompt).into_iter().collect();
             let score = prompt_tokens.intersection(&stored_tokens).count();
             if score == 0 {
                 continue;
             }
             let tools: Vec<String> = serde_json::from_str(&tools_json).unwrap_or_default();
+            let skills: Vec<String> = serde_json::from_str(&skills_json).unwrap_or_default();
             scored.push(Trajectory {
                 id,
                 prompt,
@@ -313,6 +528,11 @@ impl ExperienceStore {
                 reply,
                 reason,
                 score,
+                checker_json,
+                checker_hash,
+                skills,
+                quarantined,
+                created_ms,
             });
         }
         // Score descending, id ascending: deterministic, and the
@@ -549,6 +769,105 @@ mod tests {
             .as_ref()
             .unwrap()
             .contains("provider timed out"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn trajectories_carry_provenance_and_quarantine_excludes_them() {
+        let dir = temp_dir("provenance");
+        let store = ExperienceStore::open(dir.join("exp.db")).unwrap();
+        let notebook = Notebook::open(dir.join("n.db")).unwrap();
+        let checker = Checker::Contains {
+            needle: "sữa".to_string(),
+        };
+        let mut good = outcome("Đã lưu: mua sữa", &["notebook_add"], false, true);
+        good.skills_used = vec!["ghi-chu".to_string()];
+        assert_eq!(
+            store
+                .record_turn("mua sữa", &good, Some(&checker), &notebook)
+                .unwrap(),
+            RecordDecision::RecordedSuccess
+        );
+        let mut other = outcome("Đã lưu: mua sữa", &["notebook_add"], false, true);
+        other.skills_used = vec!["tom-tat".to_string()];
+        store
+            .record_turn("mua sữa", &other, Some(&checker), &notebook)
+            .unwrap();
+        let found = store.retrieve("mua sữa").unwrap();
+        assert_eq!(found.successes.len(), 2);
+        let first = &found.successes[0];
+        assert!(first.checker_json.contains("sữa"), "{}", first.checker_json);
+        assert_eq!(first.checker_hash, fnv1a_hex(&first.checker_json));
+        assert_eq!(first.skills, vec!["ghi-chu".to_string()]);
+        assert!(!first.quarantined);
+        assert!(first.created_ms > 0);
+        // Quarantining ghi-chu removes only its trajectory from
+        // retrieval; the row stays stored until purged.
+        assert_eq!(
+            store.quarantine_trajectories_for_skill("ghi-chu").unwrap(),
+            1
+        );
+        assert_eq!(store.quarantined_count().unwrap(), 1);
+        assert_eq!(store.success_count().unwrap(), 2);
+        let found = store.retrieve("mua sữa").unwrap();
+        assert_eq!(found.successes.len(), 1);
+        assert_eq!(found.successes[0].skills, vec!["tom-tat".to_string()]);
+        // Prefix collision guard: "ghi-chu" must not match "ghi-chu-2".
+        assert_eq!(
+            store
+                .quarantine_trajectories_for_skill("ghi-chu-2")
+                .unwrap(),
+            0
+        );
+        assert_eq!(store.purge_quarantined().unwrap(), 1);
+        assert_eq!(store.quarantined_count().unwrap(), 0);
+        assert_eq!(store.success_count().unwrap(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn old_databases_migrate_to_the_provenance_schema() {
+        let dir = temp_dir("migrate");
+        let path = dir.join("exp.db");
+        // Build a pre-F5-18 database by hand: old CREATE TABLEs,
+        // one row, no provenance columns.
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute(
+                "CREATE TABLE success_trajectories (id INTEGER PRIMARY KEY AUTOINCREMENT, prompt TEXT NOT NULL, tools_json TEXT NOT NULL, reply TEXT NOT NULL, created_ms INTEGER NOT NULL)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "CREATE TABLE failed_trajectories (id INTEGER PRIMARY KEY AUTOINCREMENT, prompt TEXT NOT NULL, tools_json TEXT NOT NULL, reply TEXT NOT NULL, reason TEXT NOT NULL, created_ms INTEGER NOT NULL)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO success_trajectories (prompt, tools_json, reply, created_ms) VALUES ('mua sữa', '[]', 'Đã lưu', 1)",
+                [],
+            )
+            .unwrap();
+        }
+        let store = ExperienceStore::open(&path).unwrap();
+        // The old row survives, retrievable, with empty provenance.
+        let found = store.retrieve("mua sữa").unwrap();
+        assert_eq!(found.successes.len(), 1);
+        assert!(found.successes[0].checker_json.is_empty());
+        assert!(found.successes[0].skills.is_empty());
+        // New recordings on the migrated database carry provenance.
+        let notebook = Notebook::open(dir.join("n.db")).unwrap();
+        let checker = Checker::ResponseNonEmpty;
+        let mut fresh = outcome("xong", &[], false, true);
+        fresh.skills_used = vec!["ghi-chu".to_string()];
+        store
+            .record_turn("làm xong việc", &fresh, Some(&checker), &notebook)
+            .unwrap();
+        let found = store.retrieve("làm xong việc").unwrap();
+        assert_eq!(found.successes[0].skills, vec!["ghi-chu".to_string()]);
+        // Opening again is a no-op (columns already exist).
+        let store = ExperienceStore::open(&path).unwrap();
+        assert_eq!(store.success_count().unwrap(), 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -257,6 +257,17 @@ pub struct SkillDef {
     pub status: SkillStatus,
     #[serde(default)]
     pub validation_history: Vec<ValidationRun>,
+    /// True when this skill arrived via `import_file` (an
+    /// external file). Imported skills can never self-promote:
+    /// they need a separate user approval step (F5-05) even
+    /// after passing validation.
+    #[serde(default)]
+    pub imported: bool,
+    /// True when the user explicitly approved this imported
+    /// skill (CLI `skill approve-import`, audited). Files may
+    /// not claim this: import forces it to false.
+    #[serde(default)]
+    pub import_approved: bool,
 }
 
 impl SkillDef {
@@ -321,8 +332,36 @@ impl SkillDef {
                     self.name, task.id
                 )));
             }
+            validate_checker(&task.checker).map_err(|reason| {
+                MimintError::Config(format!(
+                    "skill {:?}, task {:?}: {reason}",
+                    self.name, task.id
+                ))
+            })?;
         }
         Ok(())
+    }
+
+    /// The SINGLE usability predicate (F5-06, F5-20): every
+    /// selection path — `catalog()` and `retrieve_skills()` —
+    /// filters through this and nothing else. A skill is usable
+    /// only when it is Promoted, its latest validation run passed
+    /// every task for its CURRENT content hash (so a hand edit
+    /// after promotion silently disables it until re-validation),
+    /// and, when imported, the user approved the import.
+    pub fn is_usable(&self) -> bool {
+        if self.status != SkillStatus::Promoted {
+            return false;
+        }
+        if self.imported && !self.import_approved {
+            return false;
+        }
+        let Some(latest) = self.validation_history.last() else {
+            return false;
+        };
+        latest.content_hash == self.content_hash()
+            && latest.total > 0
+            && latest.passed == latest.total
     }
 
     /// Change-detection hash of the content + validation tasks.
@@ -358,7 +397,91 @@ impl SkillDef {
     }
 }
 
-/// One retrieval hit: a promoted skill and its deterministic score.
+/// Validate one checker's shape, recursively. Rejects the
+/// always-pass shapes (F5-05): an empty `All` passes vacuously,
+/// an empty needle matches every reply/note, an empty tool name
+/// never matches but is equally meaningless. Shape validation is
+/// the first line; the negative probe (empty-evidence evaluation)
+/// is the second.
+fn validate_checker(checker: &Checker) -> Result<(), String> {
+    match checker {
+        Checker::Contains { needle } | Checker::NoteCreated { needle } => {
+            if needle.trim().is_empty() {
+                Err("checker needle must not be empty".to_string())
+            } else {
+                Ok(())
+            }
+        }
+        Checker::ToolUsed { tool } => {
+            if tool.trim().is_empty() {
+                Err("checker tool name must not be empty".to_string())
+            } else {
+                Ok(())
+            }
+        }
+        Checker::ResponseNonEmpty => Ok(()),
+        Checker::All { checks } => {
+            if checks.is_empty() {
+                return Err("checker `all` must contain at least one sub-checker".to_string());
+            }
+            for check in checks {
+                validate_checker(check)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+/// The negative probe (F5-05): does this checker pass on EMPTY
+/// evidence — an empty reply, no tools used — against the
+/// notebook the validation turn will actually use? Any checker
+/// that does is an always-pass checker in context (for example a
+/// `NoteCreated` needle already satisfied by an old note, or an
+/// empty `All`/empty needle, which shape validation also
+/// rejects) and must fail the whole validation run. Pure code,
+/// zero model calls. The probe checks the notebook state BEFORE
+/// the tasks run; it does not guard against one task's notes
+/// satisfying a later task's checker — callers must use distinct
+/// needles per task for that (see `run_validation_tasks`).
+pub fn checker_passes_on_empty_evidence(
+    checker: &Checker,
+    notebook: &Notebook,
+) -> Result<bool, MimintError> {
+    let evidence = checker.evaluate("", &[], notebook)?;
+    Ok(evidence.passed)
+}
+
+/// Deterministic trigger-conflict detection (F5-14): triggers
+/// that two or more skills share (compared after trimming and
+/// lowercasing). Sharing a trigger does NOT override anything:
+/// retrieval order is score descending, name ascending, and all
+/// colliding skills stay eligible up to the retrieval limit.
+/// Returns `(trigger, skill names)` pairs sorted by trigger, with
+/// names sorted ascending.
+pub fn find_trigger_conflicts(skills: &[SkillDef]) -> Vec<(String, Vec<String>)> {
+    let mut by_trigger: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for skill in skills {
+        for trigger in &skill.triggers {
+            let key = trigger.trim().to_lowercase();
+            if key.is_empty() {
+                continue;
+            }
+            let names = by_trigger.entry(key).or_default();
+            if !names.contains(&skill.name) {
+                names.push(skill.name.clone());
+            }
+        }
+    }
+    by_trigger
+        .into_iter()
+        .filter(|(_, names)| names.len() > 1)
+        .map(|(trigger, mut names)| {
+            names.sort();
+            (trigger, names)
+        })
+        .collect()
+}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SkillMatch {
     pub name: String,
@@ -368,10 +491,14 @@ pub struct SkillMatch {
 /// Deterministic retrieval: token-overlap scoring, no model
 /// judgement. Weights: a prompt token appearing in the triggers
 /// scores 3, in the name 2, in the description 1 (each prompt
-/// token counted once per field). Only `Promoted` skills are
-/// considered; a score of 0 never matches. Order is score
+/// token counted once per field). Only USABLE skills are
+/// considered (see [`SkillDef::is_usable`]: Promoted + passing
+/// run bound to the current content hash + import approved when
+/// imported); a score of 0 never matches. Order is score
 /// descending, name ascending — the same prompt always retrieves
-/// the same skills in the same order.
+/// the same skills in the same order. Identical triggers do not
+/// override each other: every colliding skill is scored the same
+/// way, and the name tie-break decides the order (F5-14).
 pub fn retrieve_skills(skills: &[SkillDef], prompt: &str, limit: usize) -> Vec<SkillMatch> {
     let prompt_tokens: HashSet<String> = tokenize_baseline(prompt).into_iter().collect();
     if prompt_tokens.is_empty() || limit == 0 {
@@ -379,7 +506,7 @@ pub fn retrieve_skills(skills: &[SkillDef], prompt: &str, limit: usize) -> Vec<S
     }
     let mut matches: Vec<SkillMatch> = Vec::new();
     for skill in skills {
-        if skill.status != SkillStatus::Promoted {
+        if !skill.is_usable() {
             continue;
         }
         let trigger_tokens: HashSet<String> = skill
@@ -526,6 +653,7 @@ impl SkillStore {
     /// Create a new skill as a draft. Fails when a skill with the
     /// name already exists; the status is forced to Draft and any
     /// supplied history is dropped (a new skill has no runs).
+    /// A locally created skill is never marked imported.
     pub fn create_draft(&self, mut def: SkillDef) -> Result<(), MimintError> {
         def.validate_shape()?;
         if self.get(&def.name)?.is_some() {
@@ -536,13 +664,18 @@ impl SkillStore {
         }
         def.status = SkillStatus::Draft;
         def.validation_history = Vec::new();
+        def.imported = false;
+        def.import_approved = false;
         self.save(&def)
     }
 
     /// Import a skill file from outside the store. The imported
     /// skill ALWAYS lands as a draft with no history, whatever the
     /// file claims: an external file must pass validation here
-    /// before it is used. Fails when the name already exists.
+    /// before it is used. It is marked `imported` and
+    /// `import_approved = false`: even a passing validation keeps
+    /// it a draft until the user approves the import separately
+    /// (F5-05). Fails when the name already exists.
     pub fn import_file(&self, path: &Path) -> Result<SkillDef, MimintError> {
         let mut def = Self::parse_file(path)?;
         if self.get(&def.name)?.is_some() {
@@ -553,16 +686,21 @@ impl SkillStore {
         }
         def.status = SkillStatus::Draft;
         def.validation_history = Vec::new();
+        def.imported = true;
+        def.import_approved = false;
         self.save(&def)?;
         Ok(def)
     }
 
-    /// The curated catalog: promoted skills only, sorted by name.
+    /// The curated catalog: usable skills only (see
+    /// [`SkillDef::is_usable`]), sorted by name. This and
+    /// `retrieve_skills` are the two selection paths, and both
+    /// filter through the same single predicate (F5-06/F5-20).
     pub fn catalog(&self) -> Result<Vec<SkillDef>, MimintError> {
         Ok(self
             .load_all()?
             .into_iter()
-            .filter(|def| def.status == SkillStatus::Promoted)
+            .filter(|def| def.is_usable())
             .collect())
     }
 
@@ -714,6 +852,12 @@ pub async fn run_one_task(
 /// inspect created notes must use distinct needles per task, or
 /// run tasks individually via [`run_one_task`] with fresh
 /// notebooks.
+///
+/// `deadline` (F5-15) bounds the whole run: when it passes
+/// before a task starts, the run errors WITHOUT running that
+/// task — partial results are never returned as if complete,
+/// and callers must not record a run from them.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_validation_tasks(
     provider: &dyn Provider,
     system_prompt: &str,
@@ -722,9 +866,18 @@ pub async fn run_validation_tasks(
     audit: &AuditLog,
     turn_prefix: &str,
     max_steps: usize,
+    deadline: Option<std::time::Instant>,
 ) -> Result<Vec<TaskResult>, MimintError> {
     let mut results = Vec::new();
-    for task in tasks {
+    for (index, task) in tasks.iter().enumerate() {
+        if let Some(deadline) = deadline {
+            if std::time::Instant::now() >= deadline {
+                return Err(MimintError::Config(format!(
+                    "time budget exhausted after {index}/{} validation task(s); no run recorded",
+                    tasks.len()
+                )));
+            }
+        }
         let turn_id = format!("{turn_prefix}-{}", task.id);
         results.push(
             run_one_task(
@@ -745,8 +898,24 @@ pub async fn run_validation_tasks(
 /// Validate one stored skill against its own tasks, then set its
 /// status from the outcome: all tasks pass → Promoted; any task
 /// fails → Quarantined. The run is appended to the skill's
-/// history and the skill is saved. Audited with kinds
-/// `skill_validation`, `skill_promote` / `skill_quarantine`.
+/// history and the skill is saved. Audited with kind
+/// `skill_validation` (decision `promoted`, `quarantined`, or
+/// `awaiting_import_approval`); quarantine is a decision, not
+/// a separate kind.
+///
+/// Two gates run before any model call or promotion (F5-05):
+/// the NEGATIVE PROBE quarantines the skill when any checker
+/// passes on empty evidence (an always-pass checker), with zero
+/// model calls; and an unapproved IMPORTED skill that passes
+/// validation stays a Draft awaiting the user's separate
+/// approval (`approve_import`), audited as
+/// `awaiting_import_approval`.
+///
+/// `time_budget` (F5-15) bounds the whole run: when it expires
+/// before a task starts, validation ERRORS and records nothing
+/// — no run, no status change — so a partial run can never look
+/// like a passing one.
+#[allow(clippy::too_many_arguments)]
 pub async fn validate_skill(
     store: &SkillStore,
     provider: &dyn Provider,
@@ -755,16 +924,66 @@ pub async fn validate_skill(
     audit: &AuditLog,
     turn_prefix: &str,
     max_steps: usize,
+    time_budget: Option<std::time::Duration>,
 ) -> Result<SkillDef, MimintError> {
     let mut def = store.get(name)?.ok_or_else(|| {
         MimintError::Config(format!(
             "unknown skill {name:?}: no such skill in the store"
         ))
     })?;
+    // Negative probe first: no model call may run for a skill
+    // whose checkers cannot fail against this notebook.
+    let mut probe_failed: Vec<String> = Vec::new();
+    for task in &def.validation_tasks {
+        if checker_passes_on_empty_evidence(&task.checker, &notebook)? {
+            probe_failed.push(task.id.clone());
+        }
+    }
+    if !probe_failed.is_empty() {
+        let results: Vec<TaskResult> = def
+            .validation_tasks
+            .iter()
+            .map(|task| TaskResult {
+                id: task.id.clone(),
+                passed: false,
+                evidence: format!(
+                    "negative probe: checker passes on empty evidence; \
+                     task {:?} cannot fail and the skill is quarantined without any model call",
+                    task.id
+                ),
+            })
+            .collect();
+        let total = results.len();
+        def.validation_history.push(ValidationRun {
+            ts_ms: now_ms(),
+            content_hash: def.content_hash(),
+            passed: 0,
+            total,
+            results,
+        });
+        def.status = SkillStatus::Quarantined;
+        store.save(&def)?;
+        audit.log(
+            turn_prefix,
+            "skill_validation",
+            None,
+            Some("quarantined"),
+            json!({
+                "skill": def.name,
+                "passed": 0,
+                "total": total,
+                "content_hash": def.content_hash(),
+                "reason": "negative_probe",
+                "probe_failed_tasks": probe_failed,
+            }),
+        )?;
+        return Ok(def);
+    }
     let system_prompt = format!(
         "You are Mimint, a local-first personal assistant. Use the provided tools when they help answer. Keep answers short.\n\n{}",
         def.prompt_section()
     );
+    let deadline = time_budget.map(|budget| std::time::Instant::now() + budget);
     let results = run_validation_tasks(
         provider,
         &system_prompt,
@@ -773,6 +992,7 @@ pub async fn validate_skill(
         audit,
         turn_prefix,
         max_steps,
+        deadline,
     )
     .await?;
     let passed = results.iter().filter(|result| result.passed).count();
@@ -784,9 +1004,12 @@ pub async fn validate_skill(
         total,
         results,
     };
-    let promoted = passed == total && total > 0;
-    def.status = if promoted {
+    let all_passed = passed == total && total > 0;
+    let awaiting_approval = all_passed && def.imported && !def.import_approved;
+    def.status = if all_passed && !awaiting_approval {
         SkillStatus::Promoted
+    } else if all_passed {
+        SkillStatus::Draft
     } else {
         SkillStatus::Quarantined
     };
@@ -796,11 +1019,64 @@ pub async fn validate_skill(
         turn_prefix,
         "skill_validation",
         None,
-        Some(if promoted { "promoted" } else { "quarantined" }),
+        Some(if all_passed {
+            if awaiting_approval {
+                "awaiting_import_approval"
+            } else {
+                "promoted"
+            }
+        } else {
+            "quarantined"
+        }),
         json!({
             "skill": def.name,
             "passed": passed,
             "total": total,
+            "content_hash": def.content_hash(),
+            "imported": def.imported,
+            "import_approved": def.import_approved,
+        }),
+    )?;
+    Ok(def)
+}
+
+/// Approve an imported skill (F5-05): the separate user step an
+/// imported skill needs before it can be promoted. Approval alone
+/// changes no status — the skill must still pass validation (or
+/// already have a passing run for its current content) before
+/// `promote` accepts it. Audited with kind
+/// `skill_import_approved`. Errors on non-imported skills and on
+/// skills already approved: approval is a deliberate, recorded
+/// act, not a silent no-op.
+pub fn approve_import(
+    store: &SkillStore,
+    name: &str,
+    audit: &AuditLog,
+) -> Result<SkillDef, MimintError> {
+    let mut def = store.get(name)?.ok_or_else(|| {
+        MimintError::Config(format!(
+            "unknown skill {name:?}: no such skill in the store"
+        ))
+    })?;
+    if !def.imported {
+        return Err(MimintError::Config(format!(
+            "skill {name:?} is not imported: only imported skills need import approval"
+        )));
+    }
+    if def.import_approved {
+        return Err(MimintError::Config(format!(
+            "skill {name:?} was already approved for import"
+        )));
+    }
+    def.import_approved = true;
+    store.save(&def)?;
+    audit.log(
+        "skill-admin",
+        "skill_import_approved",
+        None,
+        Some("approved"),
+        json!({
+            "skill": def.name,
             "content_hash": def.content_hash(),
         }),
     )?;
@@ -809,7 +1085,8 @@ pub async fn validate_skill(
 
 /// Promote a skill WITHOUT running validation — only when its
 /// latest validation run passed every task for its CURRENT
-/// content. Anything else is an error: there is no manual
+/// content, and (for imported skills) the user approved the
+/// import. Anything else is an error: there is no manual
 /// override around the gate. Audited with kind `skill_promote`.
 pub fn promote(store: &SkillStore, name: &str, audit: &AuditLog) -> Result<SkillDef, MimintError> {
     let mut def = store.get(name)?.ok_or_else(|| {
@@ -817,6 +1094,11 @@ pub fn promote(store: &SkillStore, name: &str, audit: &AuditLog) -> Result<Skill
             "unknown skill {name:?}: no such skill in the store"
         ))
     })?;
+    if def.imported && !def.import_approved {
+        return Err(MimintError::Config(format!(
+            "skill {name:?} is imported and not yet approved: approve the import (skill approve-import) before promoting"
+        )));
+    }
     let latest = def.validation_history.last().ok_or_else(|| {
         MimintError::Config(format!(
             "skill {name:?} has no validation run: run validation before promoting"
@@ -922,6 +1204,8 @@ pub fn builtin_note_skill() -> SkillDef {
         ],
         status: SkillStatus::Draft,
         validation_history: Vec::new(),
+        imported: false,
+        import_approved: false,
     }
 }
 
@@ -956,6 +1240,8 @@ pub fn builtin_summary_skill() -> SkillDef {
         }],
         status: SkillStatus::Draft,
         validation_history: Vec::new(),
+        imported: false,
+        import_approved: false,
     }
 }
 
@@ -1002,7 +1288,25 @@ mod tests {
             }],
             status: SkillStatus::Draft,
             validation_history: Vec::new(),
+            imported: false,
+            import_approved: false,
         }
+    }
+
+    /// Make a draft skill genuinely usable: Promoted plus a
+    /// passing run bound to its current content hash (F5-06).
+    /// Status alone is NOT enough.
+    fn make_usable(mut def: SkillDef) -> SkillDef {
+        def.status = SkillStatus::Promoted;
+        let hash = def.content_hash();
+        def.validation_history = vec![ValidationRun {
+            ts_ms: 1,
+            content_hash: hash,
+            passed: 1,
+            total: 1,
+            results: Vec::new(),
+        }];
+        def
     }
 
     #[test]
@@ -1061,9 +1365,102 @@ mod tests {
     }
 
     #[test]
+    fn shape_validation_rejects_always_pass_checkers() {
+        // Empty `All` passes vacuously; empty needles match
+        // everything; an empty tool name is meaningless. All are
+        // rejected, including nested inside `All`.
+        let mut def = draft_skill("ok");
+        def.validation_tasks[0].checker = Checker::All { checks: vec![] };
+        assert!(def.validate_shape().is_err());
+        def = draft_skill("ok");
+        def.validation_tasks[0].checker = Checker::Contains {
+            needle: "   ".to_string(),
+        };
+        assert!(def.validate_shape().is_err());
+        def = draft_skill("ok");
+        def.validation_tasks[0].checker = Checker::NoteCreated {
+            needle: String::new(),
+        };
+        assert!(def.validate_shape().is_err());
+        def = draft_skill("ok");
+        def.validation_tasks[0].checker = Checker::ToolUsed {
+            tool: String::new(),
+        };
+        assert!(def.validate_shape().is_err());
+        def = draft_skill("ok");
+        def.validation_tasks[0].checker = Checker::All {
+            checks: vec![
+                Checker::ToolUsed {
+                    tool: "notebook_add".to_string(),
+                },
+                Checker::Contains {
+                    needle: String::new(),
+                },
+            ],
+        };
+        assert!(def.validate_shape().is_err());
+        // A well-formed `All` still passes shape validation.
+        def = draft_skill("ok");
+        def.validation_tasks[0].checker = Checker::All {
+            checks: vec![
+                Checker::ToolUsed {
+                    tool: "notebook_add".to_string(),
+                },
+                Checker::Contains {
+                    needle: "x".to_string(),
+                },
+            ],
+        };
+        assert!(def.validate_shape().is_ok());
+    }
+
+    #[test]
+    fn negative_probe_catches_checkers_passing_on_empty_evidence() {
+        let dir = temp_dir("probe");
+        let empty = Notebook::open(":memory:").unwrap();
+        assert!(
+            checker_passes_on_empty_evidence(&Checker::All { checks: vec![] }, &empty).unwrap()
+        );
+        assert!(checker_passes_on_empty_evidence(
+            &Checker::Contains {
+                needle: String::new()
+            },
+            &empty
+        )
+        .unwrap());
+        assert!(!checker_passes_on_empty_evidence(
+            &Checker::ToolUsed {
+                tool: "notebook_add".to_string()
+            },
+            &empty
+        )
+        .unwrap());
+        assert!(!checker_passes_on_empty_evidence(&Checker::ResponseNonEmpty, &empty).unwrap());
+        // The in-context case: a shape-valid NoteCreated checker
+        // passes on empty evidence when an old note already
+        // contains the needle.
+        let seeded = Notebook::open(dir.join("n.db")).unwrap();
+        seeded.add("Mua sữa", "sáng mai").unwrap();
+        assert!(checker_passes_on_empty_evidence(
+            &Checker::NoteCreated {
+                needle: "sữa".to_string()
+            },
+            &seeded
+        )
+        .unwrap());
+        assert!(!checker_passes_on_empty_evidence(
+            &Checker::NoteCreated {
+                needle: "bánh".to_string()
+            },
+            &seeded
+        )
+        .unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn retrieval_is_deterministic_and_promoted_only() {
-        let mut promoted = draft_skill("notes");
-        promoted.status = SkillStatus::Promoted;
+        let promoted = make_usable(draft_skill("notes"));
         let mut draft = draft_skill("drafty");
         draft.triggers = vec!["save a note".to_string()];
         draft.description = "A test skill about notes.".to_string();
@@ -1071,7 +1468,7 @@ mod tests {
         quarantined.status = SkillStatus::Quarantined;
         quarantined.triggers = vec!["save a note".to_string()];
         let skills = vec![quarantined, draft, promoted.clone()];
-        // Only the promoted skill is retrieved.
+        // Only the usable skill is retrieved.
         let hits = retrieve_skills(&skills, "please save a note", 5);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].name, "notes");
@@ -1080,18 +1477,16 @@ mod tests {
         // skill whose triggers match outranks a description-only
         // match.
         let mut weak = draft_skill("weak");
-        weak.status = SkillStatus::Promoted;
         weak.triggers = Vec::new();
         weak.description = "a note keeper".to_string();
+        let weak = make_usable(weak);
         let skills = vec![weak, promoted];
         let hits = retrieve_skills(&skills, "save a note", 5);
         assert_eq!(hits[0].name, "notes");
         assert!(hits[0].score > hits[1].score);
         // Ties break by name, ascending.
-        let mut a = draft_skill("aaa");
-        a.status = SkillStatus::Promoted;
-        let mut b = draft_skill("bbb");
-        b.status = SkillStatus::Promoted;
+        let a = make_usable(draft_skill("aaa"));
+        let b = make_usable(draft_skill("bbb"));
         let hits = retrieve_skills(&[b, a], "save a note", 5);
         assert_eq!(hits[0].name, "aaa");
         assert_eq!(hits[1].name, "bbb");
@@ -1099,6 +1494,61 @@ mod tests {
         assert!(retrieve_skills(&[draft_skill("x")], "weather today", 5).is_empty());
         assert!(retrieve_skills(&[draft_skill("x")], "", 5).is_empty());
         assert!(retrieve_skills(&[draft_skill("x")], "save a note", 0).is_empty());
+    }
+
+    #[test]
+    fn promoted_status_alone_is_not_usable() {
+        // TOCTOU / stale-promotion cases (F5-06): status says
+        // Promoted, but the predicate must refuse all of these.
+        let mut no_run = draft_skill("no-run");
+        no_run.status = SkillStatus::Promoted;
+        assert!(!no_run.is_usable());
+        // Edited after promotion: hash no longer matches.
+        let mut edited = make_usable(draft_skill("edited"));
+        edited.content = "Save notes, differently.".to_string();
+        assert!(!edited.is_usable());
+        assert!(retrieve_skills(&[edited.clone()], "save a note", 5).is_empty());
+        // Failing latest run.
+        let mut failing = draft_skill("failing");
+        failing.status = SkillStatus::Promoted;
+        let hash = failing.content_hash();
+        failing.validation_history = vec![ValidationRun {
+            ts_ms: 1,
+            content_hash: hash,
+            passed: 0,
+            total: 1,
+            results: Vec::new(),
+        }];
+        assert!(!failing.is_usable());
+        // Unapproved import, even with a passing run.
+        let mut imported = make_usable(draft_skill("imported"));
+        imported.imported = true;
+        assert!(!imported.is_usable());
+        imported.import_approved = true;
+        assert!(imported.is_usable());
+    }
+
+    #[test]
+    fn trigger_conflicts_are_reported_deterministically() {
+        let mut a = draft_skill("aaa");
+        a.triggers = vec!["Save a Note".to_string(), "unique-a".to_string()];
+        let mut b = draft_skill("bbb");
+        b.triggers = vec!["save a note".to_string(), "unique-b".to_string()];
+        let mut c = draft_skill("ccc");
+        c.triggers = vec!["something else entirely".to_string()];
+        let conflicts = find_trigger_conflicts(&[c, b, a]);
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].0, "save a note");
+        assert_eq!(conflicts[0].1, vec!["aaa".to_string(), "bbb".to_string()]);
+        // Identical triggers do not override: both colliding
+        // skills stay retrievable, name order breaks the tie.
+        let a = make_usable(draft_skill("aaa"));
+        let b = make_usable(draft_skill("bbb"));
+        let hits = retrieve_skills(&[b, a], "save a note", 5);
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].name, "aaa");
+        assert_eq!(hits[1].name, "bbb");
+        assert_eq!(hits[0].score, hits[1].score);
     }
 
     #[test]
@@ -1270,6 +1720,7 @@ mod tests {
             &audit,
             "val-1",
             3,
+            None,
         )
         .await
         .unwrap();
@@ -1299,6 +1750,7 @@ mod tests {
             &audit,
             "val-2",
             3,
+            None,
         )
         .await
         .unwrap();
@@ -1307,6 +1759,208 @@ mod tests {
         let catalog = store.catalog().unwrap();
         assert_eq!(catalog.len(), 1);
         assert_eq!(catalog[0].name, "notes");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn negative_probe_quarantines_without_any_model_call() {
+        let dir = temp_dir("probe-quarantine");
+        let store = SkillStore::new(dir.join("skills"));
+        // Shape-valid checker, but the notebook already contains
+        // the needle: the task cannot discriminate.
+        let mut skill = draft_skill("stale-needle");
+        skill.validation_tasks = vec![ValidationTask {
+            id: "t1".to_string(),
+            prompt: "Save a note about milk".to_string(),
+            checker: Checker::NoteCreated {
+                needle: "sữa".to_string(),
+            },
+        }];
+        store.create_draft(skill).unwrap();
+        let notebook = Arc::new(Notebook::open(dir.join("n.db")).unwrap());
+        notebook.add("Mua sữa", "sáng mai").unwrap();
+        let audit = AuditLog::open(dir.join("a.jsonl")).unwrap();
+        // A provider that counts calls: the probe must run before
+        // any model call, so the count must stay zero.
+        struct CountingProvider {
+            calls: std::sync::Mutex<usize>,
+        }
+        impl Provider for CountingProvider {
+            fn name(&self) -> &str {
+                "counting"
+            }
+            fn model(&self) -> &str {
+                "counting-model"
+            }
+            fn endpoint_url(&self) -> &str {
+                "http://127.0.0.1:1/v1/chat/completions"
+            }
+            fn is_paid(&self) -> bool {
+                false
+            }
+            fn chat<'a>(
+                &'a self,
+                _ctx: &'a CallContext<'a>,
+                _messages: &'a [ChatMessage],
+                _tools: &'a [Value],
+            ) -> BoxFuture<'a, Result<ChatMessage, MimintError>> {
+                *self.calls.lock().unwrap() += 1;
+                Box::pin(async move { Ok(text_message("Done.")) })
+            }
+        }
+        let provider = CountingProvider {
+            calls: std::sync::Mutex::new(0),
+        };
+        let def = validate_skill(
+            &store,
+            &provider,
+            "stale-needle",
+            Arc::clone(&notebook),
+            &audit,
+            "val-probe",
+            3,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(def.status, SkillStatus::Quarantined);
+        assert_eq!(*provider.calls.lock().unwrap(), 0);
+        assert!(store.catalog().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn imported_skill_needs_user_approval_before_promotion() {
+        let dir = temp_dir("import-approval");
+        let store = SkillStore::new(dir.join("skills"));
+        // Import a file that claims promoted + approved: both
+        // claims are stripped.
+        let mut imported = draft_skill("imported");
+        imported.status = SkillStatus::Promoted;
+        imported.imported = true;
+        imported.import_approved = true;
+        let import_path = dir.join("imported.toml");
+        std::fs::write(&import_path, toml::to_string(&imported).unwrap()).unwrap();
+        let def = store.import_file(&import_path).unwrap();
+        assert_eq!(def.status, SkillStatus::Draft);
+        assert!(def.imported);
+        assert!(!def.import_approved);
+        let notebook = Arc::new(Notebook::open(dir.join("n.db")).unwrap());
+        let audit = AuditLog::open(dir.join("a.jsonl")).unwrap();
+        let provider = ScriptProvider {
+            replies: std::sync::Mutex::new(std::collections::VecDeque::from([
+                tool_call_message("notebook_add", r#"{"title":"t","body":"b"}"#),
+                text_message("Saved."),
+            ])),
+        };
+        // Passing validation keeps an unapproved import a draft.
+        let def = validate_skill(
+            &store,
+            &provider,
+            "imported",
+            Arc::clone(&notebook),
+            &audit,
+            "val-import",
+            3,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(def.status, SkillStatus::Draft);
+        assert_eq!(def.validation_history[0].passed, 1);
+        assert!(store.catalog().unwrap().is_empty());
+        // Promote refuses before approval.
+        assert!(promote(&store, "imported", &audit).is_err());
+        // The user approves; promote then succeeds on the same
+        // passing run (content unchanged).
+        let def = approve_import(&store, "imported", &audit).unwrap();
+        assert!(def.import_approved);
+        let def = promote(&store, "imported", &audit).unwrap();
+        assert_eq!(def.status, SkillStatus::Promoted);
+        assert_eq!(store.catalog().unwrap().len(), 1);
+        // Approval is not repeatable, and local skills need none.
+        assert!(approve_import(&store, "imported", &audit).is_err());
+        store.create_draft(draft_skill("local")).unwrap();
+        assert!(approve_import(&store, "local", &audit).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn edited_promoted_skill_leaves_the_catalog_until_revalidated() {
+        // TOCTOU (F5-06): a hand edit after promotion must remove
+        // the skill from every selection path at once.
+        let dir = temp_dir("toctou");
+        let store = SkillStore::new(dir.join("skills"));
+        store.create_draft(draft_skill("notes")).unwrap();
+        let notebook = Arc::new(Notebook::open(dir.join("n.db")).unwrap());
+        let audit = AuditLog::open(dir.join("a.jsonl")).unwrap();
+        let provider = ScriptProvider {
+            replies: std::sync::Mutex::new(std::collections::VecDeque::from([
+                tool_call_message("notebook_add", r#"{"title":"t","body":"b"}"#),
+                text_message("Saved."),
+            ])),
+        };
+        let def = validate_skill(
+            &store,
+            &provider,
+            "notes",
+            Arc::clone(&notebook),
+            &audit,
+            "val-toctou",
+            3,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(def.status, SkillStatus::Promoted);
+        assert_eq!(store.catalog().unwrap().len(), 1);
+        // Hand-edit the file, keeping status = promoted.
+        let mut edited = store.get("notes").unwrap().unwrap();
+        edited.content = "Save notes — edited by hand.".to_string();
+        store.save(&edited).unwrap();
+        assert_eq!(
+            store.get("notes").unwrap().unwrap().status,
+            SkillStatus::Promoted
+        );
+        assert!(store.catalog().unwrap().is_empty());
+        let loaded = store.load_all().unwrap();
+        assert!(retrieve_skills(&loaded, "save a note", 5).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn expired_time_budget_records_no_run_and_changes_nothing() {
+        let dir = temp_dir("validate-budget");
+        let store = SkillStore::new(dir.join("skills"));
+        store.create_draft(draft_skill("notes")).unwrap();
+        let notebook = Arc::new(Notebook::open(dir.join("n.db")).unwrap());
+        let audit = AuditLog::open(dir.join("a.jsonl")).unwrap();
+        let provider = ScriptProvider {
+            replies: std::sync::Mutex::new(std::collections::VecDeque::from([
+                tool_call_message("notebook_add", r#"{"title":"t","body":"b"}"#),
+                text_message("Saved."),
+            ])),
+        };
+        let err = validate_skill(
+            &store,
+            &provider,
+            "notes",
+            Arc::clone(&notebook),
+            &audit,
+            "val-budget",
+            3,
+            Some(std::time::Duration::ZERO),
+        )
+        .await
+        .expect_err("an expired budget must error, not record a partial run");
+        assert!(
+            err.message().contains("time budget exhausted"),
+            "{}",
+            err.message()
+        );
+        let def = store.get("notes").unwrap().unwrap();
+        assert_eq!(def.status, SkillStatus::Draft);
+        assert!(def.validation_history.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1334,6 +1988,7 @@ mod tests {
             &audit,
             "val-1",
             3,
+            None,
         )
         .await
         .unwrap();

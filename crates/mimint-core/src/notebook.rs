@@ -1,7 +1,8 @@
 //! Notebook: local-first SQLite store, one database per body (D6).
 //!
-//! Search is BM25 ranking over whitespace-separated tokens (Phase 5,
-//! P5.4), replacing the Phase 1 `LIKE` substring baseline. The
+//! Search is BM25 ranking over NFC-normalized, lowercased tokens
+//! split on non-alphanumeric characters (Phase 5, P5.4; punctuation
+//! handling fixed in the Phase 5 fix pass), replacing the Phase 1 `LIKE` substring baseline. The
 //! ranking is implemented in this module, in plain Rust, over the
 //! `notes` table — no FTS virtual table, no schema change, so a
 //! database written by Phase 1 opens unchanged and loses nothing.
@@ -21,13 +22,17 @@
 //! is cheap; FTS5 stays available if scale ever demands it.
 //!
 //! Tokenizer baseline (locked by tests, no deep Vietnamese NLP
-//! claimed): split on whitespace, Unicode-lowercase each token,
-//! keep diacritics, no stemming, no punctuation stripping. A token
-//! is a whole whitespace-separated word: `100%` matches `100%`
-//! but `100` does not, and `underscore` does not match
-//! `underscore_score`. An accented query finds accented notes;
-//! an unaccented query does NOT match accented notes (there is no
-//! accent-folding normalization, and none is claimed).
+//! claimed): Unicode NFC normalization (a minimal Vietnamese-only
+//! composer, no dependency), Unicode-lowercase, then split on any
+//! character that is not a letter or digit — punctuation is a token
+//! boundary, not part of a token. Diacritics are kept, no stemming.
+//! `mưa.` matches `mưa`, and `100%` matches `100`. An accented query
+//! finds accented notes; an unaccented query does NOT match accented
+//! notes (there is no accent-folding normalization, and none is
+//! claimed). Vietnamese words are split by syllable (whitespace /
+//! punctuation), not by multi-syllable word: length normalization
+//! sees syllables. See `docs/soul-skills-learning.md` for the
+//! documented recall limits.
 //!
 //! Empty-query semantics (defined, locked by tests): an empty or
 //! whitespace-only query returns NO results. The old `LIKE '%%'`
@@ -69,15 +74,183 @@ fn note_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Note> {
     })
 }
 
-/// Baseline tokenizer: whitespace split + Unicode lowercase.
-/// Diacritics are kept; nothing is stemmed or stripped. Shared by
-/// notebook search, skill retrieval, and experience retrieval so
-/// all three rank on the same tokens.
+/// Baseline tokenizer: NFC-normalize (Vietnamese-only, see
+/// [`normalize_nfc_vietnamese`]), Unicode-lowercase, then split on
+/// any character that is not alphanumeric. Diacritics are kept;
+/// nothing is stemmed; punctuation never survives into a token.
+/// Shared by notebook search, skill retrieval, and experience
+/// retrieval so all three rank on the same tokens.
 pub fn tokenize_baseline(text: &str) -> Vec<String> {
-    text.split_whitespace()
-        .map(|token| token.to_lowercase())
-        .filter(|token| !token.is_empty())
-        .collect()
+    let normalized = normalize_nfc_vietnamese(text);
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    for ch in normalized.chars() {
+        if ch.is_alphanumeric() {
+            current.extend(ch.to_lowercase());
+        } else if !current.is_empty() {
+            tokens.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
+
+/// Minimal Unicode NFC composition for Vietnamese text, written by
+/// hand (no new dependency). Composes a base vowel followed by
+/// combining marks into its precomposed form:
+/// - shape marks: breve U+0306, circumflex U+0302, horn U+031B;
+/// - tone marks: grave U+0300, acute U+0301, hook above U+0309,
+///   tilde U+0303, dot below U+0323.
+///
+/// A base vowel plus at most one shape mark plus at most one tone
+/// mark composes (in either mark order); anything else — a mark
+/// sequence this table does not know, a mark on a consonant, a lone
+/// combining mark — passes through unchanged. Already-composed
+/// (NFC) text is untouched, and so is text with no combining marks.
+/// This is NOT full Unicode NFC: it covers exactly the Vietnamese
+/// vowel system (including uppercase) and nothing else. `đ`/`Đ`
+/// have no canonical decomposition and pass through as-is.
+pub fn normalize_nfc_vietnamese(text: &str) -> String {
+    const GRAVE: char = '\u{300}';
+    const ACUTE: char = '\u{301}';
+    const HOOK: char = '\u{309}';
+    const TILDE: char = '\u{303}';
+    const DOT: char = '\u{323}';
+    const BREVE: char = '\u{306}';
+    const CIRCUMFLEX: char = '\u{302}';
+    const HORN: char = '\u{31b}';
+
+    fn is_combining(ch: char) -> bool {
+        matches!(
+            ch,
+            GRAVE | ACUTE | HOOK | TILDE | DOT | BREVE | CIRCUMFLEX | HORN
+        )
+    }
+    /// Compose base + one shape mark (breve/circumflex/horn).
+    fn shape_compose(base: char, mark: char) -> Option<char> {
+        Some(match (base, mark) {
+            ('a', BREVE) => 'ă',
+            ('a', CIRCUMFLEX) => 'â',
+            ('e', CIRCUMFLEX) => 'ê',
+            ('o', CIRCUMFLEX) => 'ô',
+            ('o', HORN) => 'ơ',
+            ('u', HORN) => 'ư',
+            ('A', BREVE) => 'Ă',
+            ('A', CIRCUMFLEX) => 'Â',
+            ('E', CIRCUMFLEX) => 'Ê',
+            ('O', CIRCUMFLEX) => 'Ô',
+            ('O', HORN) => 'Ơ',
+            ('U', HORN) => 'Ư',
+            _ => return None,
+        })
+    }
+    /// Compose vowel + one tone mark. `vowel` may already carry a
+    /// shape (ă/â/ê/ô/ơ/ư) — a tone on a shaped vowel composes too.
+    fn tone_compose(vowel: char, mark: char) -> Option<char> {
+        // Rows: (plain, grave, acute, hook, tilde, dot).
+        const ROWS: &[(char, [char; 5])] = &[
+            ('a', ['à', 'á', 'ả', 'ã', 'ạ']),
+            ('ă', ['ằ', 'ắ', 'ẳ', 'ẵ', 'ặ']),
+            ('â', ['ầ', 'ấ', 'ẩ', 'ẫ', 'ậ']),
+            ('e', ['è', 'é', 'ẻ', 'ẽ', 'ẹ']),
+            ('ê', ['ề', 'ế', 'ể', 'ễ', 'ệ']),
+            ('i', ['ì', 'í', 'ỉ', 'ĩ', 'ị']),
+            ('o', ['ò', 'ó', 'ỏ', 'õ', 'ọ']),
+            ('ô', ['ồ', 'ố', 'ổ', 'ỗ', 'ộ']),
+            ('ơ', ['ờ', 'ớ', 'ở', 'ỡ', 'ợ']),
+            ('u', ['ù', 'ú', 'ủ', 'ũ', 'ụ']),
+            ('ư', ['ừ', 'ứ', 'ử', 'ữ', 'ự']),
+            ('y', ['ỳ', 'ý', 'ỷ', 'ỹ', 'ỵ']),
+            ('A', ['À', 'Á', 'Ả', 'Ã', 'Ạ']),
+            ('Ă', ['Ằ', 'Ắ', 'Ẳ', 'Ẵ', 'Ặ']),
+            ('Â', ['Ầ', 'Ấ', 'Ẩ', 'Ẫ', 'Ậ']),
+            ('E', ['È', 'É', 'Ẻ', 'Ẽ', 'Ẹ']),
+            ('Ê', ['Ề', 'Ế', 'Ể', 'Ễ', 'Ệ']),
+            ('I', ['Ì', 'Í', 'Ỉ', 'Ĩ', 'Ị']),
+            ('O', ['Ò', 'Ó', 'Ỏ', 'Õ', 'Ọ']),
+            ('Ô', ['Ồ', 'Ố', 'Ổ', 'Ỗ', 'Ộ']),
+            ('Ơ', ['Ờ', 'Ớ', 'Ở', 'Ỡ', 'Ợ']),
+            ('U', ['Ù', 'Ú', 'Ủ', 'Ũ', 'Ụ']),
+            ('Ư', ['Ừ', 'Ứ', 'Ử', 'Ữ', 'Ự']),
+            ('Y', ['Ỳ', 'Ý', 'Ỷ', 'Ỹ', 'Ỵ']),
+        ];
+        let tone_index = match mark {
+            GRAVE => 0,
+            ACUTE => 1,
+            HOOK => 2,
+            TILDE => 3,
+            DOT => 4,
+            _ => return None,
+        };
+        ROWS.iter()
+            .find(|(base, _)| *base == vowel)
+            .map(|(_, tones)| tones[tone_index])
+    }
+
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut index = 0usize;
+    while index < chars.len() {
+        let base = chars[index];
+        // Collect the following combining marks (from the known set).
+        let mut marks: Vec<char> = Vec::new();
+        let mut next = index + 1;
+        while next < chars.len() && is_combining(chars[next]) {
+            marks.push(chars[next]);
+            next += 1;
+        }
+        if marks.is_empty() {
+            out.push(base);
+            index += 1;
+            continue;
+        }
+        // Split marks into at most one shape + at most one tone;
+        // anything else composes nothing (pass through verbatim).
+        let mut shape: Option<char> = None;
+        let mut tone: Option<char> = None;
+        let mut unknown = false;
+        for mark in &marks {
+            match *mark {
+                BREVE | CIRCUMFLEX | HORN => {
+                    if shape.is_some() {
+                        unknown = true;
+                    }
+                    shape = Some(*mark);
+                }
+                GRAVE | ACUTE | HOOK | TILDE | DOT => {
+                    if tone.is_some() {
+                        unknown = true;
+                    }
+                    tone = Some(*mark);
+                }
+                _ => unknown = true,
+            }
+        }
+        let mut composed = Some(base);
+        if !unknown {
+            if let Some(shape_mark) = shape {
+                composed = composed.and_then(|vowel| shape_compose(vowel, shape_mark));
+            }
+            if let Some(tone_mark) = tone {
+                composed = composed.and_then(|vowel| tone_compose(vowel, tone_mark));
+            }
+        } else {
+            composed = None;
+        }
+        match composed {
+            Some(vowel) => out.push(vowel),
+            None => {
+                out.push(base);
+                for mark in marks {
+                    out.push(mark);
+                }
+            }
+        }
+        index = next;
+    }
+    out
 }
 
 /// BM25 constants (Robertson defaults). Fixed, not tuned: this is
@@ -373,18 +546,24 @@ mod tests {
     }
 
     #[test]
-    fn tokens_are_whole_whitespace_separated_words() {
+    fn punctuation_is_a_token_boundary_not_part_of_a_token() {
         let path = temp_db("tokens");
         let notebook = Notebook::open(&path).expect("open notebook");
         notebook.add("100% sure", "underscore_score").unwrap();
-        // The whole token matches, including punctuation.
+        notebook.add("Trời mưa.", "Hôm nay, trời mưa to!").unwrap();
+        // Punctuation never survives into a token: the bare word
+        // matches, with or without the punctuation attached.
+        assert_eq!(notebook.search("100").unwrap().len(), 1);
         assert_eq!(notebook.search("100%").unwrap().len(), 1);
-        assert_eq!(notebook.search("underscore_score").unwrap().len(), 1);
-        // Partial words do NOT match: the baseline tokenizer
-        // splits on whitespace only, no substring search.
-        assert!(notebook.search("100").unwrap().is_empty());
-        assert!(notebook.search("underscore").unwrap().is_empty());
         assert_eq!(notebook.search("sure").unwrap().len(), 1);
+        assert_eq!(notebook.search("underscore").unwrap().len(), 1);
+        assert_eq!(notebook.search("score").unwrap().len(), 1);
+        assert_eq!(notebook.search("underscore_score").unwrap().len(), 1);
+        // "mưa." in a note matches a bare "mưa" query, and a query
+        // with trailing punctuation matches too.
+        assert_eq!(notebook.search("mưa").unwrap().len(), 1);
+        assert_eq!(notebook.search("mưa.").unwrap().len(), 1);
+        assert_eq!(notebook.search("Hôm nay,").unwrap().len(), 1);
         assert!(notebook.search("missing").unwrap().is_empty());
         let _ = std::fs::remove_file(&path);
     }
@@ -450,13 +629,117 @@ mod tests {
     }
 
     #[test]
-    fn tokenizer_keeps_diacritics_and_splits_on_whitespace() {
+    fn tokenizer_keeps_diacritics_splits_on_punctuation_and_folds_nfd() {
         assert_eq!(
             tokenize_baseline("Hà Nội  trời MƯA"),
             vec!["hà", "nội", "trời", "mưa"]
         );
         assert_eq!(tokenize_baseline("  "), Vec::<String>::new());
         assert_eq!(tokenize_baseline(""), Vec::<String>::new());
-        assert_eq!(tokenize_baseline("100% sure"), vec!["100%", "sure"]);
+        assert_eq!(tokenize_baseline("100% sure"), vec!["100", "sure"]);
+        assert_eq!(
+            tokenize_baseline("mưa, to! (thật)"),
+            vec!["mưa", "to", "thật"]
+        );
+        // NFD input (base + combining marks, as pasted from macOS)
+        // tokenizes identically to NFC input.
+        assert_eq!(tokenize_baseline("Ha\u{300} N\u{1ed9}i"), vec!["hà", "nội"]);
+        assert_eq!(
+            tokenize_baseline("Vie\u{302}\u{323}t Nam"),
+            tokenize_baseline("Việt Nam")
+        );
+    }
+
+    #[test]
+    fn nfc_composer_covers_the_vietnamese_vowel_system() {
+        // Every tone on a plain vowel, lowercase + uppercase.
+        assert_eq!(normalize_nfc_vietnamese("a\u{300}"), "à");
+        assert_eq!(normalize_nfc_vietnamese("a\u{301}"), "á");
+        assert_eq!(normalize_nfc_vietnamese("a\u{309}"), "ả");
+        assert_eq!(normalize_nfc_vietnamese("a\u{303}"), "ã");
+        assert_eq!(normalize_nfc_vietnamese("a\u{323}"), "ạ");
+        assert_eq!(normalize_nfc_vietnamese("A\u{301}"), "Á");
+        assert_eq!(normalize_nfc_vietnamese("y\u{323}"), "ỵ");
+        assert_eq!(normalize_nfc_vietnamese("Y\u{300}"), "Ỳ");
+        // Shape + tone, in both mark orders (canonical NFD puts
+        // the shape mark first, but either order must compose).
+        assert_eq!(normalize_nfc_vietnamese("a\u{306}\u{301}"), "ắ");
+        assert_eq!(normalize_nfc_vietnamese("a\u{301}\u{306}"), "ắ");
+        assert_eq!(normalize_nfc_vietnamese("a\u{302}\u{323}"), "ậ");
+        assert_eq!(normalize_nfc_vietnamese("o\u{31b}\u{303}"), "ỡ");
+        assert_eq!(normalize_nfc_vietnamese("u\u{31b}\u{309}"), "ử");
+        assert_eq!(normalize_nfc_vietnamese("e\u{302}\u{300}"), "ề");
+        assert_eq!(normalize_nfc_vietnamese("O\u{302}\u{301}"), "Ố");
+        // A tone on an already-shaped vowel composes too.
+        assert_eq!(normalize_nfc_vietnamese("â\u{301}"), "ấ");
+        assert_eq!(normalize_nfc_vietnamese("ơ\u{323}"), "ợ");
+        // NFC text, plain ASCII, and đ pass through untouched.
+        assert_eq!(
+            normalize_nfc_vietnamese("Hà Nội, Việt Nam"),
+            "Hà Nội, Việt Nam"
+        );
+        assert_eq!(normalize_nfc_vietnamese("hello 123"), "hello 123");
+        assert_eq!(normalize_nfc_vietnamese("đồng"), "đồng");
+        // Unknown mark sequences pass through verbatim (no silent
+        // mangling): a tone on a consonant, doubled tones.
+        assert_eq!(normalize_nfc_vietnamese("b\u{301}"), "b\u{301}");
+        assert_eq!(
+            normalize_nfc_vietnamese("a\u{301}\u{300}"),
+            "a\u{301}\u{300}"
+        );
+    }
+
+    #[test]
+    fn nfd_queries_find_nfc_notes_and_vice_versa() {
+        let path = temp_db("nfd");
+        let notebook = Notebook::open(&path).expect("open notebook");
+        // Note stored in NFC; query typed in NFD (macOS paste).
+        notebook.add("Hà Nội", "thủ đô").unwrap();
+        assert_eq!(notebook.search("Ha\u{300}").unwrap().len(), 1);
+        assert_eq!(notebook.search("Ha\u{300} N\u{1ed9}i").unwrap().len(), 1);
+        // Note stored in NFD; query typed in NFC.
+        notebook.add("Hue\u{302}\u{301}", "thành phố").unwrap();
+        assert_eq!(notebook.search("Huế").unwrap().len(), 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn ranking_prefers_short_documents_at_equal_term_frequency() {
+        let path = temp_db("length-norm");
+        let notebook = Notebook::open(&path).expect("open notebook");
+        // Same single occurrence of "mưa"; the short note must win
+        // through BM25 length normalization (b=0.75).
+        notebook.add("ngắn", "mưa").unwrap();
+        notebook
+            .add(
+                "dài",
+                "mưa và rất nhiều từ đệm khác nhau trong ghi chú này để kéo dài tài liệu",
+            )
+            .unwrap();
+        let ranked = notebook.search_ranked("mưa").unwrap();
+        assert_eq!(ranked.len(), 2);
+        assert_eq!(ranked[0].0.title, "ngắn");
+        assert!(ranked[0].1 > ranked[1].1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn ranking_prefers_rare_terms_over_ubiquitous_terms() {
+        let path = temp_db("rare-term");
+        let notebook = Notebook::open(&path).expect("open notebook");
+        // "chung" appears in every note (IDF near its floor);
+        // "hiếm" appears in exactly one note (high IDF). A query
+        // with both terms must rank the rare-term note first.
+        notebook.add("một", "chung hiếm").unwrap();
+        notebook.add("hai", "chung thường").unwrap();
+        notebook.add("ba", "chung bình").unwrap();
+        let ranked = notebook.search_ranked("chung hiếm").unwrap();
+        assert_eq!(ranked[0].0.title, "một");
+        // The IDF never goes negative: a term in every document
+        // still contributes a non-negative score.
+        let ranked = notebook.search_ranked("chung").unwrap();
+        assert_eq!(ranked.len(), 3);
+        assert!(ranked.iter().all(|(_, score)| *score >= 0.0));
+        let _ = std::fs::remove_file(&path);
     }
 }

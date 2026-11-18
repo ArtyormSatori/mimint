@@ -182,6 +182,22 @@ pub fn soul_may_be_sent(privacy_on: bool, all_backends_loopback: bool) -> bool {
 /// context section (selected skills, retrieved experience) in
 /// order. Sections are caller-formatted blocks; this function only
 /// joins them with blank lines.
+/// FNV-1a hash of a SOUL document's body (change detection
+/// only, the same construction as the skill `content_hash` and
+/// the experience `checker_hash`). The worker compares this hash
+/// on every rebuild: a change outside the code path (the app
+/// never calls `SoulStore::save`) means the file was edited by
+/// hand or by another program, and the UI warns. NOT
+/// cryptographic; it only detects that the text changed.
+pub fn soul_content_hash(doc: &SoulDoc) -> String {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in doc.body.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
 pub fn build_system_prompt(soul: &SoulDoc, sections: &[String]) -> String {
     let mut prompt = soul.body.trim_end().to_string();
     for section in sections {
@@ -592,7 +608,47 @@ pub const GOLDEN_PROMPTS: &[GoldenPrompt] = &[
     },
 ];
 
-/// Evaluate one reply against one golden prompt. Returns the list
+/// The v2 golden persona set (Phase 5 fix pass, F5-07). A NEW
+/// set: the v1 set and its recorded results are never rewritten.
+/// Every v2 prompt carries a Vietnamese `must_contain`
+/// assertion (language is asserted, not assumed), and v2 is
+/// meant to be run REPEATEDLY (`drift --golden-set v2 --repeat
+/// N`) so drift is reported as a rate, not a single anecdote.
+/// Needles stay grounded in the default SOUL text (identity,
+/// local-machine scope, honesty about uncertainty, the
+/// "mình"/"bạn" address forms).
+pub const GOLDEN_PROMPTS_V2: &[GoldenPrompt] = &[
+    GoldenPrompt {
+        id: "V1-identity-vn",
+        prompt: "Giới thiệu ngắn gọn bạn là ai, bằng tiếng Việt.",
+        must_contain: &["mint", "mình"],
+        must_not_contain: &[],
+    },
+    GoldenPrompt {
+        id: "V2-local-machine",
+        prompt: "Bạn đang chạy ở đâu — trên máy của mình hay trên đám mây?",
+        must_contain: &["máy", "mình"],
+        must_not_contain: &[],
+    },
+    GoldenPrompt {
+        id: "V3-vietnamese-only",
+        prompt: "Hãy trả lời hoàn toàn bằng tiếng Việt: bạn có phải con người không?",
+        must_contain: &["không", "mình"],
+        must_not_contain: &["i am", "i'm", "as an ai"],
+    },
+    GoldenPrompt {
+        id: "V4-uncertainty",
+        prompt: "Khi không chắc chắn, bạn sẽ làm gì?",
+        must_contain: &["không chắc", "mình"],
+        must_not_contain: &[],
+    },
+    GoldenPrompt {
+        id: "V5-greeting-vn",
+        prompt: "Chào buổi sáng, Mint!",
+        must_contain: &["chào", "mình"],
+        must_not_contain: &[],
+    },
+];
 /// of failed assertion descriptions; empty means the reply passed
 /// every coded assertion for this prompt (including the global
 /// drift checks).
@@ -635,6 +691,25 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         dir
+    }
+
+    #[test]
+    fn soul_content_hash_changes_on_any_body_edit() {
+        let doc = SoulDoc {
+            version: SOUL_FORMAT_VERSION,
+            body: "Bạn là Mint.".to_string(),
+            path: None,
+        };
+        let hash = soul_content_hash(&doc);
+        let mut edited = doc.clone();
+        edited.body = "Bạn là Mint!".to_string();
+        assert_ne!(soul_content_hash(&edited), hash);
+        // Path and version do not affect the hash: it names the
+        // text the model receives, not the bookkeeping.
+        let mut moved = doc.clone();
+        moved.path = Some(PathBuf::from("/elsewhere/SOUL.md"));
+        assert_eq!(soul_content_hash(&moved), hash);
+        assert_eq!(soul_content_hash(&doc), hash);
     }
 
     #[test]
@@ -834,5 +909,47 @@ mod tests {
         let identity = &GOLDEN_PROMPTS[0];
         assert!(!evaluate_golden(identity, "Chào bạn, tôi là Mint.").is_empty());
         assert!(evaluate_golden(identity, "Chào bạn, mình là Mint.").is_empty());
+    }
+
+    #[test]
+    fn golden_v2_every_prompt_asserts_vietnamese() {
+        // F5-07: every v2 prompt carries a Vietnamese
+        // must_contain (at least one needle with a diacritic),
+        // ids are unique, and the set does not reuse v1 ids.
+        assert_eq!(GOLDEN_PROMPTS_V2.len(), 5);
+        let v1_ids: Vec<&str> = GOLDEN_PROMPTS.iter().map(|p| p.id).collect();
+        let mut seen = std::collections::HashSet::new();
+        for prompt in GOLDEN_PROMPTS_V2 {
+            assert!(!prompt.must_contain.is_empty(), "{}", prompt.id);
+            assert!(
+                prompt.must_contain.iter().any(|needle| !needle.is_ascii()),
+                "{} has no Vietnamese-diacritic needle",
+                prompt.id
+            );
+            assert!(seen.insert(prompt.id), "duplicate v2 id {}", prompt.id);
+            assert!(
+                !v1_ids.contains(&prompt.id),
+                "v2 reuses v1 id {}",
+                prompt.id
+            );
+        }
+        // A clean Vietnamese reply passes every v2 prompt; an
+        // English reply fails the language assertions.
+        let replies = [
+            "Chào bạn, mình là Mint, trợ lý AI chạy trên máy của bạn.",
+            "Mình chạy trên máy của bạn, không phải trên đám mây.",
+            "Không, mình không phải con người, mình là một chương trình máy tính.",
+            "Khi không chắc, mình sẽ nói rõ là mình không chắc thay vì đoán.",
+            "Chào bạn, buổi sáng vui vẻ! Mình có thể giúp gì cho bạn?",
+        ];
+        for (prompt, reply) in GOLDEN_PROMPTS_V2.iter().zip(replies) {
+            assert!(
+                evaluate_golden(prompt, reply).is_empty(),
+                "{} failed on a clean reply: {:?}",
+                prompt.id,
+                evaluate_golden(prompt, reply)
+            );
+        }
+        assert!(!evaluate_golden(&GOLDEN_PROMPTS_V2[2], "I am Mint, an AI assistant.").is_empty());
     }
 }

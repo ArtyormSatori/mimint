@@ -290,6 +290,12 @@ fn run() -> Result<(), MimintError> {
     let soul_store = SoulStore::new(&data_dir);
     let soul_doc = soul_store.load_or_create(&profile.soul_file)?;
     let greeting = soul_doc.greeting().to_string();
+    // The SOUL file path shown in Settings (F5-11): the real
+    // path the document was loaded from, when known.
+    let soul_path = soul_doc
+        .path
+        .clone()
+        .unwrap_or_else(|| data_dir.join(&profile.soul_file));
     let skill_store = SkillStore::new(data_dir.join("skills"));
     skill_store.install_builtins()?;
     let experience = Arc::new(ExperienceStore::open(data_dir.join("experience.db"))?);
@@ -313,6 +319,7 @@ fn run() -> Result<(), MimintError> {
     // Capture the warnings before `resolved.profiles` moves into
     // the app options below.
     let profile_warnings = resolved.profiles.warnings.clone();
+    let fallback_active = resolved.profiles.fallback_active;
     let deps = WorkerDeps {
         initial_providers,
         retry: resolved.retry,
@@ -360,6 +367,8 @@ fn run() -> Result<(), MimintError> {
         active_profile: profile.name,
         profile_warnings,
         finetune,
+        fallback_active,
+        soul_path,
     };
     let app = MimintApp::new(worker, approval_rx, options);
     let pixels_per_point = env::var("MIMINT_UI_PIXELS_PER_POINT")

@@ -33,7 +33,7 @@ use mimint_core::{
     load_eval_tasks, probe_finetune, validate_skill, AuditLog, BackendKind, BackendSpec, Brain,
     CostCap, EgressPolicy, EvolveConfig, ExperienceStore, FallbackChain, MimintError, Notebook,
     ResolvedConfig, SkillDef, SkillStatus, SkillStore, SoulStore, ValidationApprover,
-    DEFAULT_TIMEOUT_SECS, GOLDEN_PROMPTS,
+    DEFAULT_TIMEOUT_SECS, GOLDEN_PROMPTS, GOLDEN_PROMPTS_V2,
 };
 use serde_json::{json, Value};
 use std::env;
@@ -41,7 +41,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const USAGE: &str = "mimint-eval: Phase 5 evaluation harness.\n\nUsage:\n  mimint-eval <command> [options]\n\nCommands:\n  eval --tasks FILE [--prompt-file FILE] [--notebook PATH] [--report FILE] [--no-record]\n      Run tasks (TOML [[task]] tables with binary checkers) through the\n      model and report pass/fail per task. Tasks share one fresh scratch\n      notebook: use distinct note needles per task. Records checked turns\n      into the experience store unless --no-record is given.\n  evolve --skill NAME --tasks FILE [--run-dir DIR] [--report FILE] [--apply-winner]\n      S4: evaluate skill variants on a held-out task set, report scores,\n      and name the winner (strictly beats base) and eliminated variants.\n      Each (variant, task) pair runs on a fresh notebook. Read-only by\n      default; --apply-winner saves the winner's content as a new draft\n      version (validation is still required before promotion).\n  drift [--soul-file NAME] [--report FILE]\n      Run the golden identity prompts against the SOUL persona and report\n      drift assertions. Never modifies SOUL (loads it read-only).\n  finetune\n      Print the fine-tune hardware gate status and exit.\n  skill create --name NAME --description TEXT --author TEXT (--content TEXT | --content-file FILE) --tasks-file FILE [--triggers a,b]\n      Create a skill as a draft. Never promotes: run `skill validate` next.\n  skill validate NAME [--notebook PATH]\n      Validate a skill against its own tasks (real model turns). All pass\n      -> promoted; any fail -> quarantined.\n  skill promote NAME\n      Promote only when the latest validation run passed every task for\n      the skill's current content. No override around the gate.\n  skill demote NAME\n      Demote a skill back to draft.\n  skill list\n      List all skills with status, version, and last validation run.\n  skill import PATH\n      Import a skill TOML file. Always lands as a draft with no history.\n\nShared options (model commands):\n  --config PATH      Config file (default: $XDG_CONFIG_HOME/mimint/config.toml or ~/.config/mimint/config.toml)\n  --data-dir PATH    User data directory (default: $XDG_DATA_HOME/mimint or ~/.local/share/mimint)\n  --audit PATH       Audit JSONL path (default: <data-dir>/eval-audit.jsonl)\n  --backend NAME     One backend from the config file\n  --profile NAME     Named profile (unknown names fall back to the default with a warning)\n  --base-url URL     Ad-hoc OpenAI-compatible base URL, or env MIMINT_BASE_URL\n  --model MODEL      Ad-hoc model name, or env MIMINT_MODEL\n  --privacy-mode on|off  Privacy Mode (default: profile, else on)\n  --max-steps N      Max brain steps per turn (default: 5)\n  --timeout SECONDS  Per-request timeout, overriding backend timeouts\n  --help             Show this help\n";
+const USAGE: &str = "mimint-eval: Phase 5 evaluation harness.\n\nUsage:\n  mimint-eval <command> [options]\n\nCommands:\n  eval --tasks FILE [--prompt-file FILE] [--notebook PATH] [--report FILE] [--no-record]\n      Run tasks (TOML [[task]] tables with binary checkers) through the\n      model and report pass/fail per task. Tasks share one fresh scratch\n      notebook: use distinct note needles per task. Records checked turns\n      into the experience store unless --no-record is given.\n  evolve --skill NAME --tasks FILE [--run-dir DIR] [--report FILE] [--apply-winner]\n      S4: evaluate skill variants on a held-out task set, report scores,\n      and name the winner (strictly beats base) and eliminated variants.\n      Each (variant, task) pair runs on a fresh notebook. Read-only by\n      default; --apply-winner saves the winner's content as a new draft\n      version (validation is still required before promotion).\n  drift [--soul-file NAME] [--report FILE] [--golden-set v1|v2] [--repeat N]\n      Run the golden identity prompts against the SOUL persona and report\n      drift assertions. Never modifies SOUL (loads it read-only). v2 is\n      the new set with Vietnamese language assertions on every prompt;\n      --repeat N runs each prompt N times and reports per-prompt drift rates.\n  finetune\n      Print the fine-tune hardware gate status and exit.\n  skill create --name NAME --description TEXT --author TEXT (--content TEXT | --content-file FILE) --tasks-file FILE [--triggers a,b]\n      Create a skill as a draft. Never promotes: run `skill validate` next.\n  skill validate NAME [--notebook PATH]\n      Validate a skill against its own tasks (real model turns). All pass\n      -> promoted; any fail -> quarantined. A negative probe runs first:\n      a checker that passes on empty evidence quarantines the skill with\n      zero model calls. An imported skill that passes stays a draft\n      until its import is approved (see approve-import).\n  skill promote NAME\n      Promote only when the latest validation run passed every task for\n      the skill's current content. No override around the gate.\n  skill approve-import NAME\n      Approve an imported skill (audited). The user step an imported\n      skill needs before promotion; validation is still required.\n  skill demote NAME\n      Demote a skill back to draft.\n  skill list\n      List all skills with status, version, and last validation run.\n  skill import PATH\n      Import a skill TOML file. Always lands as a draft with no history.\n\nShared options (model commands):\n  --config PATH      Config file (default: $XDG_CONFIG_HOME/mimint/config.toml or ~/.config/mimint/config.toml)\n  --data-dir PATH    User data directory (default: $XDG_DATA_HOME/mimint or ~/.local/share/mimint)\n  --audit PATH       Audit JSONL path (default: <data-dir>/eval-audit.jsonl)\n  --backend NAME     One backend from the config file\n  --profile NAME     Named profile (unknown names fall back to the default with a warning)\n  --base-url URL     Ad-hoc OpenAI-compatible base URL, or env MIMINT_BASE_URL\n  --model MODEL      Ad-hoc model name, or env MIMINT_MODEL\n  --privacy-mode on|off  Privacy Mode (default: profile, else on)\n  --max-steps N      Max brain steps per turn (default: 5)\n  --timeout SECONDS  Per-request timeout, overriding backend timeouts\n  --time-budget-secs SECONDS\n      Total time budget for eval/evolve/drift/validate: when it expires\n      before a task starts, the run stops with a partial report (evolve:\n      BudgetExhausted verdict; validate: error, no run recorded).\n      Ctrl-C still kills the process; completed tasks stay in the audit log.\n  --help             Show this help\n";
 
 /// All flags any subcommand accepts, parsed once.
 #[derive(Default)]
@@ -56,6 +56,7 @@ struct Opts {
     privacy_mode: Option<bool>,
     max_steps: usize,
     timeout_secs: Option<u64>,
+    time_budget_secs: Option<u64>,
     tasks: Option<PathBuf>,
     prompt_file: Option<PathBuf>,
     report: Option<PathBuf>,
@@ -72,10 +73,12 @@ struct Opts {
     content_file: Option<PathBuf>,
     tasks_file: Option<PathBuf>,
     triggers: Option<String>,
+    golden_set: Option<String>,
+    repeat: Option<usize>,
     positional: Vec<String>,
 }
 
-const VALUE_FLAGS: [&str; 24] = [
+const VALUE_FLAGS: [&str; 27] = [
     "--config",
     "--data-dir",
     "--audit",
@@ -86,6 +89,7 @@ const VALUE_FLAGS: [&str; 24] = [
     "--privacy-mode",
     "--max-steps",
     "--timeout",
+    "--time-budget-secs",
     "--tasks",
     "--prompt-file",
     "--report",
@@ -100,6 +104,8 @@ const VALUE_FLAGS: [&str; 24] = [
     "--content-file",
     "--tasks-file",
     "--triggers",
+    "--golden-set",
+    "--repeat",
 ];
 
 fn wants_help(argv: &[String]) -> bool {
@@ -208,6 +214,17 @@ fn parse_opts(argv: &[String]) -> Result<Opts, MimintError> {
                 }
                 opts.timeout_secs = Some(parsed);
             }
+            "--time-budget-secs" => {
+                let parsed: u64 = value.parse().map_err(|_| {
+                    MimintError::Config(format!("invalid --time-budget-secs: {value}"))
+                })?;
+                if parsed == 0 {
+                    return Err(MimintError::Config(
+                        "--time-budget-secs must be at least 1 second".to_string(),
+                    ));
+                }
+                opts.time_budget_secs = Some(parsed);
+            }
             "--tasks" => opts.tasks = Some(PathBuf::from(value)),
             "--prompt-file" => opts.prompt_file = Some(PathBuf::from(value)),
             "--report" => opts.report = Some(PathBuf::from(value)),
@@ -222,6 +239,25 @@ fn parse_opts(argv: &[String]) -> Result<Opts, MimintError> {
             "--content-file" => opts.content_file = Some(PathBuf::from(value)),
             "--tasks-file" => opts.tasks_file = Some(PathBuf::from(value)),
             "--triggers" => opts.triggers = Some(value),
+            "--golden-set" => {
+                if value != "v1" && value != "v2" {
+                    return Err(MimintError::Config(format!(
+                        "invalid --golden-set: {value} (expected v1 or v2)"
+                    )));
+                }
+                opts.golden_set = Some(value);
+            }
+            "--repeat" => {
+                let parsed: usize = value
+                    .parse()
+                    .map_err(|_| MimintError::Config(format!("invalid --repeat: {value}")))?;
+                if parsed == 0 {
+                    return Err(MimintError::Config(
+                        "--repeat must be at least 1".to_string(),
+                    ));
+                }
+                opts.repeat = Some(parsed);
+            }
             _ => return Err(MimintError::Config(format!("unknown argument: {flag}"))),
         }
         index += 1;
@@ -238,6 +274,10 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+fn time_budget(opts: &Opts) -> Option<Duration> {
+    opts.time_budget_secs.map(Duration::from_secs)
 }
 
 fn data_dir(opts: &Opts) -> PathBuf {
@@ -426,9 +466,22 @@ async fn cmd_eval(opts: &Opts) -> Result<bool, MimintError> {
     };
     let turn_prefix = format!("eval-{}-{}", std::process::id(), now_ms());
     let started = Instant::now();
+    let deadline = time_budget(opts).map(|budget| started + budget);
     let mut results = Vec::new();
     let mut passed = 0usize;
+    let mut budget_exhausted = false;
     for task in &tasks {
+        if let Some(deadline) = deadline {
+            if Instant::now() >= deadline {
+                budget_exhausted = true;
+                eprintln!(
+                    "Time budget exhausted after {}/{} task(s); stopping with a partial report.",
+                    results.len(),
+                    tasks.len()
+                );
+                break;
+            }
+        }
         let turn_id = format!("{turn_prefix}-{}", task.id);
         let run = mimint_core::run_one_task_detailed(
             &setup.chain,
@@ -494,12 +547,14 @@ async fn cmd_eval(opts: &Opts) -> Result<bool, MimintError> {
         "privacy_enabled": setup.privacy_enabled,
         "passed": passed,
         "total": tasks.len(),
+        "completed": results.len(),
+        "budget_exhausted": budget_exhausted,
         "elapsed_ms": started.elapsed().as_millis() as u64,
         "results": results,
     });
     eprintln!("Eval: {passed}/{} passed", tasks.len());
     write_report(&report, opts.report.as_ref())?;
-    Ok(passed == tasks.len())
+    Ok(passed == tasks.len() && !budget_exhausted)
 }
 
 /// `evolve`: S4 variant competition on a held-out set.
@@ -536,6 +591,7 @@ async fn cmd_evolve(opts: &Opts) -> Result<(), MimintError> {
     let config = EvolveConfig {
         turn_prefix: format!("evolve-{}-{}", std::process::id(), now_ms()),
         max_steps: opts.max_steps,
+        time_budget: time_budget(opts),
     };
     let started = Instant::now();
     let report = evolve_skill(
@@ -563,6 +619,8 @@ async fn cmd_evolve(opts: &Opts) -> Result<(), MimintError> {
             "variant": score.variant_id,
             "passed": score.passed,
             "total": score.total,
+            "total_steps": score.total_steps,
+            "total_elapsed_ms": score.total_elapsed_ms,
             "results": score.results.iter().map(|r| json!({
                 "id": r.id,
                 "passed": r.passed,
@@ -571,6 +629,9 @@ async fn cmd_evolve(opts: &Opts) -> Result<(), MimintError> {
         })).collect::<Vec<_>>(),
         "winner": report.winner,
         "eliminated": report.eliminated,
+        "verdict": report.verdict,
+        "pairs_completed": report.pairs_completed,
+        "pairs_planned": report.pairs_planned,
         "decision": report.decision,
         "elapsed_ms": started.elapsed().as_millis() as u64,
     });
@@ -615,38 +676,62 @@ async fn cmd_drift(opts: &Opts) -> Result<bool, MimintError> {
     let system_prompt = build_system_prompt(&soul, &[]);
     let turn_prefix = format!("drift-{}-{}", std::process::id(), now_ms());
     let started = Instant::now();
+    let deadline = time_budget(opts).map(|budget| started + budget);
+    // Golden set selection (F5-07): v1 is the default (old
+    // behavior, old results untouched); v2 adds Vietnamese
+    // language assertions and is meant to run repeated.
+    let golden_set = opts.golden_set.as_deref().unwrap_or("v1");
+    let prompts = if golden_set == "v2" {
+        GOLDEN_PROMPTS_V2
+    } else {
+        GOLDEN_PROMPTS
+    };
+    let repeat = opts.repeat.unwrap_or(1);
     let mut entries = Vec::new();
     let mut total_issues = 0usize;
-    for golden in GOLDEN_PROMPTS {
-        let turn_id = format!("{turn_prefix}-{}", golden.id);
-        let registry = mimint_core::default_registry(Arc::clone(&notebook));
-        let approver = ValidationApprover;
-        let mut brain = Brain::new(
-            &setup.chain,
-            &registry,
-            Some(&approver),
-            &audit,
-            Arc::clone(&notebook),
-            turn_id.clone(),
-            opts.max_steps,
-        )?;
-        brain.set_system_prompt(system_prompt.clone());
-        brain.set_profile(setup.profile_name.clone());
-        let outcome = brain.run(golden.prompt).await;
-        let (reply, issues, findings) = match &outcome {
-            Ok(outcome) => (
-                outcome.text.clone(),
-                evaluate_golden(golden, &outcome.text),
-                drift_findings(&outcome.text),
-            ),
-            Err(err) => (
-                String::new(),
-                vec![format!("turn failed: {err}")],
-                Vec::new(),
-            ),
-        };
-        total_issues += issues.len();
-        audit.log(
+    let mut budget_exhausted = false;
+    'repeats: for rep in 1..=repeat {
+        for golden in prompts {
+            if let Some(deadline) = deadline {
+                if Instant::now() >= deadline {
+                    budget_exhausted = true;
+                    eprintln!(
+                    "Time budget exhausted after {}/{} golden run(s); stopping with a partial report.",
+                    entries.len(),
+                    prompts.len() * repeat
+                );
+                    break 'repeats;
+                }
+            }
+            let turn_id = format!("{turn_prefix}-{}-r{rep}", golden.id);
+            let registry = mimint_core::default_registry(Arc::clone(&notebook));
+            let approver = ValidationApprover;
+            let mut brain = Brain::new(
+                &setup.chain,
+                &registry,
+                Some(&approver),
+                &audit,
+                Arc::clone(&notebook),
+                turn_id.clone(),
+                opts.max_steps,
+            )?;
+            brain.set_system_prompt(system_prompt.clone());
+            brain.set_profile(setup.profile_name.clone());
+            let outcome = brain.run(golden.prompt).await;
+            let (reply, issues, findings) = match &outcome {
+                Ok(outcome) => (
+                    outcome.text.clone(),
+                    evaluate_golden(golden, &outcome.text),
+                    drift_findings(&outcome.text),
+                ),
+                Err(err) => (
+                    String::new(),
+                    vec![format!("turn failed: {err}")],
+                    Vec::new(),
+                ),
+            };
+            total_issues += issues.len();
+            audit.log(
             &turn_id,
             "drift_eval",
             None,
@@ -657,43 +742,79 @@ async fn cmd_drift(opts: &Opts) -> Result<bool, MimintError> {
                 "findings": findings.iter().map(|f| format!("{:?}", f.kind)).collect::<Vec<_>>(),
             }),
         )?;
-        eprintln!(
-            "  [{}] {}: {} issue(s)",
-            if issues.is_empty() { "CLEAN" } else { "DRIFT" },
-            golden.id,
-            issues.len()
-        );
-        for issue in &issues {
-            eprintln!("      - {issue}");
+            eprintln!(
+                "  [{}] {}: {} issue(s)",
+                if issues.is_empty() { "CLEAN" } else { "DRIFT" },
+                golden.id,
+                issues.len()
+            );
+            for issue in &issues {
+                eprintln!("      - {issue}");
+            }
+            entries.push(json!({
+                "id": golden.id,
+                "repeat": rep,
+                "prompt": golden.prompt,
+                "issues": issues,
+                "drift_findings": findings.iter().map(|f| json!({
+                    "kind": format!("{:?}", f.kind),
+                    "matched": f.matched,
+                })).collect::<Vec<_>>(),
+                "reply_excerpt": reply.chars().take(500).collect::<String>(),
+            }));
         }
-        entries.push(json!({
-            "id": golden.id,
-            "prompt": golden.prompt,
-            "issues": issues,
-            "drift_findings": findings.iter().map(|f| json!({
-                "kind": format!("{:?}", f.kind),
-                "matched": f.matched,
-            })).collect::<Vec<_>>(),
-            "reply_excerpt": reply.chars().take(500).collect::<String>(),
-        }));
     }
+    // Per-prompt pass/drift rates across repeats (F5-07): a
+    // single run is an anecdote; the rate is the measurement.
+    let per_prompt: Vec<Value> = prompts
+        .iter()
+        .map(|golden| {
+            let runs: Vec<&Value> = entries
+                .iter()
+                .filter(|entry| entry["id"] == golden.id)
+                .collect();
+            let clean = runs
+                .iter()
+                .filter(|entry| {
+                    entry["issues"].as_array().map(Vec::is_empty).unwrap_or(false)
+                })
+                .count();
+            json!({
+                "id": golden.id,
+                "runs": runs.len(),
+                "clean": clean,
+                "drift": runs.len() - clean,
+                "drift_rate": if runs.is_empty() { 0.0 } else { (runs.len() - clean) as f64 / runs.len() as f64 },
+            })
+        })
+        .collect();
     let report = json!({
         "command": "drift",
+        "golden_set": golden_set,
+        "repeat": repeat,
         "soul_file": soul_file,
         "providers": setup.names,
         "profile": setup.profile_name,
         "prompts": entries,
+        "per_prompt": per_prompt,
         "total_issues": total_issues,
-        "verdict": if total_issues == 0 { "clean" } else { "drift detected" },
+        "verdict": if budget_exhausted {
+            "budget exhausted"
+        } else if total_issues == 0 {
+            "clean"
+        } else {
+            "drift detected"
+        },
+        "budget_exhausted": budget_exhausted,
         "elapsed_ms": started.elapsed().as_millis() as u64,
     });
     eprintln!(
-        "Drift: {} issue(s) across {} golden prompts",
+        "Drift: {} issue(s) across {} golden run(s) (set {golden_set}, {repeat} repeat(s))",
         total_issues,
-        GOLDEN_PROMPTS.len()
+        prompts.len() * repeat
     );
     write_report(&report, opts.report.as_ref())?;
-    Ok(total_issues == 0)
+    Ok(total_issues == 0 && !budget_exhausted)
 }
 
 /// `finetune`: hardware gate status.
@@ -756,6 +877,8 @@ fn cmd_skill_create(opts: &Opts) -> Result<(), MimintError> {
         validation_tasks: tasks,
         status: SkillStatus::Draft,
         validation_history: Vec::new(),
+        imported: false,
+        import_approved: false,
     };
     let task_count = def.validation_tasks.len();
     skill_store(opts).create_draft(def)?;
@@ -787,6 +910,7 @@ async fn cmd_skill_validate(opts: &Opts) -> Result<bool, MimintError> {
         &audit,
         &turn_prefix,
         opts.max_steps,
+        time_budget(opts),
     )
     .await?;
     let run = def
@@ -802,11 +926,31 @@ async fn cmd_skill_validate(opts: &Opts) -> Result<bool, MimintError> {
         );
     }
     let promoted = def.status == SkillStatus::Promoted;
+    let awaiting_approval = def.imported && !def.import_approved && run.passed == run.total;
+    if def.status == SkillStatus::Quarantined {
+        // F5-18: evidence produced with a quarantined skill must
+        // stop influencing turns. The experience store may not
+        // exist yet; opening it only to quarantine is harmless
+        // (an empty store quarantines zero rows).
+        let experience = ExperienceStore::open(data_dir(opts).join("experience.db"))?;
+        let quarantined = experience.quarantine_trajectories_for_skill(&def.name)?;
+        if quarantined > 0 {
+            eprintln!(
+                "Quarantined {quarantined} experience trajector(ies) that used skill '{name}'; they will no longer be retrieved."
+            );
+        }
+    }
     eprintln!(
         "Skill '{name}': {}/{} passed -> {}",
         run.passed,
         run.total,
-        if promoted { "PROMOTED" } else { "QUARANTINED" }
+        if promoted {
+            "PROMOTED"
+        } else if awaiting_approval {
+            "DRAFT — awaiting import approval (run `skill approve-import {name}` after reviewing it)"
+        } else {
+            "QUARANTINED"
+        }
     );
     Ok(promoted)
 }
@@ -822,6 +966,20 @@ fn cmd_skill_promote(opts: &Opts) -> Result<(), MimintError> {
         "Skill '{}' promoted (v{}, content hash {}).",
         def.name,
         def.version,
+        def.content_hash()
+    );
+    Ok(())
+}
+
+fn cmd_skill_approve_import(opts: &Opts) -> Result<(), MimintError> {
+    let name = opts.positional.first().cloned().ok_or_else(|| {
+        MimintError::Config("skill approve-import requires a skill NAME".to_string())
+    })?;
+    let audit = AuditLog::open(audit_path(opts))?;
+    let def = mimint_core::approve_import(&skill_store(opts), &name, &audit)?;
+    println!(
+        "Skill '{}' import approved (content hash {}). It still needs a passing validation run for its current content before promotion.",
+        def.name,
         def.content_hash()
     );
     Ok(())
@@ -861,11 +1019,8 @@ fn cmd_skill_list(opts: &Opts) -> Result<(), MimintError> {
             last.map(|text| format!("  {text}")).unwrap_or_default()
         );
     }
-    let promoted = defs
-        .iter()
-        .filter(|def| def.status == SkillStatus::Promoted)
-        .count();
-    println!("{promoted}/{} promoted (catalog).", defs.len());
+    let usable = defs.iter().filter(|def| def.is_usable()).count();
+    println!("{usable}/{} usable (catalog: promoted + passing run for current content + import approved).", defs.len());
     Ok(())
 }
 
@@ -875,11 +1030,24 @@ fn cmd_skill_import(opts: &Opts) -> Result<(), MimintError> {
         .first()
         .cloned()
         .ok_or_else(|| MimintError::Config("skill import requires a file PATH".to_string()))?;
-    let def = skill_store(opts).import_file(&PathBuf::from(path))?;
+    let store = skill_store(opts);
+    let def = store.import_file(&PathBuf::from(path))?;
     println!(
-        "Imported '{}' as a draft (v{}). Run `mimint-eval skill validate {}` to validate it.",
+        "Imported '{}' as a draft (v{}). It is marked imported: after validation passes, run `mimint-eval skill approve-import {}` to approve it, then `skill promote`.",
         def.name, def.version, def.name
     );
+    // Trigger conflicts (F5-14): warn, never override. Retrieval
+    // order (score desc, name asc) decides; both skills stay
+    // eligible.
+    let all = store.load_all()?;
+    for (trigger, names) in mimint_core::find_trigger_conflicts(&all) {
+        if names.iter().any(|name| name == &def.name) {
+            eprintln!(
+                "warning: trigger {trigger:?} is shared by skills: {}; retrieval order is score, then name — no skill overrides another.",
+                names.join(", ")
+            );
+        }
+    }
     Ok(())
 }
 
@@ -905,7 +1073,7 @@ async fn run() -> Result<i32, MimintError> {
         "skill" => {
             let action = opts.positional.first().cloned().ok_or_else(|| {
                 MimintError::Config(
-                    "skill requires an action: create | validate | promote | demote | list | import"
+                    "skill requires an action: create | validate | promote | approve-import | demote | list | import"
                         .to_string(),
                 )
             })?;
@@ -930,6 +1098,11 @@ async fn run() -> Result<i32, MimintError> {
                     cmd_skill_promote(&promote_opts)?;
                     Ok(0)
                 }
+                "approve-import" => {
+                    let approve_opts = clone_opts_for_action(&opts);
+                    cmd_skill_approve_import(&approve_opts)?;
+                    Ok(0)
+                }
                 "demote" => {
                     let demote_opts = clone_opts_for_action(&opts);
                     cmd_skill_demote(&demote_opts)?;
@@ -945,7 +1118,7 @@ async fn run() -> Result<i32, MimintError> {
                     Ok(0)
                 }
                 _ => Err(MimintError::Config(format!(
-                    "unknown skill action: {action} (expected create | validate | promote | demote | list | import)"
+                    "unknown skill action: {action} (expected create | validate | promote | approve-import | demote | list | import)"
                 ))),
             }
         }
@@ -969,6 +1142,7 @@ fn clone_opts_for_action(opts: &Opts) -> Opts {
         privacy_mode: opts.privacy_mode,
         max_steps: opts.max_steps,
         timeout_secs: opts.timeout_secs,
+        time_budget_secs: opts.time_budget_secs,
         tasks: opts.tasks.clone(),
         prompt_file: opts.prompt_file.clone(),
         report: opts.report.clone(),
@@ -985,6 +1159,8 @@ fn clone_opts_for_action(opts: &Opts) -> Opts {
         content_file: opts.content_file.clone(),
         tasks_file: opts.tasks_file.clone(),
         triggers: opts.triggers.clone(),
+        golden_set: opts.golden_set.clone(),
+        repeat: opts.repeat,
         positional: opts.positional[1..].to_vec(),
     }
 }

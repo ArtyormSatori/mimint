@@ -33,9 +33,10 @@ use mimint_control::{
 use mimint_core::audit::now_ms;
 use mimint_core::{
     build_system_prompt, default_greeting, default_registry, default_soul_text, default_vault,
-    soul_may_be_sent, url_is_loopback, AuditLog, BackendSpec, Brain, BrainProgress, CancelToken,
-    CostCap, EgressPolicy, ExperienceStore, FallbackChain, Notebook, Profile, ProfileSet, Provider,
-    Registry, RetryPolicy, SkillDef, SkillStore, SoulDoc, SoulStore, SOUL_FORMAT_VERSION,
+    find_trigger_conflicts, soul_content_hash, soul_may_be_sent, url_is_loopback, AuditLog,
+    BackendSpec, Brain, BrainProgress, CancelToken, CostCap, EgressPolicy, ExperienceStore,
+    FallbackChain, Notebook, Profile, ProfileSet, Provider, Registry, RetryPolicy, SkillDef,
+    SkillStore, SoulDoc, SoulStore, SOUL_FORMAT_VERSION,
 };
 use serde_json::json;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -163,6 +164,14 @@ pub enum WorkerEvent {
     /// and the reason. The flag latches: only a restart clears
     /// the body stop.
     StopTripped { reason: String },
+    /// The active profile's SOUL file changed between two
+    /// rebuilds without going through the code path (the app
+    /// never writes SOUL): it was edited by hand or by another
+    /// program. The new text is already in use for the next
+    /// turn; the UI warns persistently. A profile switch is
+    /// NOT this event: switching legitimately loads a
+    /// different SOUL file.
+    SoulChangedExternally { profile: String, soul_file: String },
 }
 
 /// What a rebuild needs: the specs to build from and the retry
@@ -320,6 +329,11 @@ struct ProfileRuntime {
     /// Promoted skills, filtered by the profile's selection
     /// (`None` means all promoted skills).
     skills: Vec<SkillDef>,
+    /// FNV-1a hash of the loaded SOUL body, when SOUL came from
+    /// a store. `None` for the built-in default (no file) or a
+    /// failed load. The worker loop compares it across rebuilds
+    /// to detect hand edits (F5-11).
+    soul_hash: Option<String>,
 }
 
 /// Build the runtime for one profile against a built chain.
@@ -367,6 +381,14 @@ fn compute_runtime(
         },
         None => (fallback_doc(), default_greeting().to_string()),
     };
+    // The hash names the text the model receives. It is only
+    // meaningful when SOUL came from a file: the built-in
+    // default has no file to change behind our back.
+    let soul_hash = if soul_store.is_some() && doc.path.is_some() {
+        Some(soul_content_hash(&doc))
+    } else {
+        None
+    };
     let soul_prompt = if may_send {
         Some(build_system_prompt(&doc, &[]))
     } else {
@@ -405,6 +427,22 @@ fn compute_runtime(
         },
         None => Vec::new(),
     };
+    // Trigger conflicts (F5-14): identical triggers do not
+    // override each other — retrieval order decides — but the
+    // overlap is worth a warning in the audit log at load time.
+    for (trigger, names) in find_trigger_conflicts(&skills) {
+        let _ = audit.log(
+            "ui-profile",
+            "skill_trigger_conflict",
+            None,
+            Some("warning"),
+            json!({
+                "profile": profile.name,
+                "trigger": trigger,
+                "skills": names,
+            }),
+        );
+    }
     ProfileRuntime {
         profile: profile.clone(),
         privacy_on,
@@ -413,7 +451,48 @@ fn compute_runtime(
         may_send_user_data: may_send,
         greeting,
         skills,
+        soul_hash,
     }
+}
+
+/// Compare a freshly computed runtime's SOUL hash against the
+/// baseline (F5-11). A different hash for the SAME file means
+/// the file changed outside the code path — the app never
+/// writes SOUL — so the change is audited and the UI is told
+/// to warn persistently. A different file (profile switch) or
+/// a missing hash (built-in default / failed load) resets the
+/// baseline silently: neither is evidence of an external edit.
+fn check_soul_change(
+    baseline: &mut (String, Option<String>),
+    runtime: &ProfileRuntime,
+    audit: &AuditLog,
+    event_tx: &Sender<WorkerEvent>,
+) {
+    let same_file = baseline.0 == runtime.profile.soul_file;
+    if same_file {
+        if let (Some(old), Some(new)) = (&baseline.1, &runtime.soul_hash) {
+            if old != new {
+                let _ = audit.log(
+                    "ui-profile",
+                    "soul_changed_externally",
+                    None,
+                    Some("warning"),
+                    json!({
+                        "profile": runtime.profile.name,
+                        "soul_file": runtime.profile.soul_file,
+                        "old_hash": old,
+                        "new_hash": new,
+                    }),
+                );
+                let _ = event_tx.send(WorkerEvent::SoulChangedExternally {
+                    profile: runtime.profile.name.clone(),
+                    soul_file: runtime.profile.soul_file.clone(),
+                });
+            }
+        }
+    }
+    baseline.0 = runtime.profile.soul_file.clone();
+    baseline.1 = runtime.soul_hash.clone();
 }
 
 /// Spawn the worker thread. The initial chain state is reported as
@@ -595,6 +674,23 @@ fn worker_loop(
             }),
         );
     }
+    // Forced-safe fallback (F5-03): every [[profile]] table was
+    // dropped, so the app runs on the forced-safe profile. The
+    // record names the warnings that explain why.
+    if profiles.fallback_active {
+        let _ = audit.log(
+            "ui-profile",
+            "profile_fallback",
+            None,
+            Some("forced_safe"),
+            json!({
+                "profile": initial_profile.name,
+                "warnings": profiles.warnings,
+                "privacy_on": true,
+                "paid_locked": true,
+            }),
+        );
+    }
     let initial_profile = initial_profile.clone();
     let endpoints: Vec<&str> = chain
         .as_ref()
@@ -608,6 +704,14 @@ fn worker_loop(
         soul_store.as_ref(),
         skill_store.as_ref(),
         &audit,
+    );
+    // SOUL hash baseline (F5-11): the first load sets the
+    // reference; later rebuilds of the SAME file compare
+    // against it. A switch to another file resets the
+    // baseline without a warning (see `check_soul_change`).
+    let mut soul_baseline = (
+        initial_profile.soul_file.clone(),
+        profile_runtime.soul_hash.clone(),
     );
 
     while let Ok(request) = request_rx.recv() {
@@ -683,6 +787,7 @@ fn worker_loop(
                         skill_store.as_ref(),
                         &audit,
                     );
+                    check_soul_change(&mut soul_baseline, &profile_runtime, &audit, &event_tx);
                 }
                 if event_tx.send(event).is_err() {
                     break;
@@ -736,6 +841,7 @@ fn worker_loop(
                         skill_store.as_ref(),
                         &audit,
                     );
+                    check_soul_change(&mut soul_baseline, &profile_runtime, &audit, &event_tx);
                     let event = WorkerEvent::ProfileSwitched {
                         name: profile_runtime.profile.name.clone(),
                         greeting: profile_runtime.greeting.clone(),
@@ -811,13 +917,14 @@ fn run_one_turn(
     // Phase 5 profile wiring: the profile name tags every audit
     // record; the SOUL prompt (when egress allows) replaces the
     // built-in prompt; promoted skills and experience retrieval
-    // follow the same egress rule as SOUL.
+    // follow the same egress rule as SOUL (F5-01): when user data
+    // may not be sent, NO skill content is injected either.
     brain.set_profile(ctx.runtime.profile.name.clone());
     if let Some(prompt) = &ctx.runtime.soul_prompt {
         brain.set_system_prompt(prompt.clone());
     }
-    brain.set_skills(ctx.runtime.skills.clone());
     if ctx.runtime.may_send_user_data {
+        brain.set_skills(ctx.runtime.skills.clone());
         if let Some(store) = ctx.experience {
             brain.set_experience_store(Arc::clone(store));
         }
@@ -1187,6 +1294,182 @@ mod tests {
             WorkerEvent::TurnDone { text, .. } => assert_eq!(text, "never"),
             other => panic!("expected TurnDone after resume, got: {other:?}"),
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Provider that records the messages it receives and reports
+    /// a configurable endpoint URL, so the egress-gate test can
+    /// place it on either side of the loopback boundary without
+    /// any real HTTP.
+    struct CaptureProvider {
+        endpoint: String,
+        seen: Arc<std::sync::Mutex<Vec<ChatMessage>>>,
+    }
+
+    impl Provider for CaptureProvider {
+        fn name(&self) -> &str {
+            "capture"
+        }
+
+        fn model(&self) -> &str {
+            "capture-model"
+        }
+
+        fn endpoint_url(&self) -> &str {
+            &self.endpoint
+        }
+
+        fn is_paid(&self) -> bool {
+            false
+        }
+
+        fn chat<'a>(
+            &'a self,
+            _ctx: &'a CallContext<'a>,
+            messages: &'a [ChatMessage],
+            _tools: &'a [serde_json::Value],
+        ) -> BoxFuture<'a, Result<ChatMessage, MimintError>> {
+            *self.seen.lock().unwrap() = messages.to_vec();
+            Box::pin(async move {
+                Ok(ChatMessage {
+                    role: "assistant".to_string(),
+                    content: Some("done".to_string()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                })
+            })
+        }
+    }
+
+    /// Spawn a worker whose data dir holds a SOUL file and one
+    /// promoted skill with marker content, behind a capturing
+    /// provider at `endpoint`. Privacy Mode is ON.
+    fn spawn_capture(
+        endpoint: &str,
+    ) -> (
+        WorkerHandle,
+        Arc<std::sync::Mutex<Vec<ChatMessage>>>,
+        std::path::PathBuf,
+    ) {
+        use mimint_core::{
+            Checker, SkillDef, SkillStatus, SkillStore, ValidationRun, ValidationTask,
+        };
+        let (db_path, audit_path) = temp_paths("capture");
+        let dir = db_path.parent().unwrap().to_path_buf();
+        std::fs::write(dir.join("SOUL.md"), "SOUL-BODY-MARKER chào bạn\n").unwrap();
+        let store = SkillStore::new(dir.join("skills"));
+        let mut def = SkillDef {
+            name: "ghi-chu".to_string(),
+            description: "Lưu ghi chú.".to_string(),
+            triggers: vec!["lưu ghi chú".to_string()],
+            content: "SKILL-CONTENT-MARKER: lưu ghi chú ngay.".to_string(),
+            version: 1,
+            author: "test".to_string(),
+            validation_tasks: vec![ValidationTask {
+                id: "t1".to_string(),
+                prompt: "Lưu ghi chú: x".to_string(),
+                checker: Checker::ResponseNonEmpty,
+            }],
+            status: SkillStatus::Promoted,
+            validation_history: Vec::new(),
+            imported: false,
+            import_approved: false,
+        };
+        // A genuinely usable promotion: a passing run bound to
+        // the current content hash (the F5-06 predicate requires
+        // it, so the fixture carries it from the start).
+        let hash = def.content_hash();
+        def.validation_history = vec![ValidationRun {
+            ts_ms: now_ms(),
+            content_hash: hash,
+            passed: 1,
+            total: 1,
+            results: Vec::new(),
+        }];
+        store.save(&def).unwrap();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = CaptureProvider {
+            endpoint: endpoint.to_string(),
+            seen: Arc::clone(&seen),
+        };
+        let (approval_tx, _approval_rx) = approval_channel();
+        let profiles = ProfileSet::resolve(&[], None, &[], &[], true, CostCap { cap_usd: None });
+        let active_profile = profiles.default_profile().name.clone();
+        let deps = WorkerDeps {
+            initial_providers: vec![Box::new(provider)],
+            retry: RetryPolicy::default(),
+            rebuild: None,
+            notebook: Arc::new(Notebook::open(&db_path).unwrap()),
+            audit: Arc::new(AuditLog::open(&audit_path).unwrap()),
+            max_steps: 5,
+            approval_tx,
+            stop_slot: TokenSlot::new(),
+            turn_slot: TokenSlot::new(),
+            repaint: RepaintSignal::new(),
+            approval_timeout: Duration::from_secs(60),
+            max_observation_age: Duration::from_secs(300),
+            body: None,
+            approval_pending: None,
+            privacy_on: true,
+            profiles,
+            active_profile,
+            soul_store: Some(SoulStore::new(dir.clone())),
+            skill_store: Some(SkillStore::new(dir.join("skills"))),
+            experience: None,
+        };
+        (spawn_worker(deps), seen, dir)
+    }
+
+    fn joined_messages(seen: &Arc<std::sync::Mutex<Vec<ChatMessage>>>) -> String {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .filter_map(|message| message.content.clone())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn skills_follow_the_soul_egress_gate() {
+        // Non-loopback endpoint + Privacy ON: neither SOUL nor
+        // skill content may reach the provider (F5-01).
+        let (handle, seen, dir) = spawn_capture("https://example.com/v1");
+        let _ = wait_event(&handle);
+        handle.run_turn("lưu ghi chú mua sữa".to_string());
+        assert!(matches!(
+            wait_terminal(&handle),
+            WorkerEvent::TurnDone { .. }
+        ));
+        let joined = joined_messages(&seen);
+        assert!(
+            !joined.contains("SKILL-CONTENT-MARKER"),
+            "skill content must be withheld: {joined}"
+        );
+        assert!(
+            !joined.contains("SOUL-BODY-MARKER"),
+            "SOUL must be withheld: {joined}"
+        );
+        drop(handle);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Loopback endpoint + Privacy ON: both reach the provider.
+        let (handle, seen, dir) = spawn_capture("http://127.0.0.1:9/v1");
+        let _ = wait_event(&handle);
+        handle.run_turn("lưu ghi chú mua sữa".to_string());
+        assert!(matches!(
+            wait_terminal(&handle),
+            WorkerEvent::TurnDone { .. }
+        ));
+        let joined = joined_messages(&seen);
+        assert!(
+            joined.contains("SKILL-CONTENT-MARKER"),
+            "skill content must be sent to loopback: {joined}"
+        );
+        assert!(
+            joined.contains("SOUL-BODY-MARKER"),
+            "SOUL must be sent to loopback: {joined}"
+        );
+        drop(handle);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

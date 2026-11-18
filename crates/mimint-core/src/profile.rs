@@ -96,6 +96,14 @@ pub struct ProfileSet {
     /// True when the config file defined at least one
     /// `[[profile]]` table (even if all were dropped).
     pub explicit: bool,
+    /// True when `[[profile]]` tables existed but NONE survived
+    /// validation, so the app runs on a FORCED-SAFE fallback
+    /// profile (Privacy ON, paid backends locked, no proactive
+    /// budget) instead of inheriting possibly-edited top-level
+    /// values (F5-03). False when no `[[profile]]` tables exist
+    /// at all: the implicit default then inherits the top-level
+    /// values as before. Callers must surface this persistently.
+    pub fallback_active: bool,
 }
 
 impl ProfileSet {
@@ -137,13 +145,21 @@ impl ProfileSet {
                 }
             }
         }
+        let mut fallback_active = false;
         if profiles.is_empty() {
             if !entries.is_empty() {
+                // F5-03: every declared profile failed validation.
+                // Do NOT inherit the top-level privacy/cost values
+                // (they may be the edited values that broke the
+                // profiles): force the safest profile instead.
+                fallback_active = true;
                 warnings.push(format!(
-                    "no valid profiles: falling back to the implicit {DEFAULT_PROFILE_NAME:?} profile"
+                    "no valid profiles: running in FORCED-SAFE fallback mode (Privacy ON, paid backends locked, no proactive budget) on the implicit {DEFAULT_PROFILE_NAME:?} profile; fix the profile entries in the config file"
                 ));
+                profiles.push(forced_safe_default(top_chain));
+            } else {
+                profiles.push(implicit_default(top_chain, privacy_enabled, cost_cap));
             }
-            profiles.push(implicit_default(top_chain, privacy_enabled, cost_cap));
         }
         let default_index = match default_name {
             Some(name) => match profiles.iter().position(|profile| profile.name == name) {
@@ -163,6 +179,7 @@ impl ProfileSet {
             default_index,
             warnings,
             explicit: !entries.is_empty(),
+            fallback_active,
         }
     }
 
@@ -190,6 +207,29 @@ impl ProfileSet {
                 )),
             ),
         }
+    }
+}
+
+/// The forced-safe fallback profile (F5-03), used ONLY when
+/// `[[profile]]` tables existed but none survived validation.
+/// Privacy is forced ON, the cost cap is forced to 0.0 USD (paid
+/// backends locked), proactive mode is off, and there is no
+/// proactive budget — regardless of the top-level values, which
+/// may themselves be the misconfiguration. The chain is the
+/// top-level chain (its backends are still gated by privacy and
+/// the zero cap). The broken config file is never overwritten.
+fn forced_safe_default(top_chain: &[String]) -> Profile {
+    Profile {
+        name: DEFAULT_PROFILE_NAME.to_string(),
+        soul_file: DEFAULT_SOUL_FILE.to_string(),
+        chain: top_chain.to_vec(),
+        voice: None,
+        skills: None,
+        proactive: false,
+        budget_usd: None,
+        privacy: true,
+        cost_cap: CostCap { cap_usd: Some(0.0) },
+        avatar: None,
     }
 }
 
@@ -332,6 +372,96 @@ chain = ["local", "cloud"]
     }
 
     #[test]
+    fn all_profiles_dropped_forces_safe_fallback() {
+        // Top-level values are permissive here (privacy off, no
+        // cap): the fallback must NOT inherit them (F5-03).
+        let config = resolved(
+            r#"
+default_backend = "local"
+[privacy]
+enabled = false
+[[backend]]
+name = "local"
+kind = "ollama"
+model = "qwen2.5:3b"
+[fallback]
+chain = ["local"]
+"#,
+        );
+        let (entries, _) = parse_probe(
+            r#"
+[[profile]]
+name = "Xấu"
+chain = ["ghost"]
+"#,
+        );
+        let set = resolve_set(&entries, None, &config);
+        assert!(set.fallback_active);
+        assert!(set.explicit);
+        let profile = set.default_profile();
+        assert_eq!(profile.name, DEFAULT_PROFILE_NAME);
+        assert!(profile.privacy, "fallback forces Privacy ON");
+        assert_eq!(
+            profile.cost_cap.cap_usd,
+            Some(0.0),
+            "fallback locks paid backends"
+        );
+        assert!(!profile.proactive);
+        assert_eq!(profile.budget_usd, None);
+        assert!(set
+            .warnings
+            .iter()
+            .any(|w| w.contains("FORCED-SAFE fallback")));
+        assert!(set
+            .warnings
+            .iter()
+            .any(|w| w.contains("profile \"Xấu\" was dropped")));
+    }
+
+    #[test]
+    fn no_profile_tables_is_not_fallback_mode() {
+        let config = resolved(
+            r#"
+default_backend = "local"
+[privacy]
+enabled = false
+[cost]
+cap_usd = 3.0
+[[backend]]
+name = "local"
+kind = "ollama"
+model = "qwen2.5:3b"
+[fallback]
+chain = ["local"]
+"#,
+        );
+        let set = resolve_set(&[], None, &config);
+        assert!(!set.fallback_active);
+        assert!(!set.explicit);
+        // Implicit default keeps inheriting the top-level values.
+        assert!(!set.default_profile().privacy);
+        assert_eq!(set.default_profile().cost_cap.cap_usd, Some(3.0));
+    }
+
+    #[test]
+    fn one_surviving_profile_is_not_fallback_mode() {
+        let config = resolved(TWO_BACKENDS);
+        let (entries, _) = parse_probe(
+            r#"
+[[profile]]
+name = "Xấu"
+chain = ["ghost"]
+[[profile]]
+name = "Tốt"
+"#,
+        );
+        let set = resolve_set(&entries, None, &config);
+        assert!(!set.fallback_active);
+        assert_eq!(set.profiles.len(), 1);
+        assert_eq!(set.profiles[0].name, "Tốt");
+    }
+
+    #[test]
     fn no_profiles_yields_implicit_default() {
         let config = resolved(TWO_BACKENDS);
         let set = resolve_set(&[], None, &config);
@@ -411,7 +541,11 @@ chain = ["ghost"]
         let set = resolve_set(&entries, None, &config);
         assert_eq!(set.profiles.len(), 1);
         assert_eq!(set.profiles[0].name, DEFAULT_PROFILE_NAME);
-        assert!(set.warnings.iter().any(|w| w.contains("falling back")));
+        assert!(set.fallback_active);
+        assert!(set
+            .warnings
+            .iter()
+            .any(|w| w.contains("FORCED-SAFE fallback")));
     }
 
     #[test]

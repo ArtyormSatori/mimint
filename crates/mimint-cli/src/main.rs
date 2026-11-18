@@ -453,6 +453,23 @@ async fn run() -> Result<(), MimintError> {
     let notebook = Arc::new(Notebook::open(&args.db)?);
     let audit = Arc::new(AuditLog::open(&args.audit)?);
     let turn_id = format!("turn-{}-{}", std::process::id(), now_ms());
+    // Forced-safe fallback (F5-03): every [[profile]] table was
+    // dropped, so this run uses the forced-safe profile. The
+    // record names the warnings that explain why.
+    if resolved.profiles.fallback_active {
+        audit.log(
+            &turn_id,
+            "profile_fallback",
+            None,
+            Some("forced_safe"),
+            json!({
+                "profile": profile.name,
+                "warnings": resolved.profiles.warnings,
+                "privacy_on": true,
+                "paid_locked": true,
+            }),
+        )?;
+    }
     audit.log(
         &turn_id,
         "privacy_mode",
@@ -627,13 +644,13 @@ async fn run() -> Result<(), MimintError> {
             "reason": if soul_allowed {
                 "egress allowed for this turn's backends"
             } else {
-                "Privacy Mode on with a non-loopback backend: SOUL withheld, default prompt used"
+                "Privacy Mode on with a non-loopback backend: SOUL, skill content, and experience withheld; default prompt used"
             },
         }),
     )?;
     if !soul_allowed {
         eprintln!(
-            "SOUL withheld: Privacy Mode is ON and a backend is not loopback; the default prompt is used for this turn."
+            "SOUL withheld: Privacy Mode is ON and a backend is not loopback; the default prompt is used for this turn, and no skill content or experience is sent either."
         );
     }
 
@@ -664,8 +681,12 @@ async fn run() -> Result<(), MimintError> {
         // of — CLI turns are retrieved, never recorded.
         let experience = Arc::new(ExperienceStore::open(data_dir.join("experience.db"))?);
         brain.set_experience_store(experience);
+        // Skills follow the SAME egress rule (F5-01): skill
+        // content is user-written instruction data. When SOUL is
+        // withheld, no skill content is injected either — not
+        // even names/descriptions.
+        brain.set_skills(skills);
     }
-    brain.set_skills(skills);
     let outcome = brain.run(&args.prompt).await?;
     println!("{}", outcome.text);
     println!("---");

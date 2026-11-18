@@ -139,6 +139,54 @@ impl AuditRow {
             }
         }
     }
+
+    /// Learning-journal line (F5-12): `Some` for records about
+    /// learning — skill validation, promotion, evolution, drift
+    /// checks, recorded experience, import approvals — and
+    /// `None` for everything else. The category (tried /
+    /// verified / applied / not-improved) comes only from the
+    /// record's kind + decision; the detail string carries the
+    /// skill/task name and counts. Nothing is inferred beyond
+    /// what the record says: a record that does not exist is
+    /// never shown as a result.
+    pub fn learning_summary(&self) -> Option<String> {
+        let category = match (self.kind.as_str(), self.decision.as_deref()) {
+            ("skill_validation", Some("promoted")) => "Đã xác minh",
+            ("skill_validation", Some("quarantined")) => {
+                if self.reason.as_deref() == Some("negative_probe") {
+                    "Đã thử, chưa đạt — checker luôn-pass nên bị loại"
+                } else {
+                    "Đã thử, chưa đạt"
+                }
+            }
+            ("skill_validation", Some("awaiting_import_approval")) => {
+                "Đã xác minh, chờ bạn duyệt import"
+            }
+            ("skill_validation", _) => "Đã thử nghiệm",
+            ("skill_promote", _) => "Đã áp dụng",
+            ("skill_import_approved", _) => "Bạn đã duyệt import",
+            ("skill_evolve", Some("winner")) => "Đã cải thiện",
+            ("skill_evolve", Some("base_kept")) => "Chưa cải thiện — giữ bản gốc",
+            ("skill_evolve", Some("inconclusive_ceiling")) => {
+                "Chưa kết luận được — mọi bản đều chạm trần"
+            }
+            ("skill_evolve", Some("budget_exhausted")) => "Chưa xong — hết ngân sách thời gian",
+            ("skill_evolve", _) => "Đã thử nghiệm",
+            ("drift_eval", Some("clean")) => "Kiểm tra drift: sạch",
+            ("drift_eval", Some("drift")) => "Drift bị bắt",
+            ("drift_eval", _) => "Kiểm tra drift",
+            ("experience_recorded", Some("passed")) => "Kinh nghiệm đã ghi (có checker): đạt",
+            ("experience_recorded", Some("failed")) => "Kinh nghiệm đã ghi (có checker): chưa đạt",
+            ("experience_recorded", _) => "Kinh nghiệm đã ghi (có checker)",
+            ("skill_trigger_conflict", _) => "Cảnh báo: trigger trùng nhau",
+            _ => return None,
+        };
+        if self.detail.is_empty() {
+            Some(format!("[{category}]"))
+        } else {
+            Some(format!("[{category}] {}", self.detail))
+        }
+    }
 }
 
 /// Parse one JSONL line. Returns `None` for blank or malformed lines.
@@ -398,6 +446,59 @@ mod tests {
         )
         .unwrap();
         assert!(stop_banner(&[startup2, stop]).is_some());
+    }
+
+    #[test]
+    fn learning_summary_covers_tried_verified_applied_and_not_improved() {
+        let line = |kind: &str, decision: &str, detail: &str| {
+            parse_audit_line(&format!(
+                "{{\"ts_ms\":1,\"turn_id\":\"t\",\"kind\":\"{kind}\",\"decision\":\"{decision}\",\"detail\":{detail}}}"
+            ))
+            .unwrap()
+            .learning_summary()
+            .unwrap()
+        };
+        assert!(line(
+            "skill_validation",
+            "promoted",
+            r#"{"skill":"ghi-chu","passed":2,"total":2}"#
+        )
+        .starts_with("[Đã xác minh]"));
+        assert!(line(
+            "skill_validation",
+            "quarantined",
+            r#"{"skill":"x","reason":"negative_probe"}"#
+        )
+        .contains("luôn-pass"));
+        assert!(line(
+            "skill_validation",
+            "awaiting_import_approval",
+            r#"{"skill":"x"}"#
+        )
+        .contains("chờ bạn duyệt import"));
+        assert!(
+            line("skill_promote", "promoted", r#"{"skill":"ghi-chu"}"#).starts_with("[Đã áp dụng]")
+        );
+        assert!(
+            line("skill_evolve", "base_kept", r#"{"skill":"ghi-chu"}"#).contains("Chưa cải thiện")
+        );
+        assert!(line(
+            "skill_evolve",
+            "inconclusive_ceiling",
+            r#"{"skill":"ghi-chu"}"#
+        )
+        .contains("chạm trần"));
+        assert!(line(
+            "drift_eval",
+            "drift",
+            r#"{"golden_id":"G1","issues":["x"]}"#
+        )
+        .contains("Drift bị bắt"));
+        assert!(line("experience_recorded", "passed", r#"{"task":"H1"}"#).contains("có checker"));
+        // Non-learning records stay out of the journal.
+        let row = parse_audit_line(r#"{"ts_ms":1,"turn_id":"t","kind":"turn_start","detail":{}}"#)
+            .unwrap();
+        assert!(row.learning_summary().is_none());
     }
 
     #[test]

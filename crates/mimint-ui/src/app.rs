@@ -35,7 +35,8 @@ use egui::{Color32, Pos2, Rect, Stroke, Vec2};
 use mimint_body::ScreenRect;
 use mimint_control::FrameStore;
 use mimint_core::{
-    evaluate_finetune, probe_finetune, ApprovalDecision, BrainProgress, FineTuneStatus, ProfileSet,
+    evaluate_finetune, probe_finetune, ApprovalDecision, BrainProgress, FineTuneStatus, Profile,
+    ProfileSet, VerdictTracker,
 };
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
@@ -102,6 +103,12 @@ pub struct AppOptions {
     /// Fine-tune hardware status, probed once at startup; the
     /// sidebar re-probes on demand.
     pub finetune: FineTuneStatus,
+    /// True when every `[[profile]]` table was dropped and the
+    /// app runs on the forced-safe fallback profile (F5-03).
+    pub fallback_active: bool,
+    /// Path of the active profile's SOUL file, for the Settings
+    /// section (F5-11).
+    pub soul_path: PathBuf,
 }
 
 pub struct MimintApp {
@@ -163,6 +170,26 @@ pub struct MimintApp {
     profile_warnings: Vec<String>,
     /// Fine-tune hardware status (sidebar, re-probed on demand).
     finetune: FineTuneStatus,
+    /// Hysteresis for the displayed fine-tune verdict (F5-09):
+    /// the raw verdict must repeat twice before the displayed
+    /// one flips, so borderline hardware does not flicker.
+    finetune_tracker: VerdictTracker,
+    /// Forced-safe fallback mode (F5-03): shown persistently
+    /// in the sidebar until restart.
+    fallback_active: bool,
+    /// Path of the active profile's SOUL file (Settings, F5-11).
+    soul_path: PathBuf,
+    /// Set when the worker reports the SOUL file changed
+    /// outside the code path; the Settings warning stays up
+    /// for the rest of the session (F5-11).
+    soul_changed_warning: bool,
+    show_journal: bool,
+    journal_rows: Vec<AuditRow>,
+    /// Last emotion code the model sent in the current turn
+    /// (F5-10): shown separately from the turn progress, so
+    /// the user can tell a model signal from system state.
+    /// Reset on every new turn.
+    last_model_emotion: Option<FaceState>,
 }
 
 impl MimintApp {
@@ -177,6 +204,16 @@ impl MimintApp {
         // (first line), loaded by `main`; the default SOUL's
         // first line is the settled greeting from the design spec.
         chat.add_system(options.greeting.clone());
+        if options.fallback_active {
+            // Forced-safe fallback (F5-03): one startup message
+            // plus the persistent sidebar banner below. The
+            // profile/field/reason detail lives in the warnings.
+            chat.add_system(
+                "Đang chạy ở chế độ dự phòng: mọi hồ sơ trong file cấu hình đều bị loại, nên Mimint dùng hồ sơ an toàn ép buộc (Chế độ riêng tư BẬT, backend trả phí bị khóa). Xem lý do trong thanh bên, mục Hồ sơ."
+                    .to_string(),
+            );
+        }
+        let finetune_tracker = VerdictTracker::new(options.finetune.available);
         Self {
             chat,
             face: FaceMachine::new(now),
@@ -220,6 +257,13 @@ impl MimintApp {
             active_profile: options.active_profile,
             profile_warnings: options.profile_warnings,
             finetune: options.finetune,
+            finetune_tracker,
+            fallback_active: options.fallback_active,
+            soul_path: options.soul_path,
+            soul_changed_warning: false,
+            show_journal: false,
+            journal_rows: Vec::new(),
+            last_model_emotion: None,
         }
     }
 
@@ -296,14 +340,14 @@ impl MimintApp {
                     }
                     self.face.on_turn_finished(now, had_tools);
                     self.state_since = now;
-                    self.clear_stale_card();
+                    self.clear_stale_card(now);
                     self.log_event("reply_displayed");
                 }
                 WorkerEvent::TurnFailed { error, kind } => {
                     self.chat.on_error(error, kind);
                     self.face.on_error(now);
                     self.state_since = now;
-                    self.clear_stale_card();
+                    self.clear_stale_card(now);
                 }
                 WorkerEvent::TurnCancelled => {
                     self.chat.on_cancelled();
@@ -313,7 +357,7 @@ impl MimintApp {
                     );
                     self.face.on_error(now);
                     self.state_since = now;
-                    self.clear_stale_card();
+                    self.clear_stale_card(now);
                 }
                 WorkerEvent::TryingBackend { name } => {
                     self.backend_in_use = Some(name.clone());
@@ -325,7 +369,9 @@ impl MimintApp {
                     // change the status, not the face.
                     match progress {
                         BrainProgress::Emotion { code } => {
-                            self.face.on_emotion(FaceState::from_emotion(code), now);
+                            let state = FaceState::from_emotion(code);
+                            self.last_model_emotion = Some(state);
+                            self.face.on_emotion(state, now);
                             self.state_since = now;
                         }
                         BrainProgress::Analyzing => {
@@ -347,7 +393,7 @@ impl MimintApp {
                     self.chat.on_error(error, FailureKind::Other);
                     self.face.on_error(now);
                     self.state_since = now;
-                    self.clear_stale_card();
+                    self.clear_stale_card(now);
                 }
                 WorkerEvent::ChainRebuilt { names, error } => {
                     self.chain_names = names;
@@ -374,6 +420,10 @@ impl MimintApp {
                     self.pending_backend_change = None;
                     self.chat
                         .add_system(format!("Đã chuyển sang hồ sơ \"{name}\". {greeting}"));
+                    self.chat.add_system(
+                        "Phạm vi chuyển hồ sơ: chỉ lượt trò chuyện tiếp theo dùng SOUL, thứ tự backend và chế độ riêng tư của hồ sơ mới; lịch sử trò chuyện không đổi."
+                            .to_string(),
+                    );
                     if !soul_sent {
                         self.chat.add_system(
                             "SOUL của hồ sơ này đang bị giữ lại (Chế độ riêng tư + backend ở xa): Mimint trả lời bằng câu nhắc mặc định."
@@ -397,7 +447,18 @@ impl MimintApp {
                     ));
                     self.face.on_error(now);
                     self.state_since = now;
-                    self.clear_stale_card();
+                    self.clear_stale_card(now);
+                }
+                WorkerEvent::SoulChangedExternally { profile, soul_file } => {
+                    // The SOUL file changed outside the code path
+                    // (F5-11): the new text is already in use for
+                    // the next turn. Warn persistently; the
+                    // Settings section keeps the warning up.
+                    self.soul_changed_warning = true;
+                    self.chat.add_system(format!(
+                        "Cảnh báo: file SOUL ({soul_file}) của hồ sơ \"{profile}\" đã đổi ngoài ứng dụng. Nội dung mới sẽ dùng cho lượt tiếp theo — kiểm tra lại file nếu bạn không tự sửa."
+                    ));
+                    self.log_event("soul_changed_externally");
                 }
             }
         }
@@ -405,14 +466,16 @@ impl MimintApp {
 
     /// A turn ended: any card still on screen is stale (the worker
     /// already resolved it). Clear it silently — the turn's own
-    /// outcome is the news, not the card.
-    fn clear_stale_card(&mut self) {
+    /// outcome is the news, not the card. The system face
+    /// override (F5-10) clears with the card.
+    fn clear_stale_card(&mut self, now: Instant) {
         self.pending_job = None;
         self.approval_crop = None;
+        self.face.clear_system_override(now);
         self.chat.expire_approval();
     }
 
-    fn drain_approval_jobs(&mut self) {
+    fn drain_approval_jobs(&mut self, now: Instant) {
         if self.pending_job.is_some() {
             return;
         }
@@ -428,6 +491,11 @@ impl MimintApp {
                 job.max_observation_age,
             );
             self.pending_job = Some(job);
+            // System state overrides model codes (F5-10): while
+            // a card waits, the face shows Neutral, whatever
+            // the model signaled. Turn-phase events and card
+            // resolution clear the override.
+            self.face.set_system_override(FaceState::Neutral, now);
             self.log_event("approval_shown");
         }
     }
@@ -448,6 +516,7 @@ impl MimintApp {
                 .unwrap_or(0);
             self.pending_job = None;
             self.approval_crop = None;
+            self.face.clear_system_override(now);
             if self.chat.expire_approval() {
                 self.chat.add_system(format!(
                     "Hết thời gian chờ phê duyệt ({timeout_secs} giây): công cụ đã bị từ chối."
@@ -459,6 +528,7 @@ impl MimintApp {
 
     fn submit(&mut self, now: Instant) {
         if let Some(prompt) = self.chat.submit_input() {
+            self.last_model_emotion = None;
             self.worker.run_turn(prompt);
             self.face.on_turn_started(now);
             self.state_since = now;
@@ -470,6 +540,7 @@ impl MimintApp {
     /// already in the history (no duplicate user message).
     fn resubmit(&mut self, prompt: String, notice: &str, now: Instant) {
         if self.chat.resubmit(prompt.clone()).is_some() {
+            self.last_model_emotion = None;
             self.chat.add_system(notice.to_string());
             self.worker.run_turn(prompt);
             self.face.on_turn_started(now);
@@ -623,7 +694,7 @@ impl eframe::App for MimintApp {
         }
 
         self.drain_worker_events(now);
-        self.drain_approval_jobs();
+        self.drain_approval_jobs(now);
         self.expire_stale_card(now);
         self.face.tick(now);
 
@@ -755,6 +826,16 @@ impl eframe::App for MimintApp {
                     ui.label("• Phiên hiện tại");
                     ui.separator();
                     ui.heading("Hồ sơ");
+                    // Forced-safe fallback (F5-03): persistent
+                    // banner while the mode is active. The
+                    // profile/field/reason detail is in the
+                    // warnings listed below it.
+                    if self.fallback_active {
+                        ui.colored_label(
+                            Color32::from_rgb(0xDC, 0x26, 0x26),
+                            "Đang chạy ở chế độ dự phòng: mọi hồ sơ trong file cấu hình đều bị loại. Mimint dùng hồ sơ an toàn ép buộc — Chế độ riêng tư BẬT, backend trả phí bị khóa, không chủ động. Sửa file cấu hình rồi khởi động lại để thoát chế độ này.",
+                        );
+                    }
                     // One row per profile; clicking sends the
                     // switch request. The active row only moves
                     // when the worker confirms the switch, so a
@@ -771,29 +852,32 @@ impl eframe::App for MimintApp {
                         if ui.selectable_label(active, label).clicked() && !active {
                             switch_to = Some(profile.name.clone());
                         }
-                        // Stored profile attributes, displayed
-                        // as labels. Voice, proactive mode,
-                        // budget, and avatar have no execution
-                        // engine yet: the labels describe the
-                        // profile, they do not claim behavior.
-                        let mut details: Vec<String> = Vec::new();
-                        details.push(format!(
-                            "riêng tư: {}",
-                            if profile.privacy { "BẬT" } else { "TẮT" }
-                        ));
-                        if let Some(voice) = &profile.voice {
-                            details.push(format!("giọng: {voice}"));
+                        // Plain-language attribute explanations
+                        // (F5-13). Voice, proactive mode, budget,
+                        // and avatar have no execution engine
+                        // yet: those lines say so, plainly.
+                        for line in profile_detail_lines(&profile) {
+                            ui.label(format!("    {line}"));
                         }
-                        if let Some(avatar) = &profile.avatar {
-                            details.push(format!("avatar: {avatar}"));
-                        }
-                        if profile.proactive {
-                            details.push("chủ động: BẬT".to_string());
-                        }
-                        ui.label(format!("    {}", details.join(" · ")));
                     }
                     if let Some(name) = switch_to {
-                        self.worker.switch_profile(name);
+                        // Switch-during-approval (F5-13): the
+                        // worker processes requests in order, so
+                        // a switch would only queue behind the
+                        // running turn — but deciding on a card
+                        // for one profile and then switching
+                        // mid-decision is confusing, so the UI
+                        // refuses the click and says why. The
+                        // pending card is never cancelled by a
+                        // switch: it must be decided or time out.
+                        if self.chat.pending_approval.is_some() {
+                            self.chat.add_system(
+                                "Không chuyển hồ sơ lúc này: đang có thẻ phê duyệt chờ bạn quyết định. Hãy quyết định trên thẻ trước, rồi chuyển hồ sơ sau."
+                                    .to_string(),
+                            );
+                        } else {
+                            self.worker.switch_profile(name);
+                        }
                     }
                     for warning in &self.profile_warnings {
                         ui.colored_label(
@@ -803,7 +887,10 @@ impl eframe::App for MimintApp {
                     }
                     ui.separator();
                     ui.heading("Fine-tune");
-                    if self.finetune.available {
+                    // The displayed verdict goes through the
+                    // hysteresis tracker (F5-09); the gates and
+                    // reasons below are always the latest probe.
+                    if self.finetune_tracker.displayed() {
                         ui.label("Trạng thái: khả dụng trên phần cứng này.");
                     } else {
                         ui.label("Trạng thái: không khả dụng trên phần cứng này.");
@@ -819,16 +906,43 @@ impl eframe::App for MimintApp {
                     for reason in &self.finetune.reasons {
                         ui.label(format!("Lý do: {reason}"));
                     }
+                    if let Some(warning) = &self.finetune.busy_warning {
+                        ui.label(format!("Cảnh báo: {warning}"));
+                    }
                     ui.label("Huấn luyện thật bị chặn trong bản này.");
                     if ui.button("Kiểm tra lại").clicked() {
                         // Bounded probe (the GPU query has a 5s
                         // cap; on machines without NVIDIA tooling
                         // it returns immediately).
                         self.finetune = evaluate_finetune(&probe_finetune());
+                        self.finetune_tracker.update(self.finetune.available);
                     }
                     ui.separator();
                     ui.heading("Cài đặt");
                     ui.checkbox(&mut self.show_audit, "Nhật ký kiểm tra");
+                    ui.checkbox(&mut self.show_journal, "Nhật ký học tập");
+                    ui.separator();
+                    ui.heading("Persona / SOUL");
+                    ui.label(format!("File: {}", self.soul_path.display()));
+                    if let Ok(modified) = std::fs::metadata(&self.soul_path)
+                        .and_then(|meta| meta.modified())
+                    {
+                        ui.label(format!("Lần sửa gần nhất: {}", ago_text(modified)));
+                    } else {
+                        ui.label("Lần sửa gần nhất: không đọc được file.");
+                    }
+                    ui.label("Trạng thái tải: đã tải (file được tạo mới với persona mặc định nếu chưa có).");
+                    if ui.button("Mở file SOUL.md").clicked() {
+                        open_file_in_default_app(&self.soul_path);
+                    }
+                    ui.label("Sửa file bằng trình soạn thảo của bạn, giữ nguyên dòng đánh dấu phiên bản ở đầu file. Mimint không tự sửa SOUL.");
+                    ui.label("Lưu ý: lịch sử thay đổi SOUL chỉ ghi việc tạo file và các lần lưu qua code — ứng dụng không bao giờ lưu, nên sửa tay KHÔNG được ghi vào lịch sử.");
+                    if self.soul_changed_warning {
+                        ui.colored_label(
+                            Color32::from_rgb(0xDC, 0x26, 0x26),
+                            "Cảnh báo: file SOUL đã đổi ngoài ứng dụng trong phiên này. Nội dung mới đang được dùng cho lượt tiếp theo.",
+                        );
+                    }
                     match self.motion.tier() {
                         MotionTier::Static => {
                             ui.label("Chế độ đơn giản: BẬT");
@@ -894,6 +1008,41 @@ impl eframe::App for MimintApp {
                         }
                         if self.audit_rows.is_empty() {
                             ui.label("Chưa có bản ghi. Bấm Làm mới sau một lượt trò chuyện.");
+                        }
+                    });
+                });
+        }
+
+        // ---- Learning journal (bottom panel, F5-12) ----
+        if self.show_journal {
+            egui::Panel::bottom("journal_panel")
+                .default_size(160.0)
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.heading("Nhật ký học tập");
+                        if ui.button("Làm mới").clicked() {
+                            self.journal_rows = read_audit_tail(&self.audit_path, 200);
+                        }
+                        ui.label(format!(
+                            "{} bản ghi mới nhất (giờ UTC)",
+                            self.journal_rows.len()
+                        ));
+                    });
+                    ui.label("Chỉ hiện những gì nhật ký kiểm tra đã ghi. Lượt trò chuyện hàng ngày không có checker thì không được ghi thành kinh nghiệm; kỹ năng chưa từng chạy validation thì không xuất hiện ở đây.");
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        let mut shown = 0;
+                        for row in &self.journal_rows {
+                            if let Some(line) = row.learning_summary() {
+                                ui.label(format!(
+                                    "{} {}",
+                                    crate::audit_view::format_time_ms(row.ts_ms),
+                                    line
+                                ));
+                                shown += 1;
+                            }
+                        }
+                        if shown == 0 {
+                            ui.label("Chưa có bản ghi học tập. Bấm Làm mới sau khi chạy validation/eval (mimint-eval).");
                         }
                     });
                 });
@@ -1066,8 +1215,25 @@ impl eframe::App for MimintApp {
                 blinking,
                 params.tilt_degrees,
             );
+            // Two lines (F5-10): what the model signaled, and
+            // what the turn is waiting on. Never merged: a model
+            // emotion code is not system state, and system state
+            // (approval pending, errors) overrides the face.
+            let emotion_line = match self.last_model_emotion {
+                Some(code) => format!("Cảm xúc model gửi: {}", code.label()),
+                None => "Cảm xúc model gửi: chưa có trong lượt này".to_string(),
+            };
+            ui.label(emotion_line);
+            let progress_line = if self.chat.pending_approval.is_some() {
+                "Tiến trình: đang chờ bạn quyết định trên thẻ phê duyệt".to_string()
+            } else {
+                match self.turn_phase_line() {
+                    Some(line) => format!("Tiến trình: {line}"),
+                    None => "Tiến trình: đang chờ bạn".to_string(),
+                }
+            };
             ui.horizontal(|ui| {
-                ui.label(format!("Trạng thái: {}", self.face.state().label()));
+                ui.label(progress_line);
                 match self.motion.tier() {
                     MotionTier::Static => {
                         ui.label("(chế độ đơn giản: mặt tĩnh)");
@@ -1194,6 +1360,7 @@ impl eframe::App for MimintApp {
 impl MimintApp {
     fn decide_approval(&mut self, id: u64, decision: ApprovalDecision) {
         if self.chat.resolve_approval(id) {
+            self.face.clear_system_override(Instant::now());
             if let Some(job) = self.pending_job.take() {
                 self.approval_crop = None;
                 // Deadline re-check at the UI layer (F4-06):
@@ -1303,6 +1470,79 @@ impl MimintApp {
             self.rebuild();
         }
     }
+}
+
+/// Plain-language explanations of a profile's attributes
+/// (F5-13). Attributes whose engine does not exist yet are
+/// marked "chưa khả dụng" — the line never claims behavior
+/// the app cannot perform.
+fn profile_detail_lines(profile: &Profile) -> Vec<String> {
+    let mut lines = Vec::new();
+    lines.push(if profile.privacy {
+        "Chế độ riêng tư: BẬT — chỉ dùng backend trên máy này".to_string()
+    } else {
+        "Chế độ riêng tư: TẮT — câu hỏi có thể tới backend ở xa".to_string()
+    });
+    if profile.chain.is_empty() {
+        lines.push("Backend: chưa cấu hình".to_string());
+    } else {
+        lines.push(format!("Backend: {}", profile.chain.join(" -> ")));
+    }
+    match &profile.skills {
+        None => lines.push("Kỹ năng: mọi kỹ năng đã duyệt".to_string()),
+        Some(selected) => lines.push(format!("Kỹ năng: chỉ {}", selected.join(", "))),
+    }
+    if let Some(voice) = &profile.voice {
+        lines.push(format!(
+            "Giọng nói: {voice} — chưa khả dụng (chưa có engine giọng nói)"
+        ));
+    }
+    if let Some(avatar) = &profile.avatar {
+        lines.push(format!(
+            "Avatar: {avatar} — chưa khả dụng (mặt hiển thị chưa theo hồ sơ)"
+        ));
+    }
+    if profile.proactive {
+        lines.push("Chế độ chủ động: BẬT — chưa khả dụng (chưa có engine chủ động)".to_string());
+    }
+    if let Some(budget) = profile.budget_usd {
+        lines.push(format!(
+            "Ngân sách: ${budget:.2} — chưa khả dụng (chưa đo chi tiêu USD)"
+        ));
+    }
+    lines
+}
+
+/// "3 phút trước" style age for a file modification time. No
+/// date library is pulled in for one clock; the future (clock
+/// skew) reads as "vừa xong".
+fn ago_text(modified: std::time::SystemTime) -> String {
+    let secs = modified.elapsed().map(|d| d.as_secs()).unwrap_or(0);
+    if secs < 60 {
+        "vừa xong".to_string()
+    } else if secs < 3600 {
+        format!("{} phút trước", secs / 60)
+    } else if secs < 86400 {
+        format!("{} giờ trước", secs / 3600)
+    } else {
+        format!("{} ngày trước", secs / 86400)
+    }
+}
+
+/// Open a file with the operating system's default application
+/// (F5-11). Best effort: a failure leaves the user with the
+/// path shown above the button, which they can open by hand.
+fn open_file_in_default_app(path: &std::path::Path) {
+    #[cfg(target_os = "linux")]
+    let _ = std::process::Command::new("xdg-open").arg(path).spawn();
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("open").arg(path).spawn();
+    #[cfg(target_os = "windows")]
+    let _ = std::process::Command::new("cmd")
+        .args(["/C", "start", "", &path.to_string_lossy()])
+        .spawn();
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    let _ = path;
 }
 
 /// Draw Mint's face: mint fluff ball, off-white face patch, eyes and

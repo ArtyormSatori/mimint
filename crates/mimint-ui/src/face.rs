@@ -213,6 +213,13 @@ pub const TRANSIENT_SECS: u64 = 3;
 /// Idle time after which the face falls asleep.
 pub const IDLE_SLEEP_SECS: u64 = 60;
 
+/// Hard TTL for an emotion-held state (F5-10): a hold that no
+/// turn event supersedes releases after 2 minutes instead of
+/// lasting forever. Long enough that a held face stays visible
+/// (the old +90s hold test still passes); short enough that a
+/// stale signal cannot pin the face indefinitely.
+pub const HOLD_TTL_SECS: u64 = 120;
+
 /// State machine: turn-phase events in, face state out. Time is
 /// passed in so tests can jump the clock.
 #[derive(Debug)]
@@ -229,6 +236,11 @@ pub struct FaceMachine {
     /// model signaled stays visible instead of flashing for 3
     /// seconds and vanishing before anyone can see it.
     emotion_held: bool,
+    /// System override (F5-10): when set, `state()` returns this
+    /// instead of the underlying state. System state (approval
+    /// pending) always overrides model codes; turn-phase events
+    /// clear it.
+    system_override: Option<FaceState>,
 }
 
 impl FaceMachine {
@@ -238,15 +250,43 @@ impl FaceMachine {
             state_since: now,
             last_activity: now,
             emotion_held: false,
+            system_override: None,
         }
     }
 
+    /// The DISPLAYED state: the system override when one is set,
+    /// otherwise the underlying state.
     pub fn state(&self) -> FaceState {
+        self.system_override.unwrap_or(self.state)
+    }
+
+    /// The underlying state, ignoring any override (for tests
+    /// and for the UI's "model-sent emotion" line).
+    pub fn underlying_state(&self) -> FaceState {
         self.state
     }
 
+    /// True while a system override is active.
+    pub fn has_system_override(&self) -> bool {
+        self.system_override.is_some()
+    }
+
     pub fn params(&self) -> FaceParams {
-        params_for(self.state)
+        params_for(self.state())
+    }
+
+    /// Set a system override (F5-10): the displayed face becomes
+    /// `state` until the override is cleared or a turn-phase
+    /// event supersedes it. The underlying held state is kept.
+    pub fn set_system_override(&mut self, state: FaceState, now: Instant) {
+        self.system_override = Some(state);
+        self.last_activity = now;
+    }
+
+    /// Clear the system override, revealing the underlying state.
+    pub fn clear_system_override(&mut self, now: Instant) {
+        self.system_override = None;
+        self.last_activity = now;
     }
 
     fn set(&mut self, state: FaceState, now: Instant) {
@@ -269,6 +309,7 @@ impl FaceMachine {
     pub fn on_turn_started(&mut self, now: Instant) {
         self.last_activity = now;
         self.emotion_held = false;
+        self.system_override = None;
         self.set(FaceState::Thinking, now);
     }
 
@@ -278,6 +319,7 @@ impl FaceMachine {
     pub fn on_turn_finished(&mut self, now: Instant, tools_used: bool) {
         self.last_activity = now;
         self.emotion_held = false;
+        self.system_override = None;
         self.set(
             if tools_used {
                 FaceState::Celebrating
@@ -291,6 +333,7 @@ impl FaceMachine {
     pub fn on_error(&mut self, now: Instant) {
         self.last_activity = now;
         self.emotion_held = false;
+        self.system_override = None;
         self.set(FaceState::Confused, now);
     }
 
@@ -312,9 +355,15 @@ impl FaceMachine {
     /// call `tick` with a stale `last_activity` while a turn runs —
     /// `on_turn_started` refreshes it, and turns finish through
     /// `on_turn_finished`/`on_error`. An emotion-held state never
-    /// changes through `tick` at all.
+    /// changes through `tick` — except through the hard hold TTL
+    /// ([`HOLD_TTL_SECS`]): a hold that outlives the TTL releases
+    /// to Neutral instead of pinning the face forever.
     pub fn tick(&mut self, now: Instant) {
         if self.emotion_held {
+            if now.duration_since(self.state_since) >= Duration::from_secs(HOLD_TTL_SECS) {
+                self.emotion_held = false;
+                self.set(FaceState::Neutral, now);
+            }
             return;
         }
         match self.state {
@@ -424,6 +473,44 @@ mod tests {
         m.on_emotion(FaceState::Surprised, later);
         m.on_turn_started(later);
         assert_eq!(m.state(), FaceState::Thinking);
+    }
+
+    #[test]
+    fn emotion_hold_releases_at_the_hard_ttl() {
+        let (mut m, now) = machine();
+        m.on_emotion(FaceState::Happy, now);
+        // Still held just before the TTL.
+        m.tick(now + Duration::from_secs(HOLD_TTL_SECS - 1));
+        assert_eq!(m.state(), FaceState::Happy);
+        // At the TTL the hold releases to Neutral.
+        m.tick(now + Duration::from_secs(HOLD_TTL_SECS));
+        assert_eq!(m.state(), FaceState::Neutral);
+        // After release, the normal idle timer applies again.
+        m.tick(now + Duration::from_secs(HOLD_TTL_SECS + IDLE_SLEEP_SECS));
+        assert_eq!(m.state(), FaceState::Sleepy);
+    }
+
+    #[test]
+    fn system_override_beats_model_codes_until_cleared() {
+        let (mut m, now) = machine();
+        m.on_emotion(FaceState::Happy, now);
+        assert_eq!(m.state(), FaceState::Happy);
+        // Approval pending: the system override wins.
+        m.set_system_override(FaceState::Neutral, now);
+        assert_eq!(m.state(), FaceState::Neutral);
+        assert!(m.has_system_override());
+        // Model codes still update the underlying held state.
+        m.on_emotion(FaceState::Celebrating, now);
+        assert_eq!(m.state(), FaceState::Neutral);
+        assert_eq!(m.underlying_state(), FaceState::Celebrating);
+        // Clearing reveals the underlying state.
+        m.clear_system_override(now);
+        assert_eq!(m.state(), FaceState::Celebrating);
+        // A turn-phase event clears the override too.
+        m.set_system_override(FaceState::Neutral, now);
+        m.on_turn_finished(now, false);
+        assert!(!m.has_system_override());
+        assert_eq!(m.state(), FaceState::Happy);
     }
 
     #[test]
