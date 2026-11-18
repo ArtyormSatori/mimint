@@ -22,9 +22,11 @@
 //! not spending metering.
 
 use mimint_core::{
-    build_chain, default_config_path, default_vault, load_config_file, probe_local_backends,
-    suggestion_text, Approver, AuditLog, BackendKind, BackendSpec, Brain, CostCap, EgressPolicy,
-    FallbackChain, MimintError, Notebook, ResolvedConfig, DEFAULT_TIMEOUT_SECS,
+    build_chain, build_system_prompt, default_config_path, default_data_dir, default_vault,
+    evaluate_finetune, load_config_file, probe_finetune, probe_local_backends, soul_may_be_sent,
+    suggestion_text, url_is_loopback, Approver, AuditLog, BackendKind, BackendSpec, Brain, CostCap,
+    EgressPolicy, ExperienceStore, FallbackChain, MimintError, Notebook, ResolvedConfig,
+    SkillStore, SoulStore, DEFAULT_TIMEOUT_SECS,
 };
 use serde_json::{json, Value};
 use std::env;
@@ -33,18 +35,20 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const USAGE: &str = "mimint-cli: run one Mimint turn (Phase 2).\n\nUsage:\n  mimint-cli [options] <prompt...>\n\nBackend selection (first match wins):\n  1. --base-url / --model flags (missing piece filled from env MIMINT_BASE_URL / MIMINT_MODEL)\n  2. --backend NAME (one backend from the config file)\n  3. Config file: fallback.chain, else default_backend\n  4. Env MIMINT_BASE_URL + MIMINT_MODEL (both set)\n  5. Nothing configured: probe Ollama/LM Studio on loopback and print a\n     configuration suggestion. Nothing is changed. Exit code 1 means\n     \"not ready to run\", not a crash.\n\nOptions:\n  --base-url URL     Ad-hoc OpenAI-compatible base URL, or env MIMINT_BASE_URL\n  --model MODEL      Ad-hoc model name, or env MIMINT_MODEL (required, no default)\n  --backend NAME     Use one backend from the config file (not with --base-url/--model/--key-file/--allow-plaintext-auth)\n  --config PATH      Config file (default: $XDG_CONFIG_HOME/mimint/config.toml or ~/.config/mimint/config.toml; MIMINT_CONFIG is not read)\n  --key-file PATH    Key file for the ad-hoc backend (0600-checked; config backends use key_env/key_file in the file)\n  --allow-plaintext-auth  Ad-hoc only: allow sending the key over plaintext http to a loopback endpoint (default: refused; config backends set allow_plaintext_auth in the file)\n  --privacy-mode on|off  Privacy Mode: ON allows loopback backends only (127.0.0.1, localhost, ::1; LAN addresses like 192.168.x.x are blocked too) (default: on)\n  --db PATH          Notebook SQLite path (default: mimint.db)\n  --audit PATH       Audit JSONL path (default: mimint-audit.jsonl)\n  --auto-approve     Approve consequential tools automatically (test mode only; recorded in audit)\n  --max-steps N      Max brain steps (default: 5)\n  --timeout SECONDS  Per-request timeout, overriding backend timeouts (default: 30 ad-hoc, else per backend)\n  --help             Show this help (works anywhere on the command line)\n\nPrivacy Mode: ON means this process only talks to loopback backends. Turn it\nOFF only when you trust the configured endpoint: remote providers receive\nyour prompts and conversation data. Privacy Mode covers this process only;\nit cannot stop a local proxy or another process from forwarding traffic.\n\nCost gate: paid backends (any non-loopback endpoint) are LOCKED unless the\nconfig file opts in with [cost] cap_usd > 0. A missing [cost] section locks\npaid backends too. cap_usd is an opt-in gate, not spending metering: actual\nspend is not measured. The gate applies to ad-hoc backends as well.\n\nThe API key comes from the vault: env MIMINT_API_KEY by default for remote\nbackends, or the backend's key_env/key_file. A loopback backend only gets a\nkey when it explicitly declares key_env/key_file; an ambient MIMINT_API_KEY\nis never sent to a local port. Keys are never printed or written to the audit log.\n";
+const USAGE: &str = "mimint-cli: run one Mimint turn (Phase 5).\n\nUsage:\n  mimint-cli [options] <prompt...>\n\nBackend selection (first match wins):\n  1. --base-url / --model flags (missing piece filled from env MIMINT_BASE_URL / MIMINT_MODEL)\n  2. --backend NAME (one backend from the config file)\n  3. Config file: the active profile's chain (a [[profile]] chain, else fallback.chain, else default_backend)\n  4. Env MIMINT_BASE_URL + MIMINT_MODEL (both set)\n  5. Nothing configured: probe Ollama/LM Studio on loopback and print a\n     configuration suggestion. Nothing is changed. Exit code 1 means\n     \"not ready to run\", not a crash.\n\nOptions:\n  --base-url URL     Ad-hoc OpenAI-compatible base URL, or env MIMINT_BASE_URL\n  --model MODEL      Ad-hoc model name, or env MIMINT_MODEL (required, no default)\n  --backend NAME     Use one backend from the config file (not with --base-url/--model/--key-file/--allow-plaintext-auth/--profile)\n  --profile NAME     Use a named profile from the config file (chain, SOUL, skills, privacy, cost cap). Unknown names fall back to the default profile with a warning. Not with --backend/--base-url/--model/--key-file/--allow-plaintext-auth.\n  --config PATH      Config file (default: $XDG_CONFIG_HOME/mimint/config.toml or ~/.config/mimint/config.toml; MIMINT_CONFIG is not read)\n  --key-file PATH    Key file for the ad-hoc backend (0600-checked; config backends use key_env/key_file in the file)\n  --allow-plaintext-auth  Ad-hoc only: allow sending the key over plaintext http to a loopback endpoint (default: refused; config backends set allow_plaintext_auth in the file)\n  --privacy-mode on|off  Privacy Mode: ON allows loopback backends only (127.0.0.1, localhost, ::1; LAN addresses like 192.168.x.x are blocked too). Overrides the profile setting. (default: profile, else on)\n  --db PATH          Notebook SQLite path (default: mimint.db)\n  --audit PATH       Audit JSONL path (default: mimint-audit.jsonl)\n  --data-dir PATH    User data directory holding SOUL.md, skills/, and experience.db (default: $XDG_DATA_HOME/mimint or ~/.local/share/mimint)\n  --auto-approve     Approve consequential tools automatically (test mode only; recorded in audit)\n  --max-steps N      Max brain steps (default: 5)\n  --timeout SECONDS  Per-request timeout, overriding backend timeouts (default: 30 ad-hoc, else per backend)\n  --finetune-status  Print the fine-tune hardware gate status and exit (no prompt needed)\n  --help             Show this help (works anywhere on the command line)\n\nProfiles: a [[profile]] table in the config file binds a SOUL file, a backend\nchain, a skill selection, Privacy Mode, and a cost cap. Without --profile the\ndefault profile runs (the implicit \"Mặc định\" profile when no [[profile]]\ntables exist, which reproduces the top-level config behavior exactly).\n\nSOUL: the active profile's SOUL file (in the data directory) is the persona:\nit becomes the turn's system prompt. Under Privacy Mode it is sent only to\nloopback backends; when it must be withheld, the built-in default prompt is\nused instead and the withholding is audited. SOUL is never edited by Mimint.\n\nPrivacy Mode: ON means this process only talks to loopback backends. Turn it\nOFF only when you trust the configured endpoint: remote providers receive\nyour prompts and conversation data. Privacy Mode covers this process only;\nit cannot stop a local proxy or another process from forwarding traffic.\n\nCost gate: paid backends (any non-loopback endpoint) are LOCKED unless the\nactive profile opts in with a cost cap > 0. A missing cap locks paid backends\ntoo. The cap is an opt-in gate, not spending metering: actual spend is not\nmeasured. The gate applies to ad-hoc backends as well.\n\nThe API key comes from the vault: env MIMINT_API_KEY by default for remote\nbackends, or the backend's key_env/key_file. A loopback backend only gets a\nkey when it explicitly declares key_env/key_file; an ambient MIMINT_API_KEY\nis never sent to a local port. Keys are never printed or written to the audit log.\n";
 
 struct CliArgs {
     base_url: Option<String>,
     model: Option<String>,
     backend: Option<String>,
+    profile: Option<String>,
     config: Option<PathBuf>,
     key_file: Option<PathBuf>,
     allow_plaintext_auth: bool,
     privacy_mode: Option<bool>,
     db: PathBuf,
     audit: PathBuf,
+    data_dir: Option<PathBuf>,
     auto_approve: bool,
     max_steps: usize,
     timeout_secs: Option<u64>,
@@ -52,17 +56,19 @@ struct CliArgs {
 }
 
 /// Flags that consume the following argv element as their value. Shared
-/// by the parser and the `--help` pre-scan so the two agree on what is
-/// a value and what is a flag.
-const VALUE_FLAGS: [&str; 10] = [
+/// by the parser and the `--help`/`--finetune-status` pre-scans so all
+/// three agree on what is a value and what is a flag.
+const VALUE_FLAGS: [&str; 12] = [
     "--base-url",
     "--model",
     "--backend",
+    "--profile",
     "--config",
     "--key-file",
     "--privacy-mode",
     "--db",
     "--audit",
+    "--data-dir",
     "--max-steps",
     "--timeout",
 ];
@@ -71,13 +77,24 @@ const VALUE_FLAGS: [&str; 10] = [
 /// line: after positional words, but not after `--` (where it is a
 /// prompt word) and not as the value of a value-taking flag.
 fn wants_help(argv: &[String]) -> bool {
+    wants_flag(argv, &["--help", "-h"])
+}
+
+/// True when `--finetune-status` appears as a flag anywhere on the
+/// command line, with the same `--` / value-position rules as
+/// [`wants_help`].
+fn wants_finetune_status(argv: &[String]) -> bool {
+    wants_flag(argv, &["--finetune-status"])
+}
+
+fn wants_flag(argv: &[String], targets: &[&str]) -> bool {
     let mut index = 0usize;
     while index < argv.len() {
         let arg = &argv[index];
         if arg == "--" {
             return false;
         }
-        if arg == "--help" || arg == "-h" {
+        if targets.contains(&arg.as_str()) {
             return true;
         }
         let flag = arg.split_once('=').map(|(flag, _)| flag).unwrap_or(arg);
@@ -94,6 +111,9 @@ fn wants_help(argv: &[String]) -> bool {
 /// `--backend` selects a backend from the config file, so ad-hoc-only
 /// flags (`--base-url`/`--model`, `--key-file`, `--allow-plaintext-auth`)
 /// have no meaning with it and must fail loudly instead of being dropped.
+/// `--profile` selects a whole profile (chain, SOUL, skills, privacy,
+/// cost cap) from the config file, so it conflicts with `--backend`
+/// and with the ad-hoc flags for the same reason.
 fn validate_flag_combination(args: &CliArgs) -> Result<(), MimintError> {
     if args.backend.is_some() {
         if args.base_url.is_some() || args.model.is_some() {
@@ -114,6 +134,32 @@ fn validate_flag_combination(args: &CliArgs) -> Result<(), MimintError> {
                     .to_string(),
             ));
         }
+        if args.profile.is_some() {
+            return Err(MimintError::Config(
+                "cannot combine --backend with --profile: --profile already selects the chain; use one or the other"
+                    .to_string(),
+            ));
+        }
+    }
+    if args.profile.is_some() {
+        if args.base_url.is_some() || args.model.is_some() {
+            return Err(MimintError::Config(
+                "cannot combine --profile with --base-url/--model: profiles select config-file backends"
+                    .to_string(),
+            ));
+        }
+        if args.key_file.is_some() {
+            return Err(MimintError::Config(
+                "cannot combine --profile with --key-file: set key_env/key_file in the backend's config entry"
+                    .to_string(),
+            ));
+        }
+        if args.allow_plaintext_auth {
+            return Err(MimintError::Config(
+                "cannot combine --profile with --allow-plaintext-auth: set allow_plaintext_auth in the backend's config entry"
+                    .to_string(),
+            ));
+        }
     }
     Ok(())
 }
@@ -122,12 +168,14 @@ fn parse_args(argv: Vec<String>) -> Result<CliArgs, MimintError> {
     let mut base_url = None;
     let mut model = None;
     let mut backend = None;
+    let mut profile = None;
     let mut config = None;
     let mut key_file = None;
     let mut allow_plaintext_auth = false;
     let mut privacy_mode = None;
     let mut db = PathBuf::from("mimint.db");
     let mut audit = PathBuf::from("mimint-audit.jsonl");
+    let mut data_dir = None;
     let mut auto_approve = false;
     let mut max_steps = 5usize;
     let mut timeout_secs = None;
@@ -183,6 +231,7 @@ fn parse_args(argv: Vec<String>) -> Result<CliArgs, MimintError> {
             "--base-url" => base_url = Some(value),
             "--model" => model = Some(value),
             "--backend" => backend = Some(value),
+            "--profile" => profile = Some(value),
             "--config" => config = Some(PathBuf::from(value)),
             "--key-file" => key_file = Some(PathBuf::from(value)),
             "--privacy-mode" => {
@@ -198,6 +247,7 @@ fn parse_args(argv: Vec<String>) -> Result<CliArgs, MimintError> {
             }
             "--db" => db = PathBuf::from(value),
             "--audit" => audit = PathBuf::from(value),
+            "--data-dir" => data_dir = Some(PathBuf::from(value)),
             "--max-steps" => {
                 max_steps = value
                     .parse()
@@ -230,12 +280,14 @@ fn parse_args(argv: Vec<String>) -> Result<CliArgs, MimintError> {
         base_url,
         model,
         backend,
+        profile,
         config,
         key_file,
         allow_plaintext_auth,
         privacy_mode,
         db,
         audit,
+        data_dir,
         auto_approve,
         max_steps,
         timeout_secs,
@@ -335,6 +387,11 @@ async fn run() -> Result<(), MimintError> {
         print!("{USAGE}");
         return Ok(());
     }
+    if wants_finetune_status(&argv) {
+        let status = evaluate_finetune(&probe_finetune());
+        println!("{}", status.summary());
+        return Ok(());
+    }
     let args = parse_args(argv)?;
     validate_flag_combination(&args)?;
 
@@ -352,12 +409,35 @@ async fn run() -> Result<(), MimintError> {
         .map(|path| path.display().to_string())
         .unwrap_or_else(|| "(no config file: home directory not found)".to_string());
 
-    // Privacy Mode: flag > config file > default ON. The effective mode
-    // is recorded in the audit log on every run.
+    // Profile: --profile selects one, else the default. Unknown names
+    // fall closed to the default with a warning (never an error).
+    // Resolution warnings (dropped profiles, ...) are surfaced here.
+    for warning in &resolved.profiles.warnings {
+        eprintln!("Warning: {warning}");
+    }
+    let (profile, profile_warning) = match &args.profile {
+        Some(name) => {
+            let (profile, warning) = resolved.profiles.resolve_or_default(name);
+            (profile.clone(), warning)
+        }
+        None => (resolved.profiles.default_profile().clone(), None),
+    };
+    if let Some(warning) = profile_warning {
+        eprintln!("Warning: {warning}");
+    }
+    eprintln!("Profile: {}", profile.name);
+
+    // Privacy Mode: flag > profile > default ON. The profile carries
+    // the top-level value when it does not override it, so configs
+    // without [[profile]] tables behave exactly as before. The
+    // effective mode is recorded in the audit log on every run.
     let (privacy_enabled, privacy_source) = match args.privacy_mode {
-        Some(enabled) => (enabled, "flag"),
-        None if config_existed => (resolved.privacy_enabled, "config file"),
-        None => (resolved.privacy_enabled, "default"),
+        Some(enabled) => (enabled, "flag".to_string()),
+        None if resolved.profiles.explicit => {
+            (profile.privacy, format!("profile '{}'", profile.name))
+        }
+        None if config_existed => (profile.privacy, "config file".to_string()),
+        None => (profile.privacy, "default".to_string()),
     };
     let policy = EgressPolicy::new(privacy_enabled);
     if privacy_enabled {
@@ -382,6 +462,7 @@ async fn run() -> Result<(), MimintError> {
             "enabled": privacy_enabled,
             "source": privacy_source,
             "config_path": config_display,
+            "profile": profile.name,
         }),
     )?;
 
@@ -436,7 +517,7 @@ async fn run() -> Result<(), MimintError> {
         backend_source = "--backend";
     } else if !resolved.backends.is_empty() {
         specs = resolved.backends.clone();
-        order = resolved.chain.clone();
+        order = profile.chain.clone();
         backend_source = "config file";
     } else if let (Some(base_url), Some(model)) = (
         nonempty(env::var("MIMINT_BASE_URL").ok()),
@@ -467,8 +548,10 @@ async fn run() -> Result<(), MimintError> {
         }
     }
 
-    // The cost cap applies in every mode (see module docs).
-    let cost_cap: CostCap = resolved.cost_cap;
+    // The cost cap applies in every mode (see module docs). It comes
+    // from the active profile, which carries the top-level value
+    // when it does not override it.
+    let cost_cap: CostCap = profile.cost_cap;
     let vault = default_vault();
     let providers = build_chain(&specs, &order, &vault, policy, cost_cap)?;
     let chain_names: Vec<String> = providers
@@ -501,6 +584,59 @@ async fn run() -> Result<(), MimintError> {
         );
     }
 
+    // User data: SOUL, skills, experience. The data directory
+    // defaults to the platform data dir; --data-dir overrides it.
+    // Built-in skills are installed as drafts when absent; they
+    // must pass validation before use (see `mimint-eval skill`).
+    let data_dir = args
+        .data_dir
+        .clone()
+        .or_else(default_data_dir)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let soul_store = SoulStore::new(&data_dir);
+    let soul = soul_store.load_or_create(&profile.soul_file)?;
+    let skill_store = SkillStore::new(data_dir.join("skills"));
+    skill_store.install_builtins()?;
+    let promoted = skill_store.catalog()?;
+    let skills: Vec<mimint_core::SkillDef> = match &profile.skills {
+        None => promoted,
+        Some(selected) => promoted
+            .into_iter()
+            .filter(|def| selected.iter().any(|name| name == &def.name))
+            .collect(),
+    };
+
+    // SOUL egress decision: under Privacy Mode the SOUL body goes
+    // only to loopback backends. An unparseable endpoint counts as
+    // non-loopback (fail closed). When withheld, the brain keeps
+    // its built-in default prompt, and the withholding is audited.
+    let all_loopback = providers
+        .iter()
+        .all(|provider| url_is_loopback(provider.endpoint_url()).unwrap_or(false));
+    let soul_allowed = soul_may_be_sent(privacy_enabled, all_loopback);
+    audit.log(
+        &turn_id,
+        "soul",
+        None,
+        Some(if soul_allowed { "sent" } else { "withheld" }),
+        json!({
+            "file": profile.soul_file,
+            "profile": profile.name,
+            "privacy_enabled": privacy_enabled,
+            "all_loopback": all_loopback,
+            "reason": if soul_allowed {
+                "egress allowed for this turn's backends"
+            } else {
+                "Privacy Mode on with a non-loopback backend: SOUL withheld, default prompt used"
+            },
+        }),
+    )?;
+    if !soul_allowed {
+        eprintln!(
+            "SOUL withheld: Privacy Mode is ON and a backend is not loopback; the default prompt is used for this turn."
+        );
+    }
+
     let registry = mimint_core::default_registry(Arc::clone(&notebook));
     let chain = FallbackChain::new(providers, resolved.retry)?;
     let stdin_approver = StdinApprover::new();
@@ -510,7 +646,7 @@ async fn run() -> Result<(), MimintError> {
     } else {
         &stdin_approver
     };
-    let brain = Brain::new(
+    let mut brain = Brain::new(
         &chain,
         &registry,
         Some(approver),
@@ -519,9 +655,26 @@ async fn run() -> Result<(), MimintError> {
         turn_id,
         args.max_steps,
     )?;
+    brain.set_profile(profile.name.clone());
+    if soul_allowed {
+        brain.set_system_prompt(build_system_prompt(&soul, &[]));
+        // Experience retrieval follows the same egress rule as
+        // SOUL: retrieved trajectories contain past user prompts.
+        // Recording needs a turn checker, which the CLI has none
+        // of — CLI turns are retrieved, never recorded.
+        let experience = Arc::new(ExperienceStore::open(data_dir.join("experience.db"))?);
+        brain.set_experience_store(experience);
+    }
+    brain.set_skills(skills);
     let outcome = brain.run(&args.prompt).await?;
     println!("{}", outcome.text);
     println!("---");
+    println!("profile: {}", profile.name);
+    println!(
+        "soul: {} ({})",
+        profile.soul_file,
+        if soul_allowed { "sent" } else { "withheld" }
+    );
     println!("providers: {}", chain_names.join(" -> "));
     println!(
         "privacy mode: {}",
@@ -534,6 +687,27 @@ async fn run() -> Result<(), MimintError> {
             "(none)".to_string()
         } else {
             outcome.tools_used.join(", ")
+        }
+    );
+    println!(
+        "skills used: {}",
+        if outcome.skills_used.is_empty() {
+            "(none)".to_string()
+        } else {
+            outcome.skills_used.join(", ")
+        }
+    );
+    println!(
+        "emotions: {}",
+        if outcome.emotions.is_empty() {
+            "(none)".to_string()
+        } else {
+            outcome
+                .emotions
+                .iter()
+                .map(|code| code.wire_name())
+                .collect::<Vec<_>>()
+                .join(", ")
         }
     );
     println!("partial: {}", outcome.partial);
@@ -695,6 +869,62 @@ mod tests {
         let err =
             validate_flag_combination(&with_plain).expect_err("backend + allow-plaintext-auth");
         assert!(err.to_string().contains("--allow-plaintext-auth"), "{err}");
+    }
+
+    #[test]
+    fn profile_and_data_dir_flags_parse() {
+        let args = parse_args(argv(&[
+            "--profile",
+            "Làm việc",
+            "--data-dir=/tmp/data",
+            "hi",
+        ]))
+        .unwrap();
+        assert_eq!(args.profile.as_deref(), Some("Làm việc"));
+        assert_eq!(args.data_dir, Some(PathBuf::from("/tmp/data")));
+        let args = parse_args(argv(&["hi"])).unwrap();
+        assert!(args.profile.is_none());
+        assert!(args.data_dir.is_none());
+    }
+
+    #[test]
+    fn profile_flag_combination_validation() {
+        let ok = parse_args(argv(&["--profile", "A", "hi"])).unwrap();
+        assert!(validate_flag_combination(&ok).is_ok());
+        let with_backend =
+            parse_args(argv(&["--profile", "A", "--backend", "local", "hi"])).unwrap();
+        let err = validate_flag_combination(&with_backend).expect_err("profile + backend");
+        assert!(err.to_string().contains("--profile"), "{err}");
+        let with_adhoc = parse_args(argv(&[
+            "--profile",
+            "A",
+            "--base-url",
+            "http://127.0.0.1:9",
+            "--model",
+            "m",
+            "hi",
+        ]))
+        .unwrap();
+        assert!(validate_flag_combination(&with_adhoc).is_err());
+    }
+
+    #[test]
+    fn finetune_status_flag_works_anywhere_except_after_separator_or_as_value() {
+        assert!(wants_finetune_status(&argv(&["--finetune-status"])));
+        assert!(wants_finetune_status(&argv(&[
+            "hello",
+            "--finetune-status"
+        ])));
+        assert!(!wants_finetune_status(&argv(&["--", "--finetune-status"])));
+        assert!(!wants_finetune_status(&argv(&[
+            "--model",
+            "--finetune-status",
+            "hi"
+        ])));
+        assert!(!wants_finetune_status(&argv(&["hello"])));
+        // --help still wins its own scan, independently.
+        assert!(!wants_finetune_status(&argv(&["--help"])));
+        assert!(!wants_help(&argv(&["--finetune-status"])));
     }
 
     #[test]

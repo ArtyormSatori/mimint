@@ -64,6 +64,17 @@ pub enum GateName {
     Simd,
 }
 
+impl GateName {
+    /// Human-readable gate name for status displays.
+    pub fn label(self) -> &'static str {
+        match self {
+            GateName::GpuVram => "GPU VRAM",
+            GateName::RamAvailable => "RAM khả dụng",
+            GateName::Simd => "SIMD (AVX2/NEON)",
+        }
+    }
+}
+
 /// Verdict of one gate, with measured and required values.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GateVerdict {
@@ -105,8 +116,11 @@ impl FineTuneStatus {
                 "KHÔNG ĐẠT"
             };
             lines.push(format!(
-                "- {:?}: {} (đo được: {}, yêu cầu: {})",
-                gate.gate, mark, gate.measured, gate.required
+                "- {}: {} (đo được: {}, yêu cầu: {})",
+                gate.gate.label(),
+                mark,
+                gate.measured,
+                gate.required
             ));
         }
         for reason in &self.reasons {

@@ -93,6 +93,9 @@ pub struct ProfileSet {
     /// Warnings from resolution (dropped profiles, unknown
     /// default, ...). Callers must surface these.
     pub warnings: Vec<String>,
+    /// True when the config file defined at least one
+    /// `[[profile]]` table (even if all were dropped).
+    pub explicit: bool,
 }
 
 impl ProfileSet {
@@ -159,6 +162,7 @@ impl ProfileSet {
             profiles,
             default_index,
             warnings,
+            explicit: !entries.is_empty(),
         }
     }
 

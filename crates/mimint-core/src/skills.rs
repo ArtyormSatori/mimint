@@ -31,7 +31,7 @@
 //! the catalog ([`SkillStore::catalog`]) is the promoted set.
 
 use crate::audit::{now_ms, AuditLog};
-use crate::brain::Brain;
+use crate::brain::{Brain, TurnOutcome};
 use crate::error::MimintError;
 use crate::guards::Approver;
 use crate::notebook::{tokenize_baseline, Notebook};
@@ -599,13 +599,28 @@ impl Approver for ValidationApprover {
     }
 }
 
+/// What one validation task run produced: the checker's verdict
+/// plus the turn outcome, when the turn completed. Callers that
+/// record experience need the outcome (verification status,
+/// partial flag); callers that only need pass/fail use
+/// [`run_one_task`].
+#[derive(Debug)]
+pub struct TaskRun {
+    pub result: TaskResult,
+    /// The turn outcome, when the turn ran to completion
+    /// (including partial turns). `None` when the turn errored.
+    pub outcome: Option<TurnOutcome>,
+    /// The turn error, when the turn failed.
+    pub error: Option<String>,
+}
+
 /// Run ONE validation task through the brain and evaluate its
-/// checker. The turn is audited with kind `validation_task`,
-/// including the checker's evidence. Factored out so the S4
-/// evolution runner can give each (variant, task) pair its own
-/// notebook: sharing one would let one variant's notes satisfy
-/// another's checkers.
-pub async fn run_one_task(
+/// checker, returning the full run (see [`TaskRun`]). The turn
+/// is audited with kind `validation_task`, including the
+/// checker's evidence. Factored out so the S4 evolution runner
+/// can give each (variant, task) pair its own notebook: sharing
+/// one would let one variant's notes satisfy another's checkers.
+pub async fn run_one_task_detailed(
     provider: &dyn Provider,
     system_prompt: &str,
     task: &ValidationTask,
@@ -613,7 +628,7 @@ pub async fn run_one_task(
     audit: &AuditLog,
     turn_id: &str,
     max_steps: usize,
-) -> Result<TaskResult, MimintError> {
+) -> Result<TaskRun, MimintError> {
     let registry = crate::tools::default_registry(Arc::clone(&notebook));
     let approver = ValidationApprover;
     let mut brain = Brain::new(
@@ -627,7 +642,7 @@ pub async fn run_one_task(
     )?;
     brain.set_system_prompt(system_prompt.to_string());
     let outcome = brain.run(&task.prompt).await;
-    let (passed, evidence) = match &outcome {
+    let (passed, evidence, outcome, error) = match outcome {
         Ok(outcome) => {
             let evidence = task
                 .checker
@@ -636,9 +651,12 @@ pub async fn run_one_task(
             if outcome.partial {
                 detail.push_str(" (turn ended partial: step budget exhausted)");
             }
-            (evidence.passed, detail)
+            (evidence.passed, detail, Some(outcome), None)
         }
-        Err(err) => (false, format!("turn failed: {err}")),
+        Err(err) => {
+            let message = format!("turn failed: {err}");
+            (false, message, None, Some(err.to_string()))
+        }
     };
     audit.log(
         turn_id,
@@ -650,11 +668,40 @@ pub async fn run_one_task(
             "evidence": evidence,
         }),
     )?;
-    Ok(TaskResult {
-        id: task.id.clone(),
-        passed,
-        evidence,
+    Ok(TaskRun {
+        result: TaskResult {
+            id: task.id.clone(),
+            passed,
+            evidence,
+        },
+        outcome,
+        error,
     })
+}
+
+/// Run ONE validation task through the brain and evaluate its
+/// checker, returning only the verdict. See
+/// [`run_one_task_detailed`] for the full run.
+pub async fn run_one_task(
+    provider: &dyn Provider,
+    system_prompt: &str,
+    task: &ValidationTask,
+    notebook: Arc<Notebook>,
+    audit: &AuditLog,
+    turn_id: &str,
+    max_steps: usize,
+) -> Result<TaskResult, MimintError> {
+    Ok(run_one_task_detailed(
+        provider,
+        system_prompt,
+        task,
+        notebook,
+        audit,
+        turn_id,
+        max_steps,
+    )
+    .await?
+    .result)
 }
 
 /// Run validation tasks through the brain with one provider and

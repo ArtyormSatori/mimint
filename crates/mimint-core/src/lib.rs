@@ -38,7 +38,7 @@ pub use brain::{Brain, BrainProgress, StepVerifier, TurnOutcome};
 pub use cancel::CancelToken;
 pub use claude::{ClaudeClient, ANTHROPIC_BASE_URL, ANTHROPIC_VERSION, DEFAULT_MAX_TOKENS};
 pub use config::{default_config_path, load_config_file, FileConfig, ResolvedConfig};
-pub use egress::{EgressPolicy, GuardedHttpClient};
+pub use egress::{url_is_loopback, EgressPolicy, GuardedHttpClient};
 pub use emotion::{handle_emotion_args, EmotionCode, EmotionOutcome};
 pub use error::MimintError;
 pub use evolve::{
@@ -68,8 +68,9 @@ pub use registry::{
 };
 pub use skills::{
     builtin_skills, demote, load_eval_tasks, promote, retrieve_skills, run_one_task,
-    run_validation_tasks, validate_skill, Checker, CheckerEvidence, SkillDef, SkillMatch,
-    SkillStatus, SkillStore, TaskResult, ValidationApprover, ValidationRun, ValidationTask,
+    run_one_task_detailed, run_validation_tasks, validate_skill, Checker, CheckerEvidence,
+    SkillDef, SkillMatch, SkillStatus, SkillStore, TaskResult, TaskRun, ValidationApprover,
+    ValidationRun, ValidationTask,
 };
 pub use soul::{
     build_system_prompt, default_data_dir, default_soul_path, default_soul_text, drift_findings,
