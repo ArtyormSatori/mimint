@@ -28,8 +28,8 @@
 //!
 //! ```text
 //! Request:  {"v":2,"id":7,"method":"click",
-//!            "params":{"x":100,"y":200},"auth":"<token>",
-//!            "role":"owner","payload_len":0}
+//!            "params":{"x":100,"y":200},"auth":"<value>",
+//!            "auth_mode":"bound","role":"owner","payload_len":0}
 //! Response: {"v":2,"id":7,"ok":true,"result":{...},"payload_len":0}
 //! Error:    {"v":2,"id":7,"ok":false,
 //!            "error":{"code":"out_of_bounds","message":"..."},
@@ -52,8 +52,12 @@
 //! Rules both sides enforce:
 //!
 //! * `v` must be `2`; anything else is `version_mismatch`.
-//! * `auth` must equal the pairing token; anything else is
-//!   `unauthorized`. Tokens are compared without early exit.
+//! * `auth` proves knowledge of the pairing token, bound to
+//!   the connection (see "Session binding" below).
+//!   `auth_mode` says how: `"bound"` on TLS connections,
+//!   `"raw"` on plain ones. A wrong value, or a mode that does
+//!   not match the transport, is `unauthorized`. Auth values
+//!   are compared without early exit.
 //! * `role` is `owner` or `guest`. Guests may call only
 //!   `display_size`, `screenshot`, `permissions` and
 //!   `focused_window`; anything else is `forbidden_role`. The
@@ -77,6 +81,18 @@
 //! * **Pairing auth.** The token is generated on the device at
 //!   pairing time and shown to the owner, who enters it on the
 //!   Rust side. There is no default token and no tokenless mode.
+//! * **Session binding.** On a TLS connection the client never
+//!   sends the raw token. Both ends derive the same 32-byte
+//!   secret from the TLS exporter (RFC 5705, label
+//!   `"mimint android v2 auth"`, no context) and the client
+//!   sends `auth = hex(HMAC-SHA256(exporter, token))` with
+//!   `auth_mode = "bound"`. The value is useless on any other
+//!   connection: a different TLS session has a different
+//!   exporter, so a captured or leaked auth value — or the raw
+//!   token itself — cannot be replayed. The server rejects the
+//!   raw token outright in TLS mode. Plain mode keeps the raw
+//!   token with `auth_mode = "raw"` and exists only for the
+//!   fake server and loopback debugging.
 //! * **TLS with certificate pinning.** The shell serves a
 //!   self-signed certificate generated on first run; the client
 //!   pins the SHA-256 of the certificate DER, configured
@@ -396,6 +412,69 @@ pub fn fingerprint_of_cert_der(der: &[u8]) -> [u8; 32] {
 }
 
 // ---------------------------------------------------------------------------
+// Session binding (F4-11)
+// ---------------------------------------------------------------------------
+
+/// Label for the TLS exporter (RFC 5705) that binds the pairing
+/// token to one TLS session. Both ends use the same label and
+/// no context, so both derive the same secret.
+const EXPORTER_LABEL: &[u8] = b"mimint android v2 auth";
+
+/// `auth_mode` for a plain connection: the raw token.
+const AUTH_MODE_RAW: &str = "raw";
+
+/// `auth_mode` for a TLS connection: the exporter-bound HMAC.
+const AUTH_MODE_BOUND: &str = "bound";
+
+fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+fn hmac_sha256_hex(key: &[u8], message: &[u8]) -> String {
+    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, key);
+    hex_lower(ring::hmac::sign(&key, message).as_ref())
+}
+
+/// The value a client sends in the `auth` field on a TLS
+/// connection: HMAC-SHA256 keyed by the session exporter over
+/// the pairing token, hex-encoded. The raw token never crosses
+/// the wire, and the value is useless on any other connection.
+fn bound_auth_value(exporter: &[u8; 32], token: &str) -> String {
+    hmac_sha256_hex(exporter, token.as_bytes())
+}
+
+/// What the server expects in the `auth` field on one
+/// connection, computed from the transport, never from the
+/// request.
+enum ExpectedAuth {
+    /// Plain connection: the raw token.
+    Raw(String),
+    /// TLS connection: the exporter-bound HMAC.
+    Bound(String),
+}
+
+impl ExpectedAuth {
+    fn value(&self) -> &str {
+        match self {
+            ExpectedAuth::Raw(value) | ExpectedAuth::Bound(value) => value,
+        }
+    }
+
+    fn mode(&self) -> &'static str {
+        match self {
+            ExpectedAuth::Raw(_) => AUTH_MODE_RAW,
+            ExpectedAuth::Bound(_) => AUTH_MODE_BOUND,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Protocol client
 // ---------------------------------------------------------------------------
 
@@ -431,9 +510,15 @@ impl Write for Transport {
 
 /// A single-connection protocol v2 client. One request at a
 /// time; the caller (`AndroidBody`) owns reconnect behavior.
+///
+/// The client stores only the auth *value* for this
+/// connection — the raw token in plain mode, the
+/// exporter-bound HMAC in TLS mode — never the token itself
+/// past `connect`.
 pub struct ProtocolClient {
     transport: Transport,
-    token: String,
+    auth_value: String,
+    auth_mode: &'static str,
     role: Role,
     next_id: u64,
 }
@@ -446,8 +531,8 @@ impl ProtocolClient {
             .map_err(|err| BodyError::Backend(format!("cannot set read timeout: {err}")))?;
         sock.set_write_timeout(Some(IO_TIMEOUT))
             .map_err(|err| BodyError::Backend(format!("cannot set write timeout: {err}")))?;
-        let transport = match &config.tls {
-            TlsMode::Plain => Transport::Plain(sock),
+        let (transport, auth_value, auth_mode) = match &config.tls {
+            TlsMode::Plain => (Transport::Plain(sock), config.token.clone(), AUTH_MODE_RAW),
             TlsMode::PinnedSha256(fingerprint) => {
                 let tls_config = pinned_client_config(*fingerprint)?;
                 let server_name = rustls::pki_types::ServerName::IpAddress(
@@ -466,13 +551,29 @@ impl ProtocolClient {
                         BodyError::Backend(format!("TLS handshake failed: {err}"))
                     })?;
                 }
+                // Bind the token to this TLS session. The
+                // exporter fails only before the handshake
+                // completes; the handshake just completed, so a
+                // failure here fails the connect — never a
+                // fallback to the raw token.
+                let mut exporter = [0u8; 32];
+                conn.export_keying_material(&mut exporter, EXPORTER_LABEL, None)
+                    .map_err(|err| {
+                        BodyError::Backend(format!("TLS exporter unavailable: {err}"))
+                    })?;
+                let auth_value = bound_auth_value(&exporter, &config.token);
                 let stream = rustls::StreamOwned::new(conn, sock);
-                Transport::Tls(Box::new(stream))
+                (
+                    Transport::Tls(Box::new(stream)),
+                    auth_value,
+                    AUTH_MODE_BOUND,
+                )
             }
         };
         Ok(ProtocolClient {
             transport,
-            token: config.token.clone(),
+            auth_value,
+            auth_mode,
             role: config.role,
             next_id: 1,
         })
@@ -489,7 +590,8 @@ impl ProtocolClient {
             "id": id,
             "method": method,
             "params": params,
-            "auth": self.token,
+            "auth": self.auth_value,
+            "auth_mode": self.auth_mode,
             "role": self.role.name(),
             "payload_len": 0,
         });
@@ -1188,6 +1290,29 @@ impl Write for ServerTransport {
     }
 }
 
+impl ServerTransport {
+    fn is_tls(&self) -> bool {
+        matches!(self, ServerTransport::Tls(_))
+    }
+
+    /// The session exporter secret, once the handshake has
+    /// completed. `None` on a plain connection, and `None` if
+    /// the exporter fails (handshake incomplete) — the caller
+    /// must fail a TLS connection closed in that case, never
+    /// fall back to the raw token.
+    fn exporter_secret(&self) -> Option<[u8; 32]> {
+        let ServerTransport::Tls(stream) = self else {
+            return None;
+        };
+        let mut secret = [0u8; 32];
+        stream
+            .conn
+            .export_keying_material(&mut secret, EXPORTER_LABEL, None)
+            .ok()?;
+        Some(secret)
+    }
+}
+
 fn serve_connection(
     stream: TcpStream,
     state: Arc<Mutex<FakeState>>,
@@ -1251,7 +1376,21 @@ fn serve_connection(
             let mut sink = vec![0u8; payload_len];
             transport.read_exact(&mut sink)?;
         }
-        let (reply, payload) = dispatch(&state, &request, &token);
+        // The expected auth value comes from the transport, not
+        // the request: on TLS the exporter has completed by now
+        // (the frame read above drove the handshake), and a
+        // missing exporter fails the connection closed.
+        let expected = if transport.is_tls() {
+            match transport.exporter_secret() {
+                Some(secret) => ExpectedAuth::Bound(bound_auth_value(&secret, &token)),
+                None => {
+                    return Err(std::io::Error::other("TLS exporter unavailable"));
+                }
+            }
+        } else {
+            ExpectedAuth::Raw(token.clone())
+        };
+        let (reply, payload) = dispatch(&state, &request, &expected);
         // Test hook for the retry rules: the request was
         // executed, but the reply is dropped — the client
         // sees a bare transport failure.
@@ -1276,7 +1415,7 @@ fn serve_connection(
 fn dispatch(
     state: &Arc<Mutex<FakeState>>,
     request: &Value,
-    expected_token: &str,
+    expected: &ExpectedAuth,
 ) -> (Value, Vec<u8>) {
     let id = request.get("id").and_then(Value::as_u64).unwrap_or(0);
     let error_reply = |code: &str, message: &str| {
@@ -1298,7 +1437,15 @@ fn dispatch(
         return error_reply("version_mismatch", "protocol version must be 2");
     }
     let auth = request.get("auth").and_then(Value::as_str).unwrap_or("");
-    if !tokens_equal(auth, expected_token) {
+    let mode = request
+        .get("auth_mode")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    // The mode is a public two-value claim, not a secret; the
+    // value comparison is the constant-time one. A mode that
+    // does not match the transport (a raw token over TLS, a
+    // bound value over plain TCP) is rejected outright.
+    if mode != expected.mode() || !tokens_equal(auth, expected.value()) {
         audit(state, "auth", "unauthorized");
         return error_reply("unauthorized", "pairing token rejected");
     }
@@ -1703,6 +1850,133 @@ mod tests {
         assert!(!tokens_equal("", "a"));
     }
 
+    /// The committed TLS test fixtures (see `tests/fixtures/`):
+    /// (cert PEM, key PEM, cert SHA-256 fingerprint).
+    fn tls_fixture() -> (Vec<u8>, Vec<u8>, [u8; 32]) {
+        use rustls_pki_types::pem::PemObject;
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let cert_pem = std::fs::read(dir.join("android-test-cert.pem")).expect("read test cert");
+        let key_pem = std::fs::read(dir.join("android-test-key.pem")).expect("read test key");
+        let cert_der =
+            rustls_pki_types::CertificateDer::from_pem_slice(&cert_pem).expect("parse cert");
+        let fingerprint = fingerprint_of_cert_der(cert_der.as_ref());
+        (cert_pem, key_pem, fingerprint)
+    }
+
+    /// Send one hand-built request over a pinned-TLS connection
+    /// and return the reply header. Bypasses `ProtocolClient`
+    /// so the test can send a stolen or raw auth value.
+    fn raw_tls_request(addr: SocketAddr, fingerprint: [u8; 32], header: Value) -> Value {
+        let tls_config = pinned_client_config(fingerprint).unwrap();
+        let server_name =
+            rustls::pki_types::ServerName::IpAddress(rustls::pki_types::IpAddr::from(addr.ip()));
+        let mut conn = rustls::ClientConnection::new(tls_config, server_name).unwrap();
+        let mut sock = TcpStream::connect(addr).unwrap();
+        sock.set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        sock.set_write_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        while conn.is_handshaking() {
+            conn.complete_io(&mut sock).unwrap();
+        }
+        let mut stream = rustls::StreamOwned::new(conn, sock);
+        let bytes = serde_json::to_vec(&header).unwrap();
+        stream
+            .write_all(&(bytes.len() as u32).to_be_bytes())
+            .unwrap();
+        stream.write_all(&bytes).unwrap();
+        stream.flush().unwrap();
+        let mut len_buf = [0u8; 4];
+        stream.read_exact(&mut len_buf).unwrap();
+        let len = u32::from_be_bytes(len_buf) as usize;
+        let mut buf = vec![0u8; len];
+        stream.read_exact(&mut buf).unwrap();
+        serde_json::from_slice(&buf).unwrap()
+    }
+
+    #[test]
+    fn hmac_helper_matches_rfc4231_test_case_1() {
+        // RFC 4231 test case 1: key = 20 bytes of 0x0b,
+        // data = "Hi There".
+        let tag = hmac_sha256_hex(&[0x0b; 20], b"Hi There");
+        assert_eq!(
+            tag,
+            "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
+        );
+    }
+
+    #[test]
+    fn tls_auth_value_differs_across_connections() {
+        let (cert_pem, key_pem, fingerprint) = tls_fixture();
+        let server = FakeAndroidServer::start(FakeServerConfig {
+            token: "pairing-token".to_string(),
+            tls_identity: Some((cert_pem, key_pem)),
+        })
+        .unwrap();
+        let config = AndroidConfig::loopback(
+            server.addr(),
+            "pairing-token",
+            Role::Owner,
+            TlsMode::PinnedSha256(fingerprint),
+        )
+        .unwrap();
+        let mut first = ProtocolClient::connect(&config).unwrap();
+        let mut second = ProtocolClient::connect(&config).unwrap();
+        // Different TLS sessions, different exporters, different
+        // auth values — the same token binds differently.
+        assert_ne!(first.auth_value, second.auth_value);
+        assert_eq!(first.auth_mode, AUTH_MODE_BOUND);
+        assert!(first.request("display_size", json!({})).is_ok());
+        assert!(second.request("display_size", json!({})).is_ok());
+        server.stop();
+    }
+
+    #[test]
+    fn tls_server_rejects_the_raw_token_and_a_stolen_bound_value() {
+        let (cert_pem, key_pem, fingerprint) = tls_fixture();
+        let server = FakeAndroidServer::start(FakeServerConfig {
+            token: "pairing-token".to_string(),
+            tls_identity: Some((cert_pem, key_pem)),
+        })
+        .unwrap();
+        let config = AndroidConfig::loopback(
+            server.addr(),
+            "pairing-token",
+            Role::Owner,
+            TlsMode::PinnedSha256(fingerprint),
+        )
+        .unwrap();
+        // A legitimate client binds successfully; capture the
+        // auth value it sent, as an attacker with a transcript
+        // would.
+        let mut client = ProtocolClient::connect(&config).unwrap();
+        let stolen = client.auth_value.clone();
+        assert!(client.request("display_size", json!({})).is_ok());
+        drop(client);
+        // The raw token over TLS is refused outright.
+        let reply = raw_tls_request(
+            server.addr(),
+            fingerprint,
+            json!({"v": 2, "id": 1, "method": "display_size",
+                   "params": {}, "auth": "pairing-token", "auth_mode": "raw",
+                   "role": "owner", "payload_len": 0}),
+        );
+        assert_eq!(reply["ok"], false);
+        assert_eq!(reply["error"]["code"], "unauthorized");
+        // The bound value stolen from another connection is
+        // refused: this connection has a different exporter.
+        let reply = raw_tls_request(
+            server.addr(),
+            fingerprint,
+            json!({"v": 2, "id": 1, "method": "display_size",
+                   "params": {}, "auth": stolen, "auth_mode": "bound",
+                   "role": "owner", "payload_len": 0}),
+        );
+        assert_eq!(reply["ok"], false);
+        assert_eq!(reply["error"]["code"], "unauthorized");
+        server.stop();
+    }
+
     #[test]
     fn wrong_token_is_a_typed_refusal() {
         let server = FakeAndroidServer::start(FakeServerConfig {
@@ -1815,8 +2089,8 @@ mod tests {
         // Speak the framing by hand with v=1.
         let mut sock = TcpStream::connect(server.addr()).unwrap();
         let header = json!({"v": 1, "id": 1, "method": "display_size",
-                            "params": {}, "auth": "tok", "role": "owner",
-                            "payload_len": 0});
+                            "params": {}, "auth": "tok", "auth_mode": "raw",
+                            "role": "owner", "payload_len": 0});
         let bytes = serde_json::to_vec(&header).unwrap();
         sock.write_all(&(bytes.len() as u32).to_be_bytes()).unwrap();
         sock.write_all(&bytes).unwrap();
