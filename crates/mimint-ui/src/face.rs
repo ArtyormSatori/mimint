@@ -222,6 +222,13 @@ pub struct FaceMachine {
     state_since: Instant,
     /// Last user or turn activity (for the sleep timer).
     last_activity: Instant,
+    /// True when the current state came from an emotion signal
+    /// (Phase 5, P5.6). A held state changes only through an
+    /// explicit event (another emotion, a turn-phase change) —
+    /// never through the transient/sleep timers — so a face the
+    /// model signaled stays visible instead of flashing for 3
+    /// seconds and vanishing before anyone can see it.
+    emotion_held: bool,
 }
 
 impl FaceMachine {
@@ -230,6 +237,7 @@ impl FaceMachine {
             state: FaceState::Neutral,
             state_since: now,
             last_activity: now,
+            emotion_held: false,
         }
     }
 
@@ -253,12 +261,14 @@ impl FaceMachine {
     pub fn on_activity(&mut self, now: Instant) {
         self.last_activity = now;
         if self.state == FaceState::Sleepy {
+            self.emotion_held = false;
             self.set(FaceState::Neutral, now);
         }
     }
 
     pub fn on_turn_started(&mut self, now: Instant) {
         self.last_activity = now;
+        self.emotion_held = false;
         self.set(FaceState::Thinking, now);
     }
 
@@ -267,6 +277,7 @@ impl FaceMachine {
     /// [`TRANSIENT_SECS`].
     pub fn on_turn_finished(&mut self, now: Instant, tools_used: bool) {
         self.last_activity = now;
+        self.emotion_held = false;
         self.set(
             if tools_used {
                 FaceState::Celebrating
@@ -279,16 +290,20 @@ impl FaceMachine {
 
     pub fn on_error(&mut self, now: Instant) {
         self.last_activity = now;
+        self.emotion_held = false;
         self.set(FaceState::Confused, now);
     }
 
     /// An emotion code arrived through the structured channel
-    /// (Phase 5, P5.6): show the matching face. The signal counts
-    /// as turn activity, so a running turn never falls asleep
-    /// mid-signal. Unknown codes never reach this method — the
-    /// brain falls back and only audits them.
+    /// (Phase 5, P5.6): show the matching face, and HOLD it until
+    /// another emotion, a turn-phase change, or user activity
+    /// waking the face supersedes it. The signal counts as turn
+    /// activity, so a running turn never falls asleep mid-signal.
+    /// Unknown codes never reach this method — the brain falls
+    /// back and only audits them.
     pub fn on_emotion(&mut self, state: FaceState, now: Instant) {
         self.last_activity = now;
+        self.emotion_held = true;
         self.set(state, now);
     }
 
@@ -296,8 +311,12 @@ impl FaceMachine {
     /// A running turn (Thinking) never sleeps: the caller must not
     /// call `tick` with a stale `last_activity` while a turn runs —
     /// `on_turn_started` refreshes it, and turns finish through
-    /// `on_turn_finished`/`on_error`.
+    /// `on_turn_finished`/`on_error`. An emotion-held state never
+    /// changes through `tick` at all.
     pub fn tick(&mut self, now: Instant) {
+        if self.emotion_held {
+            return;
+        }
         match self.state {
             FaceState::Happy | FaceState::Celebrating => {
                 if now.duration_since(self.state_since) >= Duration::from_secs(TRANSIENT_SECS) {
@@ -382,6 +401,29 @@ mod tests {
         assert_eq!(m.state(), FaceState::Happy);
         m.tick(now + Duration::from_secs(TRANSIENT_SECS));
         assert_eq!(m.state(), FaceState::Neutral);
+    }
+
+    #[test]
+    fn emotion_held_state_survives_timers_until_superseded() {
+        let (mut m, now) = machine();
+        // An emotion Happy does NOT revert after 3s, and does
+        // not fall asleep after 60s idle: the signal holds.
+        m.on_emotion(FaceState::Happy, now);
+        m.tick(now + Duration::from_secs(TRANSIENT_SECS + 1));
+        assert_eq!(m.state(), FaceState::Happy);
+        m.tick(now + Duration::from_secs(IDLE_SLEEP_SECS + 30));
+        assert_eq!(m.state(), FaceState::Happy);
+        // A turn-phase event supersedes the hold: the finish
+        // Happy reverts on the normal transient timer again.
+        let later = now + Duration::from_secs(IDLE_SLEEP_SECS + 31);
+        m.on_turn_finished(later, false);
+        assert_eq!(m.state(), FaceState::Happy);
+        m.tick(later + Duration::from_secs(TRANSIENT_SECS));
+        assert_eq!(m.state(), FaceState::Neutral);
+        // A new turn supersedes the hold with Thinking.
+        m.on_emotion(FaceState::Surprised, later);
+        m.on_turn_started(later);
+        assert_eq!(m.state(), FaceState::Thinking);
     }
 
     #[test]
