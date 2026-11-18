@@ -12,8 +12,9 @@
 //! honestly shows `Idle` ("Chưa điều khiển") until then.
 
 use crate::worker::FailureKind;
+use mimint_body::WindowIdentity;
 use serde_json::Value;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Who a displayed message is from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,6 +37,12 @@ pub struct UiMessage {
 /// A guard approval waiting on the user. The `id` is the guard
 /// executor's request id — the same id binds the request, the card,
 /// the decision, and the audit record.
+/// `target` is the window under the action point at request time
+/// (`None` when the probe was unavailable or the tool has no
+/// point). `observation_age` is the age of the newest stored
+/// frame at request time; the card warns when it exceeds
+/// `max_observation_age`. `timeout` is the full wait the worker
+/// allows, for the expiry message (never a hardcoded number).
 #[derive(Debug, Clone, PartialEq)]
 pub struct ApprovalRequest {
     pub id: u64,
@@ -44,6 +51,10 @@ pub struct ApprovalRequest {
     /// When the worker times this request out (the card shows a
     /// countdown; an expired card is cleared, never answered late).
     pub deadline: Option<Instant>,
+    pub timeout: Duration,
+    pub target: Option<WindowIdentity>,
+    pub observation_age: Option<Duration>,
+    pub max_observation_age: Duration,
 }
 
 /// What a running turn is doing, as far as the UI can honestly tell.
@@ -55,6 +66,16 @@ pub enum TurnStatus {
     Connecting,
     /// The chain is trying this backend (attempts arrive in order).
     TryingBackend(String),
+    /// The brain is thinking (provider call in flight).
+    Analyzing,
+    /// A body tool is executing (tool name, e.g. `body_click`).
+    Acting(String),
+    /// The step verifier is checking the result on screen.
+    Verifying,
+    /// A tool failed: the tool name and the (already friendly)
+    /// failure text. The turn continues or ends on the brain's
+    /// own logic; this status only reports what happened.
+    ToolFailed { tool: String, error: String },
 }
 
 /// The six-state control lamp (F3-21).
@@ -84,6 +105,40 @@ impl ControlState {
             ControlState::Stopping => "● Đang dừng",
             ControlState::Stopped => "● Đã dừng",
             ControlState::Error => "● Lỗi",
+        }
+    }
+}
+
+/// A short Vietnamese reading of a tool failure, for the status
+/// line. Matches the machine-readable error codes the body tools
+/// prefix their errors with (`code: message`); anything
+/// unrecognized is shown truncated, never hidden. Display only:
+/// the raw error is always kept in the audit trail.
+pub fn friendly_tool_error(error: &str) -> String {
+    let lower = error.to_lowercase();
+    if lower.contains("target_changed") {
+        "mục tiêu dưới con trỏ đã đổi so với lúc phê duyệt".to_string()
+    } else if lower.contains("stale_observation") {
+        "ảnh chụp Mimint dựa vào đã quá cũ".to_string()
+    } else if lower.contains("unknown_outcome") {
+        "không rõ hành động có chạy hay không (không tự thử lại)".to_string()
+    } else if lower.contains("forbidden") {
+        "mục tiêu bị cấm".to_string()
+    } else if lower.contains("rate_limited") {
+        "vượt giới hạn thao tác".to_string()
+    } else if lower.contains("stopped") || lower.contains("emergency stop") {
+        "phiên điều khiển đã dừng".to_string()
+    } else if lower.contains("out_of_bounds") {
+        "tọa độ nằm ngoài màn hình".to_string()
+    } else if lower.contains("permission_denied") {
+        "thiếu quyền truy cập".to_string()
+    } else {
+        const MAX: usize = 80;
+        if error.chars().count() > MAX {
+            let kept: String = error.chars().take(MAX).collect();
+            format!("{kept}…")
+        } else {
+            error.to_string()
         }
     }
 }
@@ -121,6 +176,9 @@ pub struct ChatState {
     /// Kept across errors and cancellations: the content is never
     /// silently lost.
     pub last_prompt: Option<String>,
+    /// When the running turn started, for the elapsed-time status
+    /// line. Set on submit/resubmit, cleared when the turn ends.
+    pub turn_started: Option<Instant>,
 }
 
 impl ChatState {
@@ -169,6 +227,7 @@ impl ChatState {
         });
         self.busy = true;
         self.status = TurnStatus::Connecting;
+        self.turn_started = Some(Instant::now());
         Some(prompt)
     }
 
@@ -185,6 +244,7 @@ impl ChatState {
         self.last_error_kind = None;
         self.busy = true;
         self.status = TurnStatus::Connecting;
+        self.turn_started = Some(Instant::now());
         Some(prompt)
     }
 
@@ -212,6 +272,7 @@ impl ChatState {
         });
         self.busy = false;
         self.status = TurnStatus::Idle;
+        self.turn_started = None;
     }
 
     /// A turn failed: record the error, keep the user message and the
@@ -221,6 +282,7 @@ impl ChatState {
         self.last_error_kind = Some(kind);
         self.busy = false;
         self.status = TurnStatus::Idle;
+        self.turn_started = None;
     }
 
     /// A turn was cancelled (turn cancel or STOP): not a failure.
@@ -228,6 +290,13 @@ impl ChatState {
     pub fn on_cancelled(&mut self) {
         self.busy = false;
         self.status = TurnStatus::Idle;
+        self.turn_started = None;
+    }
+
+    /// Elapsed seconds of the running turn, for the status line.
+    /// `None` when no turn is running.
+    pub fn turn_elapsed_secs(&self) -> Option<u64> {
+        self.turn_started.map(|started| started.elapsed().as_secs())
     }
 
     /// Add a system notice (backend status, onboarding suggestion).
@@ -242,12 +311,27 @@ impl ChatState {
     /// Show an approval card for the guard's request id. While a card
     /// is on screen, `submit_input` refuses new turns: the user
     /// answers the guard question first.
-    pub fn request_approval(&mut self, id: u64, tool: String, args: Value, deadline: Instant) {
+    #[allow(clippy::too_many_arguments)]
+    pub fn request_approval(
+        &mut self,
+        id: u64,
+        tool: String,
+        args: Value,
+        deadline: Instant,
+        timeout: Duration,
+        target: Option<WindowIdentity>,
+        observation_age: Option<Duration>,
+        max_observation_age: Duration,
+    ) {
         self.pending_approval = Some(ApprovalRequest {
             id,
             tool,
             args,
             deadline: Some(deadline),
+            timeout,
+            target,
+            observation_age,
+            max_observation_age,
         });
     }
 
@@ -364,6 +448,10 @@ mod tests {
             "notebook_add".to_string(),
             json!({"title": "x"}),
             Instant::now(),
+            Duration::from_secs(60),
+            None,
+            None,
+            Duration::from_secs(300),
         );
         assert_eq!(chat.control_state(), ControlState::AwaitingApproval);
         chat.input = "wait".to_string();
@@ -373,6 +461,62 @@ mod tests {
         assert!(chat.resolve_approval(42));
         assert!(chat.pending_approval.is_none());
         assert_eq!(chat.submit_input().as_deref(), Some("wait"));
+    }
+
+    #[test]
+    fn turn_started_tracks_the_running_turn_only() {
+        let mut chat = ChatState::new();
+        assert_eq!(chat.turn_elapsed_secs(), None);
+        chat.input = "hi".to_string();
+        chat.submit_input();
+        assert!(chat.turn_started.is_some());
+        assert_eq!(chat.turn_elapsed_secs(), Some(0));
+        chat.on_reply("done".to_string(), Vec::new());
+        assert_eq!(chat.turn_elapsed_secs(), None);
+        chat.input = "again".to_string();
+        chat.submit_input();
+        assert!(chat.turn_started.is_some());
+        chat.on_cancelled();
+        assert_eq!(chat.turn_elapsed_secs(), None);
+    }
+
+    #[test]
+    fn friendly_tool_error_maps_known_codes() {
+        assert!(friendly_tool_error("target_changed: window differs").contains("đã đổi"));
+        assert!(friendly_tool_error("stale_observation: age 400s").contains("quá cũ"));
+        assert!(friendly_tool_error("unknown_outcome: maybe ran").contains("không rõ"));
+        assert!(friendly_tool_error("forbidden_target: x").contains("bị cấm"));
+        let long = "x".repeat(200);
+        let shown = friendly_tool_error(&long);
+        assert!(shown.ends_with('…'));
+        assert_eq!(shown.chars().count(), 81);
+        assert_eq!(friendly_tool_error("short"), "short");
+    }
+
+    #[test]
+    fn approval_carries_target_and_observation_context() {
+        let mut chat = ChatState::new();
+        let target = WindowIdentity {
+            window_id: Some(7),
+            class: Some("editor".to_string()),
+            title: None,
+            exe_basename: Some("code".to_string()),
+        };
+        chat.request_approval(
+            1,
+            "body_click".to_string(),
+            json!({"x": 1, "y": 2}),
+            Instant::now(),
+            Duration::from_secs(60),
+            Some(target),
+            Some(Duration::from_secs(42)),
+            Duration::from_secs(300),
+        );
+        let req = chat.pending_approval.as_ref().unwrap();
+        assert_eq!(req.timeout, Duration::from_secs(60));
+        assert_eq!(req.target.as_ref().unwrap().window_id, Some(7));
+        assert_eq!(req.observation_age, Some(Duration::from_secs(42)));
+        assert_eq!(req.max_observation_age, Duration::from_secs(300));
     }
 
     #[test]

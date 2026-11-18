@@ -27,7 +27,7 @@ pub mod tools;
 pub mod vault;
 
 pub use audit::{AuditLog, AuditRecord};
-pub use brain::{Brain, StepVerifier, TurnOutcome};
+pub use brain::{Brain, BrainProgress, StepVerifier, TurnOutcome};
 pub use cancel::CancelToken;
 pub use claude::{ClaudeClient, ANTHROPIC_BASE_URL, ANTHROPIC_VERSION, DEFAULT_MAX_TOKENS};
 pub use config::{default_config_path, load_config_file, FileConfig, ResolvedConfig};

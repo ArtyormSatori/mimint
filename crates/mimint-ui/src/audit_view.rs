@@ -30,6 +30,9 @@ pub struct AuditRow {
     /// The `reason` inside the detail object, when present (it
     /// distinguishes refused / timed-out / cancelled decisions).
     pub reason: Option<String>,
+    /// The `source` inside the detail object, when present (the
+    /// emergency-stop mechanism: hotkey, approval_pending, ...).
+    pub source: Option<String>,
     /// The raw JSONL line, for the technical layer.
     pub raw: String,
 }
@@ -86,6 +89,34 @@ impl AuditRow {
                 }
             }
             "approval_timeout" => "Một yêu cầu phê duyệt hết thời gian chờ.".to_string(),
+            "execution" => {
+                let tool = self.tool.as_deref().unwrap_or("công cụ");
+                match self.decision.as_deref() {
+                    Some("executed") => format!("Đã chạy {tool}."),
+                    Some("error") => format!("Chạy {tool} gặp lỗi."),
+                    Some(other) => format!("Chạy {tool}: {other}."),
+                    None => format!("Chạy {tool}."),
+                }
+            }
+            "verification" => {
+                let tool = self.tool.as_deref().unwrap_or("công cụ");
+                match self.decision.as_deref() {
+                    Some("verified") => format!("Đã kiểm tra {tool}: kết quả khớp."),
+                    Some("failed") => {
+                        format!("Đã kiểm tra {tool}: kết quả không khớp hoặc gặp lỗi.")
+                    }
+                    Some(other) => format!("Kiểm tra {tool}: {other}."),
+                    None => format!("Kiểm tra {tool}."),
+                }
+            }
+            "reflection" => "Mimint tự xem lại tiến độ của lượt.".to_string(),
+            "emergency_stop" => {
+                let source = self.source.as_deref().unwrap_or("không rõ nguồn");
+                let reason = self.reason.as_deref().unwrap_or("dừng khẩn cấp");
+                format!(
+                    "Dừng khẩn cấp ({source}): {reason}. Khởi động lại ứng dụng để điều khiển tiếp."
+                )
+            }
             "privacy_mode" => match self.decision.as_deref() {
                 Some("on") => "Chế độ riêng tư: BẬT.".to_string(),
                 Some("off") => "Chế độ riêng tư: TẮT.".to_string(),
@@ -143,6 +174,11 @@ pub fn parse_audit_line(line: &str) -> Option<AuditRow> {
         .and_then(|d| d.get("reason"))
         .and_then(Value::as_str)
         .map(str::to_string);
+    let source = obj
+        .get("detail")
+        .and_then(|d| d.get("source"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
     Some(AuditRow {
         ts_ms,
         turn_id,
@@ -151,6 +187,7 @@ pub fn parse_audit_line(line: &str) -> Option<AuditRow> {
         decision,
         detail,
         reason,
+        source,
         raw: line.trim().to_string(),
     })
 }
@@ -186,6 +223,28 @@ pub fn read_audit_tail(path: &Path, max_lines: usize) -> Vec<AuditRow> {
         rows.drain(..rows.len() - max_lines);
     }
     rows
+}
+
+/// The restart banner for the audit panel: when the newest
+/// `emergency_stop` record is newer than the newest app startup
+/// (`ui-startup` turn id), the latch is still in force and the
+/// panel says so, with the stop's source, reason, and time.
+/// `None` when no stop is recorded, or a restart happened after
+/// the last stop (the latch cleared with the old process).
+pub fn stop_banner(rows: &[AuditRow]) -> Option<String> {
+    let last_stop = rows.iter().rposition(|row| row.kind == "emergency_stop")?;
+    if let Some(last_startup) = rows.iter().rposition(|row| row.turn_id == "ui-startup") {
+        if last_startup > last_stop {
+            return None;
+        }
+    }
+    let row = &rows[last_stop];
+    let source = row.source.as_deref().unwrap_or("không rõ nguồn");
+    let reason = row.reason.as_deref().unwrap_or("dừng khẩn cấp");
+    Some(format!(
+        "Đã DỪNG KHẨN CẤP ({source}, lúc {} UTC) — {reason}. Khởi động lại ứng dụng để điều khiển tiếp.",
+        format_time_ms(row.ts_ms)
+    ))
 }
 
 /// Format epoch milliseconds as `HH:MM:SS` (UTC). No date library is
@@ -279,6 +338,66 @@ mod tests {
         )
         .unwrap();
         assert_eq!(row.friendly_summary(), "Chế độ riêng tư: BẬT.");
+    }
+
+    #[test]
+    fn friendly_summary_covers_execution_verification_reflection_and_stop() {
+        let row = parse_audit_line(
+            r#"{"ts_ms":1,"turn_id":"t","kind":"execution","tool":"body_click","decision":"executed","detail":{}}"#,
+        )
+        .unwrap();
+        assert_eq!(row.friendly_summary(), "Đã chạy body_click.");
+        let row = parse_audit_line(
+            r#"{"ts_ms":1,"turn_id":"t","kind":"execution","tool":"body_click","decision":"error","detail":{"error":"boom"}}"#,
+        )
+        .unwrap();
+        assert_eq!(row.friendly_summary(), "Chạy body_click gặp lỗi.");
+        let row = parse_audit_line(
+            r#"{"ts_ms":1,"turn_id":"t","kind":"verification","tool":"body_click","decision":"verified","detail":{}}"#,
+        )
+        .unwrap();
+        assert!(row.friendly_summary().contains("kết quả khớp"));
+        let row = parse_audit_line(
+            r#"{"ts_ms":1,"turn_id":"t","kind":"verification","tool":"body_click","decision":"failed","detail":{"reason":"tool_error"}}"#,
+        )
+        .unwrap();
+        assert!(row.friendly_summary().contains("không khớp"));
+        let row = parse_audit_line(
+            r#"{"ts_ms":1,"turn_id":"t","kind":"reflection","detail":{"step":2}}"#,
+        )
+        .unwrap();
+        assert!(row.friendly_summary().contains("xem lại tiến độ"));
+        let row = parse_audit_line(
+            r#"{"ts_ms":3661000,"turn_id":"ui-control","kind":"emergency_stop","decision":"stopped","detail":{"source":"hotkey","reason":"global STOP hotkey pressed","trip_ts_ms":3661000}}"#,
+        )
+        .unwrap();
+        assert_eq!(row.source.as_deref(), Some("hotkey"));
+        assert!(row.friendly_summary().contains("Dừng khẩn cấp (hotkey)"));
+        assert!(row.friendly_summary().contains("Khởi động lại"));
+    }
+
+    #[test]
+    fn stop_banner_shows_until_a_restart_supersedes_it() {
+        let stop = parse_audit_line(
+            r#"{"ts_ms":3661000,"turn_id":"ui-control","kind":"emergency_stop","decision":"stopped","detail":{"source":"hotkey","reason":"chord pressed","trip_ts_ms":3661000}}"#,
+        )
+        .unwrap();
+        let startup = parse_audit_line(
+            r#"{"ts_ms":3662000,"turn_id":"ui-startup","kind":"privacy_mode","decision":"on","detail":{}}"#,
+        )
+        .unwrap();
+        assert!(stop_banner(&[]).is_none());
+        let banner = stop_banner(std::slice::from_ref(&stop)).expect("banner for a live latch");
+        assert!(banner.contains("01:01:01"), "{banner}");
+        assert!(banner.contains("hotkey"), "{banner}");
+        // A restart after the stop clears the banner.
+        assert!(stop_banner(&[stop.clone(), startup]).is_none());
+        // A stop after the restart shows again.
+        let startup2 = parse_audit_line(
+            r#"{"ts_ms":3662000,"turn_id":"ui-startup","kind":"privacy_mode","decision":"on","detail":{}}"#,
+        )
+        .unwrap();
+        assert!(stop_banner(&[startup2, stop]).is_some());
     }
 
     #[test]

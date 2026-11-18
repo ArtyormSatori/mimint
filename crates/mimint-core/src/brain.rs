@@ -68,6 +68,26 @@ pub trait StepVerifier: Send + Sync {
     ) -> Result<Option<(bool, Value)>, MimintError>;
 }
 
+/// What the brain is doing, reported to the UI as the turn runs
+/// (F4-17). The UI shows the phase plus elapsed time instead of
+/// a generic spinner. Reporting is best-effort and never
+/// changes the turn: a hook that panics is caught and ignored,
+/// and the step budget still bounds the turn (a failed tool
+/// does not loop forever — the model gets at most `max_steps`
+/// steps, then the turn ends partial).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BrainProgress {
+    /// A provider call is in flight (the model is thinking).
+    Analyzing,
+    /// A tool is executing.
+    Acting { tool: String },
+    /// The step verifier is checking the previous tool results.
+    Verifying,
+    /// A tool failed: the tool name and the raw error text
+    /// (the UI renders a friendly form of it).
+    ToolFailed { tool: String, error: String },
+}
+
 /// One-turn brain loop over a provider, a tool registry, and a notebook.
 /// The provider is any [`Provider`] implementation: a single backend or
 /// a fallback chain. The loop itself is protocol-agnostic.
@@ -81,6 +101,7 @@ pub struct Brain<'a> {
     max_steps: usize,
     cancel_tokens: Vec<CancelToken>,
     verifier: Option<Arc<dyn StepVerifier>>,
+    progress_hook: Option<Arc<dyn Fn(BrainProgress) + Send + Sync>>,
 }
 
 impl<'a> Brain<'a> {
@@ -109,6 +130,7 @@ impl<'a> Brain<'a> {
             max_steps,
             cancel_tokens: Vec::new(),
             verifier: None,
+            progress_hook: None,
         })
     }
 
@@ -117,6 +139,23 @@ impl<'a> Brain<'a> {
     /// verification for every tool except `notebook_add`.
     pub fn set_step_verifier(&mut self, verifier: Arc<dyn StepVerifier>) {
         self.verifier = Some(verifier);
+    }
+
+    /// Register a progress hook (see [`BrainProgress`]). Called
+    /// synchronously from the turn: keep it cheap and
+    /// non-blocking (the worker's hook only sends on a
+    /// channel). A hook that panics is caught and ignored.
+    pub fn set_progress_hook(&mut self, hook: Arc<dyn Fn(BrainProgress) + Send + Sync>) {
+        self.progress_hook = Some(hook);
+    }
+
+    fn report(&self, progress: BrainProgress) {
+        if let Some(hook) = &self.progress_hook {
+            let hook = Arc::clone(hook);
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                hook(progress);
+            }));
+        }
     }
 
     /// Add a cancellation token: checked before every provider call
@@ -179,6 +218,9 @@ impl<'a> Brain<'a> {
                 return Err(err);
             }
             // Phase 1 (mandatory): verify the previous tool results by code.
+            if !pending.is_empty() {
+                self.report(BrainProgress::Verifying);
+            }
             for prev in pending.drain(..) {
                 let ok = self.verify_previous(&prev)?;
                 verified.push((prev.tool, ok));
@@ -196,6 +238,7 @@ impl<'a> Brain<'a> {
             messages.push(ChatMessage::system(format!("Reflection: {reflection}")));
 
             let ctx = CallContext::new(&self.turn_id, Some(self.audit));
+            self.report(BrainProgress::Analyzing);
             let reply = self.provider.chat(&ctx, &messages, &tool_schemas).await?;
             let calls = reply.tool_calls.clone().unwrap_or_default();
             if calls.is_empty() {
@@ -252,39 +295,50 @@ impl<'a> Brain<'a> {
                         MimintError::Tool(format!("tool arguments are not valid JSON: {err}"))
                     });
                 match parsed {
-                    Ok(args) => match executor.execute(&call.function.name, &args) {
-                        Ok(output) => {
-                            messages.push(ChatMessage::tool_result(&call.id, output.to_string()));
-                            pending.push(PendingVerification {
-                                tool: call.function.name.clone(),
-                                args,
-                                output: Some(output),
-                                error: None,
-                            });
+                    Ok(args) => {
+                        self.report(BrainProgress::Acting {
+                            tool: call.function.name.clone(),
+                        });
+                        match executor.execute(&call.function.name, &args) {
+                            Ok(output) => {
+                                messages
+                                    .push(ChatMessage::tool_result(&call.id, output.to_string()));
+                                pending.push(PendingVerification {
+                                    tool: call.function.name.clone(),
+                                    args,
+                                    output: Some(output),
+                                    error: None,
+                                });
+                            }
+                            Err(err) if err.is_cancelled() => {
+                                // Cancellation is not a tool error: abort
+                                // the turn instead of telling the model.
+                                self.audit.log(
+                                    &self.turn_id,
+                                    "turn_end",
+                                    None,
+                                    Some("cancelled"),
+                                    json!({"reason": "cancelled_during_tool", "tool": call.function.name}),
+                                )?;
+                                return Err(err);
+                            }
+                            Err(err) => {
+                                self.report(BrainProgress::ToolFailed {
+                                    tool: call.function.name.clone(),
+                                    error: err.to_string(),
+                                });
+                                let detail = json!({"error": err.to_string()});
+                                messages
+                                    .push(ChatMessage::tool_result(&call.id, detail.to_string()));
+                                pending.push(PendingVerification {
+                                    tool: call.function.name.clone(),
+                                    args,
+                                    output: None,
+                                    error: Some(err.to_string()),
+                                });
+                            }
                         }
-                        Err(err) if err.is_cancelled() => {
-                            // Cancellation is not a tool error: abort
-                            // the turn instead of telling the model.
-                            self.audit.log(
-                                &self.turn_id,
-                                "turn_end",
-                                None,
-                                Some("cancelled"),
-                                json!({"reason": "cancelled_during_tool", "tool": call.function.name}),
-                            )?;
-                            return Err(err);
-                        }
-                        Err(err) => {
-                            let detail = json!({"error": err.to_string()});
-                            messages.push(ChatMessage::tool_result(&call.id, detail.to_string()));
-                            pending.push(PendingVerification {
-                                tool: call.function.name.clone(),
-                                args,
-                                output: None,
-                                error: Some(err.to_string()),
-                            });
-                        }
-                    },
+                    }
                     Err(err) => {
                         let detail = json!({"error": err.to_string()});
                         messages.push(ChatMessage::tool_result(&call.id, detail.to_string()));
@@ -690,6 +744,138 @@ mod tests {
         assert_eq!(verification["detail"]["frame"], 7);
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_file(&audit_path);
+    }
+
+    #[tokio::test]
+    async fn progress_hook_reports_phases_in_order() {
+        let stem = temp_stem("progress");
+        let db_path = format!("{stem}.db");
+        let audit_path = format!("{stem}.jsonl");
+        let notebook = Arc::new(Notebook::open(&db_path).unwrap());
+        let audit = AuditLog::open(&audit_path).unwrap();
+        let registry = crate::tools::default_registry(Arc::clone(&notebook));
+        let provider = ScriptProvider {
+            replies: std::sync::Mutex::new(std::collections::VecDeque::from([
+                tool_call_message("notebook_search", r#"{"query":"nothing"}"#),
+                ChatMessage {
+                    role: "assistant".to_string(),
+                    content: Some("Done.".to_string()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                },
+            ])),
+        };
+        let mut brain = Brain::new(
+            &provider,
+            &registry,
+            None,
+            &audit,
+            Arc::clone(&notebook),
+            "turn-progress-test",
+            3,
+        )
+        .unwrap();
+        let seen: Arc<std::sync::Mutex<Vec<BrainProgress>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_clone = Arc::clone(&seen);
+        brain.set_progress_hook(Arc::new(move |progress| {
+            seen_clone.lock().unwrap().push(progress);
+        }));
+        let outcome = brain.run("search").await.expect("turn succeeds");
+        assert_eq!(outcome.tools_used, vec!["notebook_search"]);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![
+                BrainProgress::Analyzing,
+                BrainProgress::Acting {
+                    tool: "notebook_search".to_string(),
+                },
+                BrainProgress::Verifying,
+                BrainProgress::Analyzing,
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn progress_hook_reports_tool_failure_and_survives_a_panicking_hook() {
+        let stem = temp_stem("progress-fail");
+        let db_path = format!("{stem}.db");
+        let audit_path = format!("{stem}.jsonl");
+        let notebook = Arc::new(Notebook::open(&db_path).unwrap());
+        let audit = AuditLog::open(&audit_path).unwrap();
+        let registry = crate::tools::default_registry(Arc::clone(&notebook));
+        // Unknown tool: the executor fails, the hook must see
+        // ToolFailed, and the turn continues to the next step.
+        let provider = ScriptProvider {
+            replies: std::sync::Mutex::new(std::collections::VecDeque::from([
+                tool_call_message("no_such_tool", r#"{}"#),
+                ChatMessage {
+                    role: "assistant".to_string(),
+                    content: Some("Done.".to_string()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                },
+            ])),
+        };
+        let mut brain = Brain::new(
+            &provider,
+            &registry,
+            None,
+            &audit,
+            Arc::clone(&notebook),
+            "turn-progress-fail-test",
+            3,
+        )
+        .unwrap();
+        let seen: Arc<std::sync::Mutex<Vec<BrainProgress>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_clone = Arc::clone(&seen);
+        brain.set_progress_hook(Arc::new(move |progress| {
+            seen_clone.lock().unwrap().push(progress);
+        }));
+        let outcome = brain.run("fail").await.expect("turn succeeds");
+        assert_eq!(outcome.tools_used, vec!["no_such_tool"]);
+        {
+            let seen = seen.lock().unwrap();
+            assert!(matches!(seen[0], BrainProgress::Analyzing));
+            assert!(matches!(
+                &seen[1],
+                BrainProgress::Acting { tool } if tool == "no_such_tool"
+            ));
+            assert!(matches!(
+                &seen[2],
+                BrainProgress::ToolFailed { tool, .. } if tool == "no_such_tool"
+            ));
+        }
+
+        // A panicking hook must not abort the turn.
+        let stem = temp_stem("progress-panic");
+        let db_path = format!("{stem}.db");
+        let audit_path = format!("{stem}.jsonl");
+        let notebook = Arc::new(Notebook::open(&db_path).unwrap());
+        let audit = AuditLog::open(&audit_path).unwrap();
+        let registry = crate::tools::default_registry(Arc::clone(&notebook));
+        let provider = ScriptProvider {
+            replies: std::sync::Mutex::new(std::collections::VecDeque::from([ChatMessage {
+                role: "assistant".to_string(),
+                content: Some("Done.".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+            }])),
+        };
+        let mut brain = Brain::new(
+            &provider,
+            &registry,
+            None,
+            &audit,
+            Arc::clone(&notebook),
+            "turn-progress-panic-test",
+            3,
+        )
+        .unwrap();
+        brain.set_progress_hook(Arc::new(|_| panic!("hook panics")));
+        let outcome = brain.run("hi").await.expect("turn survives the hook");
+        assert_eq!(outcome.text, "Done.");
     }
 
     #[tokio::test]

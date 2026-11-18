@@ -24,16 +24,17 @@
 //! - `MIMINT_UI_PIXELS_PER_POINT=<f>`: UI scale (demo gate
 //!   screenshots at 125%/150%; applied by `main`, not here).
 
-use crate::approval_text::approval_detail;
-use crate::approver::{ApprovalJob, RepaintSignal};
-use crate::audit_view::{read_audit_tail, AuditRow};
-use crate::chat::{ChatRole, ChatState, ControlState, TurnStatus};
+use crate::approval_text::{approval_detail, crop_preview, is_point_tool, target_row};
+use crate::approver::{approval_point, ApprovalJob, RepaintSignal};
+use crate::audit_view::{read_audit_tail, stop_banner, AuditRow};
+use crate::chat::{friendly_tool_error, ChatRole, ChatState, ControlState, TurnStatus};
 use crate::face::{breath_scale, is_blinking, EyeShape, FaceMachine, MouthShape};
 use crate::motion::{MotionController, MotionTier};
 use crate::worker::{FailureKind, WorkerEvent, WorkerHandle};
 use egui::{Color32, Pos2, Rect, Stroke, Vec2};
 use mimint_body::ScreenRect;
-use mimint_core::ApprovalDecision;
+use mimint_control::FrameStore;
+use mimint_core::{ApprovalDecision, BrainProgress};
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
@@ -83,6 +84,10 @@ pub struct AppOptions {
     /// writes its window rectangle here every frame, and the body
     /// guard refuses clicks inside it. `None` without `--body`.
     pub shared_exclusion: Option<Arc<RwLock<Vec<ScreenRect>>>>,
+    /// Shared frame store (`--body` mode only): the approval
+    /// card crops its preview from the newest stored frame.
+    /// `None` without `--body`.
+    pub frame_store: Option<Arc<FrameStore>>,
 }
 
 pub struct MimintApp {
@@ -126,6 +131,15 @@ pub struct MimintApp {
     /// Last exclusion rect written, so the shared list is only
     /// rewritten when the window actually moved or resized.
     last_exclusion: Option<ScreenRect>,
+    /// Shared frame store for the approval-card crop preview.
+    frame_store: Option<Arc<FrameStore>>,
+    /// Card crop texture, keyed by approval job id: `Some((id,
+    /// Some(texture)))` when the job has a crop, `Some((id,
+    /// None))` when the crop was computed and there is none
+    /// (no frame, no point), `None` when no card is showing.
+    /// Keyed so the preview freezes at card time instead of
+    /// tracking newer frames while the user decides.
+    approval_crop: Option<(u64, Option<egui::TextureHandle>)>,
 }
 
 impl MimintApp {
@@ -175,6 +189,8 @@ impl MimintApp {
             repaint: options.repaint,
             shared_exclusion: options.shared_exclusion,
             last_exclusion: None,
+            frame_store: options.frame_store,
+            approval_crop: None,
         }
     }
 
@@ -240,6 +256,15 @@ impl MimintApp {
                     let had_tools = !tools_used.is_empty();
                     self.backend_in_use = backend;
                     self.chat.on_reply(text, tools_used);
+                    if had_tools {
+                        // Action is not completion: the tools
+                        // ran, but only the user can tell
+                        // whether the job is actually done.
+                        self.chat.add_system(
+                            "Mimint đã chạy công cụ trong lượt này. Hãy kiểm tra màn hình xem việc đã xong chưa — Mimint không tự kết luận việc đã hoàn thành."
+                                .to_string(),
+                        );
+                    }
                     self.face.on_turn_finished(now, had_tools);
                     self.state_since = now;
                     self.clear_stale_card();
@@ -264,6 +289,16 @@ impl MimintApp {
                 WorkerEvent::TryingBackend { name } => {
                     self.backend_in_use = Some(name.clone());
                     self.chat.status = TurnStatus::TryingBackend(name);
+                }
+                WorkerEvent::TurnProgress { progress } => {
+                    self.chat.status = match progress {
+                        BrainProgress::Analyzing => TurnStatus::Analyzing,
+                        BrainProgress::Acting { tool } => TurnStatus::Acting(tool),
+                        BrainProgress::Verifying => TurnStatus::Verifying,
+                        BrainProgress::ToolFailed { tool, error } => {
+                            TurnStatus::ToolFailed { tool, error }
+                        }
+                    };
                 }
                 WorkerEvent::WorkerFault { error } => {
                     self.chat.control_error = true;
@@ -305,6 +340,7 @@ impl MimintApp {
     /// outcome is the news, not the card.
     fn clear_stale_card(&mut self) {
         self.pending_job = None;
+        self.approval_crop = None;
         self.chat.expire_approval();
     }
 
@@ -313,8 +349,16 @@ impl MimintApp {
             return;
         }
         if let Ok(job) = self.approvals.try_recv() {
-            self.chat
-                .request_approval(job.id, job.tool.clone(), job.args.clone(), job.deadline);
+            self.chat.request_approval(
+                job.id,
+                job.tool.clone(),
+                job.args.clone(),
+                job.deadline,
+                job.timeout,
+                job.target.clone(),
+                job.observation_age,
+                job.max_observation_age,
+            );
             self.pending_job = Some(job);
             self.log_event("approval_shown");
         }
@@ -329,11 +373,17 @@ impl MimintApp {
             .as_ref()
             .is_some_and(|job| now >= job.deadline);
         if expired {
+            let timeout_secs = self
+                .pending_job
+                .as_ref()
+                .map(|job| job.timeout.as_secs())
+                .unwrap_or(0);
             self.pending_job = None;
+            self.approval_crop = None;
             if self.chat.expire_approval() {
-                self.chat.add_system(
-                    "Hết thời gian chờ phê duyệt (120 giây): công cụ đã bị từ chối.".to_string(),
-                );
+                self.chat.add_system(format!(
+                    "Hết thời gian chờ phê duyệt ({timeout_secs} giây): công cụ đã bị từ chối."
+                ));
                 self.log_event("approval_expired");
             }
         }
@@ -410,22 +460,48 @@ impl MimintApp {
         if self.chat.pending_approval.is_some() {
             return Some("Chờ bạn xác nhận trên thẻ phê duyệt…".to_string());
         }
+        self.turn_phase_line()
+    }
+
+    /// What the running turn is doing, with real elapsed time
+    /// (F4-17). `None` when no turn is running. The header and
+    /// the message area share this, so the phase never
+    /// disagrees with itself on screen.
+    fn turn_phase_line(&self) -> Option<String> {
+        let elapsed = self
+            .chat
+            .turn_elapsed_secs()
+            .map(|secs| format!(" ({secs} giây)"))
+            .unwrap_or_default();
         match &self.chat.status {
-            TurnStatus::Connecting => Some("Đang kết nối…".to_string()),
-            TurnStatus::TryingBackend(name) => Some(format!("Đang thử backend {name}…")),
+            TurnStatus::Connecting => Some(format!("Đang kết nối…{elapsed}")),
+            TurnStatus::TryingBackend(name) => Some(format!("Đang thử backend {name}…{elapsed}")),
+            TurnStatus::Analyzing => Some(format!("Mimint đang nghĩ…{elapsed}")),
+            TurnStatus::Acting(tool) => Some(format!("Đang chạy {tool}…{elapsed}")),
+            TurnStatus::Verifying => Some(format!("Đang kiểm tra kết quả trên màn hình…{elapsed}")),
+            TurnStatus::ToolFailed { tool, error } => Some(format!(
+                "Công cụ {tool} thất bại: {}. Đang xem lại bước tiếp theo…{elapsed}",
+                friendly_tool_error(error)
+            )),
             TurnStatus::Idle => None,
         }
     }
 
     fn error_line(&self) -> Option<String> {
         let error = self.chat.last_error.as_ref()?;
-        let heading = match self.chat.last_error_kind {
-            Some(FailureKind::Auth) => "Lỗi xác thực",
-            Some(FailureKind::PolicyBlocked) => "Bị chặn bởi Chế độ riêng tư",
-            Some(FailureKind::OutOfBackends) => "Hết backend",
-            Some(FailureKind::Other) | None => "Lỗi",
+        let (heading, guidance) = match self.chat.last_error_kind {
+            Some(FailureKind::Auth) => ("Lỗi xác thực", " Kiểm tra API key trong file cấu hình."),
+            Some(FailureKind::PolicyBlocked) => (
+                "Bị chặn bởi Chế độ riêng tư",
+                " Tắt Chế độ riêng tư hoặc dùng backend cục bộ.",
+            ),
+            Some(FailureKind::OutOfBackends) => (
+                "Hết backend",
+                " Kiểm tra Ollama/LM Studio hoặc file cấu hình backend.",
+            ),
+            Some(FailureKind::Other) | None => ("Lỗi", ""),
         };
-        Some(format!("{heading}: {error}"))
+        Some(format!("{heading}: {error}{guidance}"))
     }
 }
 
@@ -625,6 +701,16 @@ impl eframe::App for MimintApp {
                         MotionTier::Full => {}
                     }
                     ui.separator();
+                    ui.heading("Phím dừng khẩn cấp");
+                    #[cfg(target_os = "linux")]
+                    ui.label(
+                        "Ctrl+Alt+Shift+Escape — dừng ngay mọi điều khiển, kể cả khi cửa sổ Mimint không được chọn. Đã dừng thì phải khởi động lại ứng dụng mới điều khiển tiếp.",
+                    );
+                    #[cfg(not(target_os = "linux"))]
+                    ui.label(
+                        "Phím dừng khẩn cấp toàn cục chưa có trên nền tảng này. Dùng nút DỪNG NGAY trong ứng dụng.",
+                    );
+                    ui.separator();
                     ui.heading("Chó robot (ESP32)");
                     ui.label("Trạng thái: chưa kết nối");
                     ui.label("Kết nối robot là việc Phase 7.");
@@ -647,6 +733,11 @@ impl eframe::App for MimintApp {
                             self.audit_rows.len()
                         ));
                     });
+                    // Latch banner: a live emergency stop, with
+                    // its source and time, above the records.
+                    if let Some(banner) = stop_banner(&self.audit_rows) {
+                        ui.colored_label(Color32::from_rgb(0xDC, 0x26, 0x26), banner);
+                    }
                     egui::ScrollArea::vertical().show(ui, |ui| {
                         for row in &self.audit_rows {
                             if self.audit_technical {
@@ -680,11 +771,44 @@ impl eframe::App for MimintApp {
             // Approval card (P0-17): action-specific content + countdown.
             if let Some(req) = self.chat.pending_approval.clone() {
                 let detail = approval_detail(&req.tool, &req.args);
+                // Crop preview, computed once per job (frozen at
+                // card time) from the newest stored frame.
+                let crop = self.approval_crop_texture(ui.ctx(), &req);
                 ui.group(|ui| {
                     ui.heading(format!("Cần phê duyệt — {}", detail.title));
                     ui.label(format!("Yêu cầu #{} · công cụ: {}", req.id, req.tool));
                     for (label, value) in &detail.rows {
                         ui.label(format!("{label}: {value}"));
+                    }
+                    // Target identity at request time (F4-05):
+                    // what window the action will land on.
+                    if let Some(target) = &req.target {
+                        let (label, value) = target_row(target);
+                        ui.label(format!("{label}: {value}"));
+                    } else if is_point_tool(&req.tool) {
+                        ui.label(
+                            "Cửa sổ đích: không xác định được — hãy kiểm tra kỹ tọa độ trước khi cho phép.",
+                        );
+                    }
+                    if let Some(texture) = &crop {
+                        ui.label("Vùng quanh điểm đích, từ ảnh chụp gần nhất (chỉ để xem):");
+                        ui.image((texture.id(), Vec2::splat(120.0)));
+                    }
+                    // Stale-observation warning (F4-08): the
+                    // observation the model acted on is older
+                    // than the TTL. Allowing still runs the
+                    // execution-time re-verify before acting.
+                    if let Some(age) = req.observation_age {
+                        if age > req.max_observation_age {
+                            ui.colored_label(
+                                Color32::from_rgb(0xDC, 0x26, 0x26),
+                                format!(
+                                    "Cảnh báo: ảnh chụp Mimint dựa vào đã cũ ({} giây, giới hạn {} giây). Nếu cho phép, Mimint sẽ kiểm tra lại mục tiêu trước khi thực hiện.",
+                                    age.as_secs(),
+                                    req.max_observation_age.as_secs()
+                                ),
+                            );
+                        }
                     }
                     ui.label(format!("Hoàn tác: {}", detail.reversible));
                     if let Some(deadline) = req.deadline {
@@ -907,7 +1031,11 @@ impl eframe::App for MimintApp {
                         ui.add_space(4.0);
                     }
                     if self.chat.busy {
-                        ui.label("Mimint đang nghĩ…");
+                        if let Some(line) = self.turn_phase_line() {
+                            ui.label(line);
+                        } else {
+                            ui.label("Mimint đang nghĩ…");
+                        }
                     }
                 });
         });
@@ -918,6 +1046,20 @@ impl MimintApp {
     fn decide_approval(&mut self, id: u64, decision: ApprovalDecision) {
         if self.chat.resolve_approval(id) {
             if let Some(job) = self.pending_job.take() {
+                self.approval_crop = None;
+                // Deadline re-check at the UI layer (F4-06):
+                // a card that expired between renders must
+                // never be answered, even if the button was
+                // clicked. The worker already timed out; the
+                // decision is dropped, not sent.
+                if Instant::now() >= job.deadline {
+                    self.chat.add_system(format!(
+                        "Thẻ phê duyệt đã hết hạn ({} giây): công cụ đã bị từ chối.",
+                        job.timeout.as_secs()
+                    ));
+                    self.log_event("approval_expired_late_decision_refused");
+                    return;
+                }
                 let _ = job.reply.send(decision);
                 self.log_event(if decision == ApprovalDecision::Allow {
                     "approval_decided allow"
@@ -926,6 +1068,47 @@ impl MimintApp {
                 });
             }
         }
+    }
+
+    /// The card's crop preview texture for one job, computed
+    /// once and cached by job id. `None` when there is no
+    /// frame store, no stored frame, or the tool has no point.
+    /// Display only: the crop never feeds any decision.
+    fn approval_crop_texture(
+        &mut self,
+        ctx: &egui::Context,
+        req: &crate::chat::ApprovalRequest,
+    ) -> Option<egui::TextureHandle> {
+        if let Some((cached_id, cached)) = &self.approval_crop {
+            if *cached_id == req.id {
+                return cached.clone();
+            }
+        }
+        let texture = self.build_approval_crop(ctx, req);
+        self.approval_crop = Some((req.id, texture.clone()));
+        texture
+    }
+
+    fn build_approval_crop(
+        &self,
+        ctx: &egui::Context,
+        req: &crate::chat::ApprovalRequest,
+    ) -> Option<egui::TextureHandle> {
+        let frames = self.frame_store.as_ref()?;
+        let (x, y) = approval_point(&req.tool, &req.args)?;
+        let id = frames.latest_id()?;
+        let image = frames.with_frame(id, |frame| {
+            let (rgba, width, height) = crop_preview(frame, x, y, 120)?;
+            Some(egui::ColorImage::from_rgba_unmultiplied(
+                [width as usize, height as usize],
+                &rgba,
+            ))
+        })??;
+        Some(ctx.load_texture(
+            format!("approval-crop-{}", req.id),
+            image,
+            egui::TextureOptions::default(),
+        ))
     }
 
     /// The backend picker, shared by the full/compact header and the

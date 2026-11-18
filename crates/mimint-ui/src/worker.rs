@@ -26,12 +26,14 @@
 //! [`build_chain`]: mimint_core::build_chain
 
 use crate::approver::{ApprovalJob, RepaintSignal, TokenSlot, UiApprover};
-use mimint_body::StopFlag;
-use mimint_control::{register_body_tools, BodyActor, BodyStepVerifier, FrameStore, PrivacyFlag};
+use mimint_body::{StopFlag, TargetSnapshotSlot};
+use mimint_control::{
+    register_body_tools_configured, BodyActor, BodyStepVerifier, FrameStore, PrivacyFlag,
+};
 use mimint_core::audit::now_ms;
 use mimint_core::{
-    default_registry, default_vault, AuditLog, BackendSpec, Brain, CancelToken, CostCap,
-    EgressPolicy, FallbackChain, Notebook, Provider, Registry, RetryPolicy,
+    default_registry, default_vault, AuditLog, BackendSpec, Brain, BrainProgress, CancelToken,
+    CostCap, EgressPolicy, FallbackChain, Notebook, Provider, Registry, RetryPolicy,
 };
 use serde_json::json;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -119,6 +121,10 @@ pub enum WorkerEvent {
     /// chain order, including retries). The UI shows which backend
     /// is being tried, instead of a generic spinner.
     TryingBackend { name: String },
+    /// The brain entered a new phase (thinking, acting,
+    /// verifying, tool failed). The UI shows the phase plus
+    /// elapsed time, instead of a generic spinner.
+    TurnProgress { progress: BrainProgress },
     /// The chain was (re)built, or the attempt failed. `names` is
     /// empty when the build failed; the previous chain (if any) is
     /// kept on a failed rebuild.
@@ -177,6 +183,10 @@ pub struct WorkerDeps {
     pub repaint: Arc<RepaintSignal>,
     /// How long an approval card may wait before timing out.
     pub approval_timeout: Duration,
+    /// Maximum age of the observation a body action may run
+    /// on (F4-08). The same value the card warns against and
+    /// the body tools enforce at execution time.
+    pub max_observation_age: Duration,
     /// Body stack for `--body` mode. `None` means no body tools:
     /// the brain cannot touch the screen.
     pub body: Option<BodyStack>,
@@ -293,41 +303,86 @@ fn worker_loop(
         turn_slot,
         repaint,
         approval_timeout,
+        max_observation_age,
         body,
         approval_pending,
     } = deps;
+    // One snapshot slot shared by the approver (fills it at
+    // request time) and the body tools (consume it at execution
+    // time for the re-verify). Created unconditionally; without
+    // a body it is never filled.
+    let snapshot_slot = Arc::new(TargetSnapshotSlot::new());
     let mut registry = default_registry(Arc::clone(&notebook));
     if let Some(stack) = &body {
-        register_body_tools(
+        register_body_tools_configured(
             &mut registry,
             stack.actor.clone(),
             Arc::clone(&stack.frames),
             stack.privacy.clone(),
+            Arc::clone(&snapshot_slot),
+            max_observation_age,
         );
     }
     let mut approver = UiApprover::new(approval_tx)
         .with_timeout(approval_timeout)
         .with_slots(Arc::clone(&stop_slot), Arc::clone(&turn_slot))
-        .with_repaint(repaint);
+        .with_repaint(repaint)
+        .with_max_observation_age(max_observation_age);
     if let Some(flag) = approval_pending {
         approver = approver.with_pending_flag(flag);
     }
+    if let Some(stack) = &body {
+        // Request-time target probe (F4-07): a short bound, so
+        // a slow body never delays the card — a failed probe
+        // just means no snapshot.
+        let actor = stack.actor.clone();
+        approver = approver.with_target_probe(
+            Arc::new(move |x, y| {
+                actor
+                    .probe_target_with_timeout(x, y, Duration::from_secs(5))
+                    .ok()
+            }),
+            Arc::clone(&snapshot_slot),
+        );
+        let frames = Arc::clone(&stack.frames);
+        approver = approver.with_frame_age(Arc::new(move || frames.latest_age()));
+    }
     // Stop bridge: when the body's stop flag trips (hotkey or
     // approval-pending trip), cancel the stop slot so the running
-    // turn aborts, and tell the UI. Fires once; the flag latches.
+    // turn aborts, record the latch with its context, and tell
+    // the UI. Fires once; the flag latches.
     let bridge_exit = Arc::new(AtomicBool::new(false));
     let bridge = body.as_ref().map(|stack| {
         let flag = Arc::clone(&stack.stop_flag);
         let slot = Arc::clone(&stop_slot);
         let tx = event_tx.clone();
         let exit = Arc::clone(&bridge_exit);
+        let audit = Arc::clone(&audit);
         std::thread::spawn(move || {
             while !exit.load(Ordering::SeqCst) {
                 if flag.is_tripped() {
                     slot.cancel_current();
+                    // The latch is audited with its context:
+                    // source, reason, and trip time (F4-16).
+                    // Best-effort: a failed audit write must
+                    // not block the stop itself.
+                    let (source, reason, ts_ms) = match flag.trip_info() {
+                        Some(info) => (info.source, info.reason, info.ts_ms),
+                        None => ("unknown", "emergency stop tripped".to_string(), now_ms()),
+                    };
+                    let _ = audit.log(
+                        "ui-control",
+                        "emergency_stop",
+                        None,
+                        Some("stopped"),
+                        json!({
+                            "source": source,
+                            "reason": reason,
+                            "trip_ts_ms": ts_ms,
+                        }),
+                    );
                     let _ = tx.send(WorkerEvent::StopTripped {
-                        reason: "emergency stop tripped (global hotkey or input while an approval card waited)"
-                            .to_string(),
+                        reason: format!("{source}: {reason}"),
                     });
                     return;
                 }
@@ -371,7 +426,7 @@ fn worker_loop(
                 // leave the UI stuck on "thinking": catch it,
                 // report it, keep serving.
                 let event = match catch_unwind(AssertUnwindSafe(|| {
-                    run_one_turn(&runtime, chain.as_ref(), &ctx, &prompt)
+                    run_one_turn(&runtime, chain.as_ref(), &ctx, &prompt, &event_tx)
                 })) {
                     Ok(event) => event,
                     Err(payload) => {
@@ -430,6 +485,7 @@ fn run_one_turn(
     chain: Option<&FallbackChain>,
     ctx: &TurnCtx,
     prompt: &str,
+    event_tx: &Sender<WorkerEvent>,
 ) -> WorkerEvent {
     let Some(chain) = chain else {
         return WorkerEvent::TurnFailed {
@@ -461,6 +517,12 @@ fn run_one_turn(
     };
     brain.add_cancel_token(turn_token);
     brain.add_cancel_token(ctx.stop_slot.get());
+    // Phase reports for the status line (F4-17): the hook only
+    // sends on a channel, so it cannot block the turn.
+    let progress_tx = event_tx.clone();
+    brain.set_progress_hook(Arc::new(move |progress| {
+        let _ = progress_tx.send(WorkerEvent::TurnProgress { progress });
+    }));
     if let Some(stack) = ctx.body {
         // Privacy discipline (P4.6.6): tainted frames from
         // earlier turns never survive into a new turn.
@@ -660,7 +722,8 @@ mod tests {
             stop_slot: TokenSlot::new(),
             turn_slot: TokenSlot::new(),
             repaint: RepaintSignal::new(),
-            approval_timeout: Duration::from_secs(120),
+            approval_timeout: Duration::from_secs(60),
+            max_observation_age: Duration::from_secs(300),
             body: None,
             approval_pending: None,
         };
@@ -678,11 +741,12 @@ mod tests {
         panic!("no worker event within 2s");
     }
 
-    /// Drain TryingBackend events, returning the first non-progress event.
+    /// Drain progress events (backend attempts + brain
+    /// phases), returning the first terminal event.
     fn wait_terminal(handle: &WorkerHandle) -> WorkerEvent {
         loop {
             match wait_event(handle) {
-                WorkerEvent::TryingBackend { .. } => continue,
+                WorkerEvent::TryingBackend { .. } | WorkerEvent::TurnProgress { .. } => continue,
                 other => return other,
             }
         }
@@ -719,9 +783,17 @@ mod tests {
         let (handle, _approvals, dir) = spawn_fake(FakeProvider::answering("hi"));
         let _ = wait_event(&handle);
         handle.run_turn("hi".to_string());
+        // The brain reports Analyzing before the chain reports
+        // its attempt; both are progress, in that order.
+        match wait_event(&handle) {
+            WorkerEvent::TurnProgress {
+                progress: BrainProgress::Analyzing,
+            } => {}
+            other => panic!("expected TurnProgress Analyzing first, got: {other:?}"),
+        }
         match wait_event(&handle) {
             WorkerEvent::TryingBackend { name } => assert_eq!(name, "fake"),
-            other => panic!("expected TryingBackend first, got: {other:?}"),
+            other => panic!("expected TryingBackend, got: {other:?}"),
         }
         assert!(matches!(
             wait_terminal(&handle),

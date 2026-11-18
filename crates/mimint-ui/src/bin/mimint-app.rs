@@ -22,11 +22,15 @@
 //! - `MIMINT_UI_DEGRADED=1`: static face + visible simple-mode label.
 //! - `MIMINT_REDUCED_MOTION=1`: OS reduced-motion signal (Linux hook).
 //! - `MIMINT_APPROVAL_TIMEOUT_SECS=<n>`: approval card timeout
-//!   (default 120). Values under 5 are clamped to 5.
+//!   (default 60). Values under 5 are clamped to 5.
+//! - `MIMINT_MAX_OBSERVATION_AGE_SECS=<n>`: maximum age of the
+//!   observation a body action may run on (default 300).
+//!   Values under 5 are clamped to 5.
 //! - `MIMINT_UI_PIXELS_PER_POINT=<f>`: UI scale (demo gate
 //!   screenshots at 125%/150%).
 
 use mimint_body::ScreenRect;
+use mimint_control::DEFAULT_MAX_OBSERVATION_AGE;
 use mimint_core::{
     build_chain, default_config_path, default_vault, egress::url_is_loopback, load_config_file,
     probe_local_backends, suggestion_text, AuditLog, EgressPolicy, FileConfig, MimintError,
@@ -247,6 +251,14 @@ fn run() -> Result<(), MimintError> {
         .and_then(|v| v.parse::<u64>().ok())
         .map(|secs| Duration::from_secs(secs.max(5)))
         .unwrap_or(DEFAULT_APPROVAL_TIMEOUT);
+    let max_observation_age = env::var("MIMINT_MAX_OBSERVATION_AGE_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(|secs| Duration::from_secs(secs.max(5)))
+        .unwrap_or(DEFAULT_MAX_OBSERVATION_AGE);
+    // The card's crop preview shares the worker's frame store:
+    // clone the Arc before the stack moves into the worker.
+    let body_frames = body_stack.as_ref().map(|stack| Arc::clone(&stack.frames));
     let repaint = RepaintSignal::new();
     let deps = WorkerDeps {
         initial_providers,
@@ -264,6 +276,7 @@ fn run() -> Result<(), MimintError> {
         turn_slot: TokenSlot::new(),
         repaint: Arc::clone(&repaint),
         approval_timeout,
+        max_observation_age,
         body: body_stack,
         approval_pending,
     };
@@ -283,6 +296,7 @@ fn run() -> Result<(), MimintError> {
         onboarding_text,
         repaint,
         shared_exclusion,
+        frame_store: body_frames,
     };
     let app = MimintApp::new(worker, approval_rx, options);
     let pixels_per_point = env::var("MIMINT_UI_PIXELS_PER_POINT")
