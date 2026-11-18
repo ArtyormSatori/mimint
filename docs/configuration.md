@@ -110,10 +110,20 @@ cost_cap_usd = 0.0
 | `avatar` | string | none | Avatar label: stored and displayed only. |
 
 Semantic profile errors drop the offending profile with a
-warning and fall closed to the remaining profiles (or the
-implicit "Mặc định" profile when none remain); they never
-fail the run. See `docs/profiles.md` for switching semantics
-and the stored-not-executed limits.
+warning and fall closed to the remaining profiles; they never
+fail the run. When `[[profile]]` tables exist but NONE survive
+validation, the run uses a FORCED-SAFE fallback profile:
+Privacy Mode ON, paid backends locked (cost cap 0), no
+proactive mode, no budget — regardless of the top-level
+settings, which may themselves be the misconfiguration. The
+fallback is audited (`profile_fallback`, decision
+`forced_safe`) and the UI shows a persistent banner until
+restart. A config with NO `[[profile]]` tables is different:
+it builds the implicit "Mặc định" profile from the top-level
+settings, exactly as before profiles existed, and is not
+fallback mode. The broken config file is never overwritten.
+See `docs/profiles.md` for switching semantics and the
+stored-not-executed limits.
 
 ## Backend selection precedence
 

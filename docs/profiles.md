@@ -64,10 +64,28 @@ warning, and the run continues with the remaining profiles.
 Dropped for: empty name, duplicate name (first wins), a chain
 naming an unknown backend, an escaping SOUL file name, a
 negative or non-finite budget, a bad cost cap, an empty skill
-name. If every profile is dropped, the implicit default is
-used. An unknown `default_profile` name falls back to the
+name. If every profile is dropped, the run uses the
+FORCED-SAFE fallback profile (below) — not the top-level
+settings. An unknown `default_profile` name falls back to the
 first profile with a warning. Warnings are surfaced: on
 stderr at CLI startup, and in the UI sidebar.
+
+### Forced-safe fallback (fix pass, F5-03)
+
+When `[[profile]]` tables exist but none survive validation,
+the app runs on a forced-safe profile: Privacy Mode ON, paid
+backends locked (cost cap `0.0`), proactive mode off, no
+budget, the top-level chain. The top-level privacy/cost-cap
+values are NOT inherited, because they may be the
+misconfiguration that broke the profiles. The UI shows a
+persistent "chế độ dự phòng" banner in the sidebar plus one
+startup message naming the mode; the fallback is audited
+(`profile_fallback`, decision `forced_safe`, with the
+warnings that explain which profiles/fields failed). The
+broken config file is never overwritten. A config with no
+`[[profile]]` tables is NOT fallback mode: it builds the
+implicit "Mặc định" profile from the top-level settings, as
+before.
 
 Switching to an unknown profile name (CLI `--profile`, UI
 switch request, eval `--profile`) falls closed to the default
@@ -96,8 +114,24 @@ silently picks a different named profile.
   backend picker remain runtime overrides: they change the
   effective mode/order without changing the profile, and the
   next profile switch applies the profile's values fresh.
+  Switching affects only the NEXT turn: the chat history does
+  not change, and the switch notice says so.
+- UI switch while an approval card waits (fix pass, F5-13):
+  the click is refused with an explanation. The worker
+  processes requests in order, so a switch could only queue
+  behind the running turn — but deciding a card for one
+  profile and switching mid-decision is confusing, so the UI
+  does not send it. The pending card is never cancelled by a
+  switch: it must be decided or time out.
 - `mimint-app --profile NAME`: the startup profile.
   `mimint-eval --profile NAME`: the eval profile.
+
+The sidebar explains each attribute in plain language
+(fix pass, F5-13): what Privacy Mode means for where the
+question goes, which backends the chain tries, which skills
+are selected. Attributes without an engine are marked
+"chưa khả dụng" (voice, avatar, proactive mode, budget) —
+the label never claims behavior the app cannot perform.
 
 Audit records written during a turn carry the active profile
 name in their `detail.profile` field, including the fallback
