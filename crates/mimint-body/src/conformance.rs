@@ -183,6 +183,30 @@ fn check(id: &'static str, name: &'static str, passed: bool, detail: String) -> 
     }
 }
 
+/// Poll an oracle predicate until it holds or the timeout
+/// elapses. A file-backed oracle is async: the test target logs
+/// events on its own thread, and a fast gesture (server-side
+/// delays, one flush) can return before the release line lands
+/// in the file. Reading once, immediately, races that flush —
+/// the fix-pass C13 failure (drag events present in the log,
+/// `got=[]` in the check) was exactly this race. Polling the
+/// READ keeps the check honest without slowing the body: a
+/// mock oracle answers synchronously, so the first poll
+/// succeeds and nothing waits. A genuinely missing event still
+/// fails, after the timeout.
+fn poll_oracle(mut f: impl FnMut() -> bool) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        if f() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
 /// Run the full suite against one body + oracle pair. Checks run in
 /// id order; a failing check never aborts the rest, so one run shows
 /// the whole picture.
@@ -258,6 +282,7 @@ pub fn run_suite<B: Body, O: TargetOracle>(body: &mut B, oracle: &mut O) -> Suit
         for (x, y) in &points {
             body.click(*x, *y)?;
         }
+        poll_oracle(|| oracle.received_clicks().len() >= points.len());
         let got = oracle.received_clicks();
         let mut hits = 0usize;
         for (i, (x, y)) in points.iter().enumerate() {
@@ -285,8 +310,9 @@ pub fn run_suite<B: Body, O: TargetOracle>(body: &mut B, oracle: &mut O) -> Suit
         for text in TYPE_STRINGS {
             body.type_text(text)?;
         }
-        let got = oracle.received_text();
         let expected: String = TYPE_STRINGS.concat();
+        poll_oracle(|| oracle.received_text() == expected);
+        let got = oracle.received_text();
         Ok(check(
             "C4",
             "type-text",
@@ -305,8 +331,9 @@ pub fn run_suite<B: Body, O: TargetOracle>(body: &mut B, oracle: &mut O) -> Suit
         for key in [Key::Enter, Key::Tab, Key::F5] {
             body.key(key)?;
         }
-        let got = oracle.received_keys();
         let expected = vec![Key::Enter, Key::Tab, Key::F5];
+        poll_oracle(|| oracle.received_keys() == expected);
+        let got = oracle.received_keys();
         Ok(check(
             "C5",
             "key-press",
@@ -517,8 +544,9 @@ pub fn run_suite<B: Body, O: TargetOracle>(body: &mut B, oracle: &mut O) -> Suit
         for text in UNICODE_STRINGS {
             body.type_text(text)?;
         }
-        let got = oracle.received_text();
         let expected: String = UNICODE_STRINGS.concat();
+        poll_oracle(|| oracle.received_text() == expected);
+        let got = oracle.received_text();
         Ok(check(
             "C11",
             "type-unicode",
@@ -547,6 +575,7 @@ pub fn run_suite<B: Body, O: TargetOracle>(body: &mut B, oracle: &mut O) -> Suit
         for (x, y, dx, dy) in &expected {
             body.scroll(*x, *y, *dx, *dy)?;
         }
+        poll_oracle(|| oracle.received_scrolls().len() >= expected.len());
         let got = oracle.received_scrolls();
         Ok(check(
             "C12",
@@ -569,6 +598,7 @@ pub fn run_suite<B: Body, O: TargetOracle>(body: &mut B, oracle: &mut O) -> Suit
         let to = (rx + rw as i32 * 6 / 10, ry + rh as i32 * 6 / 10);
         oracle.reset_events();
         body.drag(from.0, from.1, to.0, to.1)?;
+        poll_oracle(|| !oracle.received_drags().is_empty());
         let got = oracle.received_drags();
         let ok = got.len() == 1
             && (got[0].0 - from.0).abs() <= 2
@@ -599,6 +629,7 @@ pub fn run_suite<B: Body, O: TargetOracle>(body: &mut B, oracle: &mut O) -> Suit
         let cy = ry + rh as i32 / 2;
         oracle.reset_events();
         body.double_click(cx, cy)?;
+        poll_oracle(|| !oracle.received_double_clicks().is_empty());
         let got = oracle.received_double_clicks();
         let ok = got.len() == 1 && (got[0].0 - cx).abs() <= 2 && (got[0].1 - cy).abs() <= 2;
         Ok(check(
@@ -621,6 +652,7 @@ pub fn run_suite<B: Body, O: TargetOracle>(body: &mut B, oracle: &mut O) -> Suit
         let cy = ry + rh as i32 / 2;
         oracle.reset_events();
         body.right_click(cx, cy)?;
+        poll_oracle(|| !oracle.received_right_clicks().is_empty());
         let got = oracle.received_right_clicks();
         let ok = got.len() == 1 && (got[0].0 - cx).abs() <= 2 && (got[0].1 - cy).abs() <= 2;
         Ok(check(
@@ -643,6 +675,7 @@ pub fn run_suite<B: Body, O: TargetOracle>(body: &mut B, oracle: &mut O) -> Suit
     let c16 = (|| -> Result<CheckResult, BodyError> {
         oracle.reset_events();
         body.hold_key(Key::F5, 150)?;
+        poll_oracle(|| !oracle.received_holds().is_empty());
         let got = oracle.received_holds();
         let ok = got.len() == 1 && got[0].0 == Key::F5 && (75..=650).contains(&got[0].1);
         Ok(check(
