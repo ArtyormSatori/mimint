@@ -2,3 +2,8 @@
 *.db
 *.db-journal
 mimint-audit.jsonl
+
+# F4-01: TLS test fixtures are public-by-design (see fixtures/README.md);
+# the global gitignore (*.pem) must not swallow them again.
+!crates/mimint-body/tests/fixtures/android-test-cert.pem
+!crates/mimint-body/tests/fixtures/android-test-key.pem
