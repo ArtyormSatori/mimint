@@ -133,6 +133,9 @@ pub struct GuardedExecutor<'a> {
     turn_id: String,
     next_request_id: AtomicU64,
     cancel_tokens: Vec<CancelToken>,
+    /// Active profile name (Phase 5, P5.5), tagged onto every
+    /// audit record this executor writes.
+    profile: Option<String>,
 }
 
 impl<'a> GuardedExecutor<'a> {
@@ -150,7 +153,34 @@ impl<'a> GuardedExecutor<'a> {
             turn_id: turn_id.into(),
             next_request_id: AtomicU64::new(1),
             cancel_tokens: Vec::new(),
+            profile: None,
         }
+    }
+
+    /// Set the active profile name (Phase 5, P5.5). The name is
+    /// tagged onto every audit record this executor writes.
+    pub fn set_profile(&mut self, name: impl Into<String>) {
+        self.profile = Some(name.into());
+    }
+
+    /// Audit helper with the same shape as [`AuditLog::log`], but
+    /// tagging the record's detail object with the active profile
+    /// name when one is set.
+    fn log(
+        &self,
+        turn_id: &str,
+        kind: &str,
+        tool: Option<&str>,
+        result: Option<&str>,
+        detail: Value,
+    ) -> Result<(), MimintError> {
+        let mut detail = detail;
+        if let Some(profile) = &self.profile {
+            if let Value::Object(map) = &mut detail {
+                map.insert("profile".to_string(), Value::String(profile.clone()));
+            }
+        }
+        self.audit.log(turn_id, kind, tool, result, detail)
     }
 
     /// Add a cancellation token checked immediately before any tool
@@ -176,7 +206,7 @@ impl<'a> GuardedExecutor<'a> {
     /// recorded.
     pub fn execute(&self, tool_name: &str, args: &Value) -> Result<Value, MimintError> {
         let Some(tool) = self.registry.get(tool_name) else {
-            self.audit.log(
+            self.log(
                 &self.turn_id,
                 "decision",
                 Some(tool_name),
@@ -193,7 +223,7 @@ impl<'a> GuardedExecutor<'a> {
                 // audit trail can pair them without guessing.
                 let request_id = self.next_request_id.fetch_add(1, Ordering::SeqCst);
                 if let Err(err) = self.check_cancelled() {
-                    self.audit.log(
+                    self.log(
                         &self.turn_id,
                         "decision",
                         Some(tool_name),
@@ -202,7 +232,7 @@ impl<'a> GuardedExecutor<'a> {
                     )?;
                     return Err(err);
                 }
-                self.audit.log(
+                self.log(
                     &self.turn_id,
                     "decision",
                     Some(tool_name),
@@ -213,7 +243,7 @@ impl<'a> GuardedExecutor<'a> {
             }
             Risk::Consequential => {
                 let Some(approver) = self.approver else {
-                    self.audit.log(
+                    self.log(
                         &self.turn_id,
                         "decision",
                         Some(tool_name),
@@ -227,7 +257,7 @@ impl<'a> GuardedExecutor<'a> {
                 // A stop that landed before the question was even
                 // asked denies without showing a card.
                 if let Err(err) = self.check_cancelled() {
-                    self.audit.log(
+                    self.log(
                         &self.turn_id,
                         "decision",
                         Some(tool_name),
@@ -244,7 +274,7 @@ impl<'a> GuardedExecutor<'a> {
                 };
                 match approver.approve_request(&request) {
                     Ok(outcome) if outcome.request_id != request_id => {
-                        self.audit.log(
+                        self.log(
                             &self.turn_id,
                             "decision",
                             Some(tool_name),
@@ -264,7 +294,7 @@ impl<'a> GuardedExecutor<'a> {
                             // before the stop does not let the tool
                             // run.
                             if let Err(err) = self.check_cancelled() {
-                                self.audit.log(
+                                self.log(
                                     &self.turn_id,
                                     "decision",
                                     Some(tool_name),
@@ -273,7 +303,7 @@ impl<'a> GuardedExecutor<'a> {
                                 )?;
                                 return Err(err);
                             }
-                            self.audit.log(
+                            self.log(
                                 &self.turn_id,
                                 "decision",
                                 Some(tool_name),
@@ -283,7 +313,7 @@ impl<'a> GuardedExecutor<'a> {
                             self.run_and_audit(tool_name, tool, args, request_id)
                         }
                         ApprovalDecision::Deny => {
-                            self.audit.log(
+                            self.log(
                                 &self.turn_id,
                                 "decision",
                                 Some(tool_name),
@@ -295,7 +325,7 @@ impl<'a> GuardedExecutor<'a> {
                             )))
                         }
                         ApprovalDecision::Cancelled => {
-                            self.audit.log(
+                            self.log(
                                 &self.turn_id,
                                 "decision",
                                 Some(tool_name),
@@ -307,7 +337,7 @@ impl<'a> GuardedExecutor<'a> {
                             )))
                         }
                         ApprovalDecision::Timeout => {
-                            self.audit.log(
+                            self.log(
                                 &self.turn_id,
                                 "decision",
                                 Some(tool_name),
@@ -320,7 +350,7 @@ impl<'a> GuardedExecutor<'a> {
                         }
                     },
                     Err(err) => {
-                        self.audit.log(
+                        self.log(
                             &self.turn_id,
                             "decision",
                             Some(tool_name),
@@ -343,7 +373,7 @@ impl<'a> GuardedExecutor<'a> {
     ) -> Result<Value, MimintError> {
         match tool.execute(args) {
             Ok(output) => {
-                self.audit.log(
+                self.log(
                     &self.turn_id,
                     "execution",
                     Some(tool_name),
@@ -353,7 +383,7 @@ impl<'a> GuardedExecutor<'a> {
                 Ok(output)
             }
             Err(err) => {
-                self.audit.log(
+                self.log(
                     &self.turn_id,
                     "execution",
                     Some(tool_name),

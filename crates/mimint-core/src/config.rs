@@ -42,6 +42,7 @@
 
 use crate::error::MimintError;
 use crate::fallback::RetryPolicy;
+use crate::profile::{ProfileEntry, ProfileSet};
 use crate::registry::{BackendKind, BackendSpec, CostCap, DEFAULT_TIMEOUT_SECS};
 use serde::Deserialize;
 use std::env;
@@ -171,6 +172,14 @@ pub struct FileConfig {
     /// Fallback + retry section.
     #[serde(default)]
     pub fallback: FallbackSection,
+    /// Profile entries (`[[profile]]` tables, Phase 5). Absent
+    /// means one implicit "Mặc định" profile from the top-level
+    /// values.
+    #[serde(default)]
+    pub profile: Vec<ProfileEntry>,
+    /// Name of the default profile. Absent means the first
+    /// profile (or the implicit default).
+    pub default_profile: Option<String>,
 }
 
 /// A validated, resolved configuration ready for the registry.
@@ -187,6 +196,10 @@ pub struct ResolvedConfig {
     pub chain: Vec<String>,
     /// Retry policy for the chain.
     pub retry: RetryPolicy,
+    /// Validated profile set (Phase 5). Always has at least one
+    /// profile; see [`ProfileSet`] for the fail-closed rules and
+    /// warnings.
+    pub profiles: ProfileSet,
 }
 
 impl FileConfig {
@@ -308,12 +321,22 @@ impl FileConfig {
             }
         };
 
+        let profiles = ProfileSet::resolve(
+            &self.profile,
+            self.default_profile.as_deref(),
+            &backends,
+            &chain,
+            self.privacy.enabled,
+            cost_cap,
+        );
+
         Ok(ResolvedConfig {
             privacy_enabled: self.privacy.enabled,
             cost_cap,
             backends,
             chain,
             retry,
+            profiles,
         })
     }
 }

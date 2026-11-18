@@ -4,6 +4,7 @@
 //! registered here (ACI-style: the surface is generated from the
 //! implementation). There is no second, hand-written copy of the schemas.
 
+use crate::emotion::{handle_emotion_args, EmotionCode};
 use crate::error::MimintError;
 use crate::guards::Risk;
 use crate::notebook::Notebook;
@@ -72,12 +73,14 @@ impl Registry {
     }
 }
 
-/// Registry with the Phase 1 minimal tool set sharing one notebook.
+/// Registry with the Phase 1 minimal tool set sharing one notebook,
+/// plus the Phase 5 emotion-signal tool.
 pub fn default_registry(notebook: Arc<Notebook>) -> Registry {
     let mut registry = Registry::new();
     registry.register(Box::new(NotebookSearchTool::new(Arc::clone(&notebook))));
     registry.register(Box::new(NotebookReadTool::new(Arc::clone(&notebook))));
     registry.register(Box::new(NotebookAddTool::new(notebook)));
+    registry.register(Box::new(SetEmotionTool));
     registry
 }
 
@@ -112,7 +115,7 @@ impl Tool for NotebookSearchTool {
     }
 
     fn description(&self) -> &'static str {
-        "Search notebook notes by substring. Returns matching notes."
+        "Search notebook notes by keyword (BM25-ranked, best match first). Pass keywords, not a sentence; words keep their diacritics. An empty query returns nothing."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -121,7 +124,7 @@ impl Tool for NotebookSearchTool {
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "Substring to search for in note titles and bodies.",
+                    "description": "Keywords to search for in note titles and bodies (whitespace-separated words; diacritics kept).",
                 },
             },
             "required": ["query"],
@@ -136,6 +139,12 @@ impl Tool for NotebookSearchTool {
     fn execute(&self, args: &Value) -> Result<Value, MimintError> {
         let query = arg_string(args, "query")?;
         let notes = self.notebook.search(&query)?;
+        if query.trim().is_empty() {
+            return Ok(json!({
+                "results": notes,
+                "notice": "empty query: no results by definition; pass keywords to search.",
+            }));
+        }
         Ok(json!({ "results": notes }))
     }
 }
@@ -234,5 +243,53 @@ impl Tool for NotebookAddTool {
         let body = arg_string(args, "body")?;
         let id = self.notebook.add(&title, &body)?;
         Ok(json!({ "id": id, "title": title, "body": body }))
+    }
+}
+
+/// Emotion signal (Phase 5, P5.6): the structured channel by which
+/// the model tells the UI which face to show. The brain intercepts
+/// `set_emotion` calls before the guard executor (no approval, no
+/// verification, no audit "execution" record — the signal is
+/// recorded as an `emotion` audit record instead). This tool
+/// exists in the registry so its schema is generated into the
+/// `tools` array sent to the model; `execute` is only reached by
+/// direct executor use and returns the same handling result the
+/// brain would compute.
+pub struct SetEmotionTool;
+
+impl Tool for SetEmotionTool {
+    fn name(&self) -> &'static str {
+        "set_emotion"
+    }
+
+    fn description(&self) -> &'static str {
+        "Signal the assistant's current emotion so the face display updates. Call with exactly one of the 9 codes: neutral, happy, listening, thinking, speaking, surprised, confused, sleepy, celebrating. Call it when your emotional state changes; the face follows the latest code."
+    }
+
+    fn parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "code": {
+                    "type": "string",
+                    "enum": EmotionCode::ALL.iter().map(|code| code.wire_name()).collect::<Vec<_>>(),
+                    "description": "One of the 9 emotion codes.",
+                },
+            },
+            "required": ["code"],
+            "additionalProperties": false,
+        })
+    }
+
+    fn risk(&self) -> Risk {
+        Risk::ReadOnly
+    }
+
+    fn execute(&self, args: &Value) -> Result<Value, MimintError> {
+        let outcome = handle_emotion_args(args);
+        Ok(json!({
+            "emotion": outcome.code.map(|code| code.wire_name()),
+            "fallback": outcome.fallback,
+        }))
     }
 }

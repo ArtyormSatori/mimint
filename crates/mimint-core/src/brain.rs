@@ -8,10 +8,13 @@
 
 use crate::audit::AuditLog;
 use crate::cancel::CancelToken;
+use crate::emotion::{handle_emotion_args, EmotionCode};
 use crate::error::MimintError;
 use crate::guards::{Approver, GuardedExecutor};
+use crate::memory::ExperienceStore;
 use crate::notebook::Notebook;
 use crate::provider::{CallContext, ChatMessage, Provider};
+use crate::skills::{retrieve_skills, SkillDef};
 use crate::tools::Registry;
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -23,10 +26,22 @@ pub struct TurnOutcome {
     pub text: String,
     /// Provider calls made.
     pub steps: usize,
-    /// Tool names executed, in order.
+    /// Tool names executed, in order. Emotion signals (`set_emotion`)
+    /// are NOT listed here: they change the face, not the world.
     pub tools_used: Vec<String>,
     /// True when the step budget ran out before a final answer.
     pub partial: bool,
+    /// Emotion codes accepted during the turn, in order.
+    pub emotions: Vec<EmotionCode>,
+    /// How many `set_emotion` calls fell back (unknown/missing code).
+    pub emotion_fallbacks: usize,
+    /// Per-tool verification results, in execution order.
+    pub verified_steps: Vec<(String, bool)>,
+    /// True when every executed step verified. Vacuously true when
+    /// no tool ran: a pure-answer turn has nothing to verify.
+    pub all_verified: bool,
+    /// Names of the skills retrieved for this turn, in match order.
+    pub skills_used: Vec<String>,
 }
 
 struct PendingVerification {
@@ -86,6 +101,11 @@ pub enum BrainProgress {
     /// A tool failed: the tool name and the raw error text
     /// (the UI renders a friendly form of it).
     ToolFailed { tool: String, error: String },
+    /// The model signaled an emotion through the structured
+    /// `set_emotion` channel (Phase 5, P5.6). The UI maps the
+    /// code to a face state; unknown codes never reach this
+    /// variant (they fall back and are only audited).
+    Emotion { code: EmotionCode },
 }
 
 /// One-turn brain loop over a provider, a tool registry, and a notebook.
@@ -102,6 +122,19 @@ pub struct Brain<'a> {
     cancel_tokens: Vec<CancelToken>,
     verifier: Option<Arc<dyn StepVerifier>>,
     progress_hook: Option<Arc<dyn Fn(BrainProgress) + Send + Sync>>,
+    /// System prompt override (Phase 5: the SOUL body). When
+    /// unset, the built-in default prompt is used.
+    system_prompt: Option<String>,
+    /// Promoted skills available for retrieval (Phase 5, P5.2).
+    /// Retrieval runs once per turn, before planning.
+    skills: Vec<SkillDef>,
+    /// Experience store for retrieval before planning (Phase 5,
+    /// P5.3). Callers set this only when the turn's backends may
+    /// receive user data (same rule as SOUL).
+    experience: Option<Arc<ExperienceStore>>,
+    /// Active profile name (Phase 5, P5.5), tagged onto every
+    /// audit record this brain writes.
+    profile: Option<String>,
 }
 
 impl<'a> Brain<'a> {
@@ -131,7 +164,64 @@ impl<'a> Brain<'a> {
             cancel_tokens: Vec::new(),
             verifier: None,
             progress_hook: None,
+            system_prompt: None,
+            skills: Vec::new(),
+            experience: None,
+            profile: None,
         })
+    }
+
+    /// Override the built-in system prompt (Phase 5: the caller
+    /// passes the SOUL body, or the default prompt when SOUL
+    /// must be withheld under Privacy Mode).
+    pub fn set_system_prompt(&mut self, prompt: String) {
+        self.system_prompt = Some(prompt);
+    }
+
+    /// Make promoted skills available for retrieval (Phase 5,
+    /// P5.2). Retrieval runs once per turn, before the first
+    /// provider call; only the retrieved skills' content enters
+    /// the prompt. Pass the profile-filtered set: the brain does
+    /// not know about profiles.
+    pub fn set_skills(&mut self, skills: Vec<SkillDef>) {
+        self.skills = skills;
+    }
+
+    /// Set the experience store for retrieval before planning
+    /// (Phase 5, P5.3). Only set this when the turn's backends
+    /// may receive user data: retrieved trajectories contain
+    /// past user prompts.
+    pub fn set_experience_store(&mut self, store: Arc<ExperienceStore>) {
+        self.experience = Some(store);
+    }
+
+    /// Set the active profile name (Phase 5, P5.5). The name is
+    /// tagged onto every audit record this brain writes, and
+    /// onto the provider call context so the fallback chain tags
+    /// its records too.
+    pub fn set_profile(&mut self, name: impl Into<String>) {
+        self.profile = Some(name.into());
+    }
+
+    /// Audit helper with the same shape as [`AuditLog::log`], but
+    /// tagging the record's detail object with the active profile
+    /// name when one is set. All brain audit writes go through
+    /// here.
+    fn log(
+        &self,
+        turn_id: &str,
+        kind: &str,
+        tool: Option<&str>,
+        result: Option<&str>,
+        detail: Value,
+    ) -> Result<(), MimintError> {
+        let mut detail = detail;
+        if let Some(profile) = &self.profile {
+            if let Value::Object(map) = &mut detail {
+                map.insert("profile".to_string(), Value::String(profile.clone()));
+            }
+        }
+        self.audit.log(turn_id, kind, tool, result, detail)
     }
 
     /// Register a step verifier (see [`StepVerifier`]). A brain
@@ -190,17 +280,72 @@ impl<'a> Brain<'a> {
         for token in &self.cancel_tokens {
             executor.add_cancel_token(token.clone());
         }
+        if let Some(profile) = &self.profile {
+            executor.set_profile(profile.clone());
+        }
         let executor = executor;
         let tool_schemas = self.registry.tool_schemas();
-        let mut messages = vec![
-            ChatMessage::system(
-                "You are Mimint, a local-first personal assistant. Use the provided tools when they help answer. Keep answers short.",
-            ),
-            ChatMessage::user(user_prompt),
-        ];
+        let system_prompt = self.system_prompt.clone().unwrap_or_else(|| {
+            "You are Mimint, a local-first personal assistant. Use the provided tools when they help answer. Keep answers short.".to_string()
+        });
+        let mut messages = vec![ChatMessage::system(system_prompt)];
+
+        // Phase 5 retrieval, before planning: skills first, then
+        // experience. Both are deterministic, both are audited
+        // with ids/scores only — never the prompt text.
+        const SKILL_RETRIEVAL_LIMIT: usize = 3;
+        let mut skills_used: Vec<String> = Vec::new();
+        if !self.skills.is_empty() {
+            let matches = retrieve_skills(&self.skills, user_prompt, SKILL_RETRIEVAL_LIMIT);
+            if !matches.is_empty() {
+                let sections: Vec<String> = matches
+                    .iter()
+                    .filter_map(|hit| {
+                        self.skills
+                            .iter()
+                            .find(|skill| skill.name == hit.name)
+                            .map(|skill| skill.prompt_section())
+                    })
+                    .collect();
+                if !sections.is_empty() {
+                    messages.push(ChatMessage::system(sections.join("\n\n")));
+                }
+                skills_used = matches.iter().map(|hit| hit.name.clone()).collect();
+                self.log(
+                    &self.turn_id,
+                    "skill_retrieval",
+                    None,
+                    None,
+                    json!({
+                        "skills": matches.iter().map(|hit| json!({"name": hit.name, "score": hit.score})).collect::<Vec<_>>(),
+                    }),
+                )?;
+            }
+        }
+        if let Some(store) = &self.experience {
+            let retrieved = store.retrieve(user_prompt)?;
+            let sections = retrieved.sections();
+            if !sections.is_empty() {
+                messages.push(ChatMessage::system(sections.join("\n\n")));
+                self.log(
+                    &self.turn_id,
+                    "memory_retrieval",
+                    None,
+                    None,
+                    json!({
+                        "successes": retrieved.successes.iter().map(|t| json!({"id": t.id, "score": t.score})).collect::<Vec<_>>(),
+                        "failures": retrieved.failures.iter().map(|t| json!({"id": t.id, "score": t.score})).collect::<Vec<_>>(),
+                    }),
+                )?;
+            }
+        }
+        messages.push(ChatMessage::user(user_prompt));
+
         let mut tools_used: Vec<String> = Vec::new();
         let mut verified: Vec<(String, bool)> = Vec::new();
         let mut pending: Vec<PendingVerification> = Vec::new();
+        let mut emotions: Vec<EmotionCode> = Vec::new();
+        let mut emotion_fallbacks: usize = 0;
 
         for step in 0..self.max_steps {
             // Cancellation check at the top of every step: no new
@@ -208,7 +353,7 @@ impl<'a> Brain<'a> {
             // (A request already in flight is bounded by its
             // per-request timeout; see docs/stop-and-approval.md.)
             if let Err(err) = self.check_cancelled() {
-                self.audit.log(
+                self.log(
                     &self.turn_id,
                     "turn_end",
                     None,
@@ -233,11 +378,11 @@ impl<'a> Brain<'a> {
                 "verified": verified.iter().map(|(tool, ok)| json!({"tool": tool, "verified": ok})).collect::<Vec<_>>(),
                 "remaining_steps": remaining,
             });
-            self.audit
-                .log(&self.turn_id, "reflection", None, None, reflection.clone())?;
+            self.log(&self.turn_id, "reflection", None, None, reflection.clone())?;
             messages.push(ChatMessage::system(format!("Reflection: {reflection}")));
 
-            let ctx = CallContext::new(&self.turn_id, Some(self.audit));
+            let mut ctx = CallContext::new(&self.turn_id, Some(self.audit));
+            ctx.profile = self.profile.as_deref();
             self.report(BrainProgress::Analyzing);
             let reply = self.provider.chat(&ctx, &messages, &tool_schemas).await?;
             let calls = reply.tool_calls.clone().unwrap_or_default();
@@ -257,7 +402,7 @@ impl<'a> Brain<'a> {
                 // one; the success path must too, or the trail
                 // cannot tell a finished turn from an interrupted
                 // one.
-                self.audit.log(
+                self.log(
                     &self.turn_id,
                     "turn_end",
                     None,
@@ -272,6 +417,11 @@ impl<'a> Brain<'a> {
                     steps: step + 1,
                     tools_used,
                     partial: false,
+                    emotions,
+                    emotion_fallbacks,
+                    all_verified: verified.iter().all(|(_, ok)| *ok),
+                    verified_steps: verified,
+                    skills_used,
                 });
             }
             messages.push(reply);
@@ -280,7 +430,7 @@ impl<'a> Brain<'a> {
                 // A stop between two tool calls in one step stops
                 // the rest of the step's tools.
                 if let Err(err) = self.check_cancelled() {
-                    self.audit.log(
+                    self.log(
                         &self.turn_id,
                         "turn_end",
                         None,
@@ -288,6 +438,51 @@ impl<'a> Brain<'a> {
                         json!({"reason": "cancelled_between_tools", "step": step + 1}),
                     )?;
                     return Err(err);
+                }
+                // Emotion signals (Phase 5, P5.6) are intercepted
+                // here, before the guard executor: they need no
+                // approval, no verification, and no place in
+                // `tools_used`. The structured arguments are the
+                // whole protocol — the reply text is never scanned.
+                // An unparsable argument string falls back like an
+                // unknown code: the face keeps its previous state.
+                if call.function.name == "set_emotion" {
+                    let args: Value =
+                        serde_json::from_str(&call.function.arguments).unwrap_or(Value::Null);
+                    let outcome = handle_emotion_args(&args);
+                    match outcome.code {
+                        Some(code) => {
+                            emotions.push(code);
+                            self.report(BrainProgress::Emotion { code });
+                        }
+                        None => {
+                            emotion_fallbacks += 1;
+                        }
+                    }
+                    self.log(
+                        &self.turn_id,
+                        "emotion",
+                        Some("set_emotion"),
+                        Some(if outcome.fallback {
+                            "fallback"
+                        } else {
+                            "accepted"
+                        }),
+                        json!({
+                            "code": outcome.code.map(|code| code.wire_name()),
+                            "raw": outcome.raw,
+                            "fallback": outcome.fallback,
+                        }),
+                    )?;
+                    messages.push(ChatMessage::tool_result(
+                        &call.id,
+                        json!({
+                            "emotion": outcome.code.map(|code| code.wire_name()),
+                            "fallback": outcome.fallback,
+                        })
+                        .to_string(),
+                    ));
+                    continue;
                 }
                 tools_used.push(call.function.name.clone());
                 let parsed: Result<Value, MimintError> =
@@ -313,7 +508,7 @@ impl<'a> Brain<'a> {
                             Err(err) if err.is_cancelled() => {
                                 // Cancellation is not a tool error: abort
                                 // the turn instead of telling the model.
-                                self.audit.log(
+                                self.log(
                                     &self.turn_id,
                                     "turn_end",
                                     None,
@@ -358,8 +553,7 @@ impl<'a> Brain<'a> {
             let ok = self.verify_previous(&prev)?;
             verified.push((prev.tool, ok));
         }
-        let _ = &verified;
-        self.audit.log(
+        self.log(
             &self.turn_id,
             "turn_end",
             None,
@@ -375,6 +569,11 @@ impl<'a> Brain<'a> {
             steps: self.max_steps,
             tools_used,
             partial: true,
+            emotions,
+            emotion_fallbacks,
+            all_verified: verified.iter().all(|(_, ok)| *ok),
+            verified_steps: verified,
+            skills_used,
         })
     }
 
@@ -389,7 +588,7 @@ impl<'a> Brain<'a> {
     /// the model on the next round; it does not abort the turn.
     fn verify_previous(&self, prev: &PendingVerification) -> Result<bool, MimintError> {
         if let Some(error) = &prev.error {
-            self.audit.log(
+            self.log(
                 &self.turn_id,
                 "verification",
                 Some(&prev.tool),
@@ -399,7 +598,7 @@ impl<'a> Brain<'a> {
             return Ok(false);
         }
         let Some(output) = &prev.output else {
-            self.audit.log(
+            self.log(
                 &self.turn_id,
                 "verification",
                 Some(&prev.tool),
@@ -423,7 +622,7 @@ impl<'a> Brain<'a> {
                 },
                 None => false,
             };
-            self.audit.log(
+            self.log(
                 &self.turn_id,
                 "verification",
                 Some(&prev.tool),
@@ -434,7 +633,7 @@ impl<'a> Brain<'a> {
         } else if let Some(verifier) = &self.verifier {
             match verifier.verify(&prev.tool, &prev.args, output) {
                 Ok(Some((verified, detail))) => {
-                    self.audit.log(
+                    self.log(
                         &self.turn_id,
                         "verification",
                         Some(&prev.tool),
@@ -445,7 +644,7 @@ impl<'a> Brain<'a> {
                 }
                 Ok(None) => self.verify_by_status(prev),
                 Err(err) => {
-                    self.audit.log(
+                    self.log(
                         &self.turn_id,
                         "verification",
                         Some(&prev.tool),
@@ -464,7 +663,7 @@ impl<'a> Brain<'a> {
     /// step counts as verified. Used when no verifier is
     /// registered, or the verifier has no opinion on the tool.
     fn verify_by_status(&self, prev: &PendingVerification) -> Result<bool, MimintError> {
-        self.audit.log(
+        self.log(
             &self.turn_id,
             "verification",
             Some(&prev.tool),
@@ -1070,6 +1269,335 @@ mod tests {
         assert!(
             audit_text.contains("\"cancelled\""),
             "cancelled turn_end must be audited: {audit_text}"
+        );
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(&audit_path);
+    }
+
+    // -- Phase 5 tests: emotion channel, skill retrieval, profile tagging --
+
+    fn text_message(text: &str) -> ChatMessage {
+        ChatMessage {
+            role: "assistant".to_string(),
+            content: Some(text.to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn emotion_calls_change_the_outcome_not_the_tool_list() {
+        let stem = temp_stem("emotion");
+        let db_path = format!("{stem}.db");
+        let audit_path = format!("{stem}.jsonl");
+        let notebook = Arc::new(Notebook::open(&db_path).unwrap());
+        let audit = AuditLog::open(&audit_path).unwrap();
+        let registry = crate::tools::default_registry(Arc::clone(&notebook));
+        let mut replies = std::collections::VecDeque::new();
+        // All 9 codes, then an unknown code, then a final answer.
+        for code in EmotionCode::ALL {
+            replies.push_back(tool_call_message(
+                "set_emotion",
+                &format!(r#"{{"code":"{}"}}"#, code.wire_name()),
+            ));
+        }
+        replies.push_back(tool_call_message("set_emotion", r#"{"code":"mystified"}"#));
+        replies.push_back(text_message("Done."));
+        let provider = ScriptProvider {
+            replies: std::sync::Mutex::new(replies),
+        };
+        let brain = Brain::new(
+            &provider,
+            &registry,
+            None,
+            &audit,
+            Arc::clone(&notebook),
+            "turn-emotion",
+            12,
+        )
+        .unwrap();
+        let outcome = brain.run("hello").await.unwrap();
+        assert_eq!(outcome.emotions, EmotionCode::ALL.to_vec());
+        assert_eq!(outcome.emotion_fallbacks, 1);
+        assert!(outcome.tools_used.is_empty(), "emotions are not tools");
+        assert!(outcome.all_verified, "no tools ran: vacuously verified");
+        // The audit trail has 10 emotion records: 9 accepted, 1 fallback.
+        let records = audit_records(&audit_path);
+        let emotions: Vec<&Value> = records
+            .iter()
+            .filter(|record| record["kind"] == "emotion")
+            .collect();
+        assert_eq!(emotions.len(), 10);
+        assert_eq!(emotions[9]["decision"], "fallback");
+        assert_eq!(emotions[9]["detail"]["raw"], "mystified");
+        assert_eq!(emotions[0]["detail"]["code"], "neutral");
+        // No guard decision/execution records for set_emotion: the
+        // brain intercepted the calls before the executor.
+        assert!(
+            !records.iter().any(|record| record["tool"] == "set_emotion"
+                && (record["kind"] == "decision" || record["kind"] == "execution")),
+            "emotion calls must not reach the guard executor"
+        );
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(&audit_path);
+    }
+
+    #[tokio::test]
+    async fn emotion_progress_hook_reports_each_accepted_code() {
+        let stem = temp_stem("emotion-hook");
+        let db_path = format!("{stem}.db");
+        let audit_path = format!("{stem}.jsonl");
+        let notebook = Arc::new(Notebook::open(&db_path).unwrap());
+        let audit = AuditLog::open(&audit_path).unwrap();
+        let registry = crate::tools::default_registry(Arc::clone(&notebook));
+        let provider = ScriptProvider {
+            replies: std::sync::Mutex::new(std::collections::VecDeque::from([
+                tool_call_message("set_emotion", r#"{"code":"happy"}"#),
+                tool_call_message("set_emotion", r#"{"code":"bogus"}"#),
+                text_message("Done."),
+            ])),
+        };
+        let mut brain = Brain::new(
+            &provider,
+            &registry,
+            None,
+            &audit,
+            Arc::clone(&notebook),
+            "turn-emotion-hook",
+            5,
+        )
+        .unwrap();
+        let seen: Arc<std::sync::Mutex<Vec<BrainProgress>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_clone = Arc::clone(&seen);
+        brain.set_progress_hook(Arc::new(move |progress| {
+            seen_clone.lock().unwrap().push(progress);
+        }));
+        brain.run("hello").await.unwrap();
+        let seen = seen.lock().unwrap();
+        let emotions: Vec<EmotionCode> = seen
+            .iter()
+            .filter_map(|progress| match progress {
+                BrainProgress::Emotion { code } => Some(*code),
+                _ => None,
+            })
+            .collect();
+        // Only the accepted code reaches the hook; the unknown code
+        // falls back silently (audited, not reported).
+        assert_eq!(emotions, vec![EmotionCode::Happy]);
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(&audit_path);
+    }
+
+    #[tokio::test]
+    async fn skill_retrieval_injects_content_and_audits_names_only() {
+        let stem = temp_stem("skill-retrieval");
+        let db_path = format!("{stem}.db");
+        let audit_path = format!("{stem}.jsonl");
+        let notebook = Arc::new(Notebook::open(&db_path).unwrap());
+        let audit = AuditLog::open(&audit_path).unwrap();
+        let registry = crate::tools::default_registry(Arc::clone(&notebook));
+        // A provider that captures the messages it receives.
+        struct CaptureProvider {
+            seen: std::sync::Mutex<Vec<ChatMessage>>,
+        }
+        impl Provider for CaptureProvider {
+            fn name(&self) -> &str {
+                "capture"
+            }
+            fn model(&self) -> &str {
+                "capture-model"
+            }
+            fn endpoint_url(&self) -> &str {
+                "http://127.0.0.1:1/v1/chat/completions"
+            }
+            fn is_paid(&self) -> bool {
+                false
+            }
+            fn chat<'a>(
+                &'a self,
+                _ctx: &'a CallContext<'a>,
+                messages: &'a [ChatMessage],
+                _tools: &'a [Value],
+            ) -> BoxFuture<'a, Result<ChatMessage, MimintError>> {
+                *self.seen.lock().unwrap() = messages.to_vec();
+                Box::pin(async move {
+                    Ok(ChatMessage {
+                        role: "assistant".to_string(),
+                        content: Some("Done.".to_string()),
+                        tool_calls: None,
+                        tool_call_id: None,
+                    })
+                })
+            }
+        }
+        let seen = std::sync::Mutex::new(Vec::new());
+        let provider = CaptureProvider { seen };
+        let mut skill = crate::skills::builtin_note_skill();
+        skill.status = crate::skills::SkillStatus::Promoted;
+        let mut brain = Brain::new(
+            &provider,
+            &registry,
+            None,
+            &audit,
+            Arc::clone(&notebook),
+            "turn-skill",
+            3,
+        )
+        .unwrap();
+        brain.set_skills(vec![skill]);
+        let outcome = brain.run("lưu ghi chú mua sữa").await.unwrap();
+        assert_eq!(outcome.skills_used, vec!["ghi-chu".to_string()]);
+        let messages = provider.seen.lock().unwrap();
+        let joined: String = messages
+            .iter()
+            .filter_map(|message| message.content.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            joined.contains("Kỹ năng đang bật: ghi-chu"),
+            "skill content must reach the prompt: {joined}"
+        );
+        // The audit record names the skill and its score, never the
+        // prompt text.
+        let records = audit_records(&audit_path);
+        let retrieval = records
+            .iter()
+            .find(|record| record["kind"] == "skill_retrieval")
+            .expect("skill_retrieval record");
+        assert_eq!(retrieval["detail"]["skills"][0]["name"], "ghi-chu");
+        assert!(!retrieval.to_string().contains("mua sữa"));
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(&audit_path);
+    }
+
+    #[tokio::test]
+    async fn profile_name_tags_brain_and_guard_records() {
+        let stem = temp_stem("profile-tag");
+        let db_path = format!("{stem}.db");
+        let audit_path = format!("{stem}.jsonl");
+        let notebook = Arc::new(Notebook::open(&db_path).unwrap());
+        let audit = AuditLog::open(&audit_path).unwrap();
+        let registry = crate::tools::default_registry(Arc::clone(&notebook));
+        let provider = ScriptProvider {
+            replies: std::sync::Mutex::new(std::collections::VecDeque::from([
+                tool_call_message("notebook_search", r#"{"query":"nothing"}"#),
+                text_message("Done."),
+            ])),
+        };
+        let mut brain = Brain::new(
+            &provider,
+            &registry,
+            None,
+            &audit,
+            Arc::clone(&notebook),
+            "turn-profile",
+            3,
+        )
+        .unwrap();
+        brain.set_profile("Làm việc");
+        brain.run("hello").await.unwrap();
+        let records = audit_records(&audit_path);
+        assert!(!records.is_empty());
+        for record in &records {
+            assert_eq!(
+                record["detail"]["profile"], "Làm việc",
+                "every record must carry the profile tag: {record}"
+            );
+        }
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(&audit_path);
+    }
+
+    #[tokio::test]
+    async fn system_prompt_override_replaces_the_default() {
+        let stem = temp_stem("soul-prompt");
+        let db_path = format!("{stem}.db");
+        let audit_path = format!("{stem}.jsonl");
+        let notebook = Arc::new(Notebook::open(&db_path).unwrap());
+        let audit = AuditLog::open(&audit_path).unwrap();
+        let registry = crate::tools::default_registry(Arc::clone(&notebook));
+        struct CaptureProvider {
+            seen: std::sync::Mutex<Vec<ChatMessage>>,
+        }
+        impl Provider for CaptureProvider {
+            fn name(&self) -> &str {
+                "capture"
+            }
+            fn model(&self) -> &str {
+                "capture-model"
+            }
+            fn endpoint_url(&self) -> &str {
+                "http://127.0.0.1:1/v1/chat/completions"
+            }
+            fn is_paid(&self) -> bool {
+                false
+            }
+            fn chat<'a>(
+                &'a self,
+                _ctx: &'a CallContext<'a>,
+                messages: &'a [ChatMessage],
+                _tools: &'a [Value],
+            ) -> BoxFuture<'a, Result<ChatMessage, MimintError>> {
+                *self.seen.lock().unwrap() = messages.to_vec();
+                Box::pin(async move { Ok(text_message("Done.")) })
+            }
+        }
+        let provider = CaptureProvider {
+            seen: std::sync::Mutex::new(Vec::new()),
+        };
+        let mut brain = Brain::new(
+            &provider,
+            &registry,
+            None,
+            &audit,
+            Arc::clone(&notebook),
+            "turn-soul",
+            3,
+        )
+        .unwrap();
+        brain.set_system_prompt("SOUL BODY HERE".to_string());
+        brain.run("hello").await.unwrap();
+        let messages = provider.seen.lock().unwrap();
+        assert_eq!(messages[0].role, "system");
+        assert_eq!(messages[0].content.as_deref(), Some("SOUL BODY HERE"));
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(&audit_path);
+    }
+
+    #[tokio::test]
+    async fn all_verified_is_false_when_a_tool_fails_verification() {
+        let stem = temp_stem("all-verified");
+        let db_path = format!("{stem}.db");
+        let audit_path = format!("{stem}.jsonl");
+        let notebook = Arc::new(Notebook::open(&db_path).unwrap());
+        let audit = AuditLog::open(&audit_path).unwrap();
+        let registry = crate::tools::default_registry(Arc::clone(&notebook));
+        // notebook_add with a body the re-read cannot match is
+        // impossible through the real tool, so fail verification
+        // with an unknown tool instead: the executor errors, the
+        // step is recorded failed.
+        let provider = ScriptProvider {
+            replies: std::sync::Mutex::new(std::collections::VecDeque::from([
+                tool_call_message("no_such_tool", r#"{}"#),
+                text_message("Done."),
+            ])),
+        };
+        let brain = Brain::new(
+            &provider,
+            &registry,
+            None,
+            &audit,
+            Arc::clone(&notebook),
+            "turn-verify-fail",
+            3,
+        )
+        .unwrap();
+        let outcome = brain.run("hello").await.unwrap();
+        assert!(!outcome.all_verified);
+        assert_eq!(
+            outcome.verified_steps,
+            vec![("no_such_tool".to_string(), false)]
         );
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_file(&audit_path);

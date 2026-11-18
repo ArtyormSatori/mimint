@@ -1,0 +1,38 @@
+# HELD-OUT validation tasks for the note skill (S4, Phase 5).
+#
+# DISCIPLINE (Agent S S4): these tasks decide whether a skill variant is
+# kept or eliminated. They are NOT dev tasks: skill content and variant
+# rules must be written WITHOUT tuning to these prompts, and variants
+# must not be changed after seeing held-out scores. One evaluation run
+# decides; there is no second run with tweaked variants.
+#
+# Format: same EvalTask schema as a skill's own validation tasks
+# (see crates/mimint-core/src/skills.rs). Checkers are binary and
+# code-evaluated; no model judges.
+#
+# Sealed 2026-11-18 by the Phase 5 builder BEFORE writing the variant
+# generator. SHA-256 recorded in phase5/CROSS-CHECK.md.
+
+[[task]]
+id = "H1"
+prompt = "Bạn lưu giúp mình nhé: mai 8 giờ họp với nhóm thiết kế"
+checker = { kind = "all", checks = [
+  { kind = "tool_used", tool = "notebook_add" },
+  { kind = "note_created", needle = "họp" },
+] }
+
+[[task]]
+id = "H2"
+prompt = "Nhớ giúp mình hai việc: mua sữa và gọi điện cho mẹ"
+checker = { kind = "all", checks = [
+  { kind = "tool_used", tool = "notebook_add" },
+  { kind = "note_created", needle = "sữa" },
+] }
+
+[[task]]
+id = "H3"
+prompt = "Mình có thể nhờ bạn ghi chú lại là chiều nay 3 giờ đi khám răng không?"
+checker = { kind = "all", checks = [
+  { kind = "tool_used", tool = "notebook_add" },
+  { kind = "note_created", needle = "răng" },
+] }

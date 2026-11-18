@@ -55,6 +55,9 @@ pub struct CallContext<'a> {
     pub turn_id: &'a str,
     pub audit: Option<&'a AuditLog>,
     pub deadline: Option<Instant>,
+    /// Active profile name (Phase 5, P5.5), tagged onto the
+    /// fallback chain's audit records. `None` means untagged.
+    pub profile: Option<&'a str>,
 }
 
 impl<'a> CallContext<'a> {
@@ -65,6 +68,7 @@ impl<'a> CallContext<'a> {
             turn_id,
             audit,
             deadline: None,
+            profile: None,
         }
     }
 
@@ -75,7 +79,14 @@ impl<'a> CallContext<'a> {
             turn_id,
             audit,
             deadline: Some(deadline),
+            profile: None,
         }
+    }
+
+    /// Context with a profile name attached for audit tagging.
+    pub fn with_profile(mut self, profile: &'a str) -> Self {
+        self.profile = Some(profile);
+        self
     }
 }
 

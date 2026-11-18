@@ -201,7 +201,7 @@ impl FallbackChain {
         let Some(audit) = ctx.audit else {
             return Ok(());
         };
-        let (decision, detail) = match result {
+        let (decision, mut detail) = match result {
             Ok(_) => (
                 "success",
                 json!({
@@ -233,6 +233,9 @@ impl FallbackChain {
                 }),
             ),
         };
+        if let (Some(profile), Value::Object(map)) = (ctx.profile, &mut detail) {
+            map.insert("profile".to_string(), Value::String(profile.to_string()));
+        }
         audit.log(
             ctx.turn_id,
             "provider_attempt",
@@ -338,16 +341,20 @@ impl FallbackChain {
         }
 
         if let Some(audit) = ctx.audit {
+            let mut detail = json!({
+                "providers": self.provider_names(),
+                "failures": failures,
+                "budget_exhausted": budget_exhausted,
+            });
+            if let (Some(profile), Value::Object(map)) = (ctx.profile, &mut detail) {
+                map.insert("profile".to_string(), Value::String(profile.to_string()));
+            }
             audit.log(
                 ctx.turn_id,
                 "provider_failure",
                 None,
                 Some("all_failed"),
-                json!({
-                    "providers": self.provider_names(),
-                    "failures": failures,
-                    "budget_exhausted": budget_exhausted,
-                }),
+                detail,
             )?;
         }
         Err(MimintError::Provider(format!(

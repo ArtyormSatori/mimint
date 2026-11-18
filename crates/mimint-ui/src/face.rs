@@ -1,18 +1,21 @@
 //! The ball avatar's face: 9 states mapped from the 9 core looks,
 //! with parameters the renderer turns into shapes.
 //!
-//! State selection in Phase 3 is derived from the turn phase only:
-//! the model does not send emotion codes yet (that protocol is Phase
-//! 5 work). Listening, Speaking, and Surprised exist in the enum
-//! because the design names 9 states, but the Phase 3 selector never
-//! returns them: there is no voice input, no TTS, and no surprise
-//! trigger yet. A test pins that.
+//! State selection comes from two sources: turn-phase events
+//! (thinking while a turn runs, happy/celebrating on finish,
+//! confused on error, sleepy after idleness) and — since Phase
+//! 5 — emotion codes the model sends through the structured
+//! `set_emotion` channel ([`FaceMachine::on_emotion`]). The
+//! emotion channel is the only way Listening, Speaking, and
+//! Surprised are reached: there is no voice input, no TTS, and
+//! no surprise trigger in the turn-phase events.
 //!
 //! Motion (from the design spec): 4-second breathing cycle, a blink
 //! every 3–6 seconds, a bounce on state change. Degraded mode (weak
 //! machines) draws a static face with only the blink, and the UI
 //! labels it visibly.
 
+use mimint_core::EmotionCode;
 use std::time::{Duration, Instant};
 
 /// The 9 avatar states, in design order (core looks 1–9).
@@ -30,6 +33,23 @@ pub enum FaceState {
 }
 
 impl FaceState {
+    /// The face state for one emotion code (Phase 5, P5.6). The
+    /// mapping is 1:1, in design order; the labels match the
+    /// codes' Vietnamese labels.
+    pub fn from_emotion(code: EmotionCode) -> Self {
+        match code {
+            EmotionCode::Neutral => FaceState::Neutral,
+            EmotionCode::Happy => FaceState::Happy,
+            EmotionCode::Listening => FaceState::Listening,
+            EmotionCode::Thinking => FaceState::Thinking,
+            EmotionCode::Speaking => FaceState::Speaking,
+            EmotionCode::Surprised => FaceState::Surprised,
+            EmotionCode::Confused => FaceState::Confused,
+            EmotionCode::Sleepy => FaceState::Sleepy,
+            EmotionCode::Celebrating => FaceState::Celebrating,
+        }
+    }
+
     /// Short Vietnamese label shown under the face.
     pub fn label(self) -> &'static str {
         match self {
@@ -262,6 +282,16 @@ impl FaceMachine {
         self.set(FaceState::Confused, now);
     }
 
+    /// An emotion code arrived through the structured channel
+    /// (Phase 5, P5.6): show the matching face. The signal counts
+    /// as turn activity, so a running turn never falls asleep
+    /// mid-signal. Unknown codes never reach this method — the
+    /// brain falls back and only audits them.
+    pub fn on_emotion(&mut self, state: FaceState, now: Instant) {
+        self.last_activity = now;
+        self.set(state, now);
+    }
+
     /// Advance timers: transient states revert, long idleness sleeps.
     /// A running turn (Thinking) never sleeps: the caller must not
     /// call `tick` with a stale `last_activity` while a turn runs —
@@ -367,6 +397,26 @@ mod tests {
         assert_eq!(m.state(), FaceState::Sleepy);
         m.on_activity(now + Duration::from_secs(2 * IDLE_SLEEP_SECS + 32));
         assert_eq!(m.state(), FaceState::Neutral);
+    }
+
+    #[test]
+    fn emotion_codes_reach_all_nine_states() {
+        let (mut m, now) = machine();
+        for code in EmotionCode::ALL {
+            m.on_emotion(FaceState::from_emotion(code), now);
+            assert_eq!(m.state(), FaceState::from_emotion(code));
+            // The face label matches the code's Vietnamese label.
+            assert_eq!(m.state().label(), code.label_vi());
+        }
+        // Listening / Speaking / Surprised are reachable ONLY
+        // through the emotion channel (the Phase 3 test above
+        // pins the turn-phase surface).
+        m.on_emotion(FaceState::Listening, now);
+        assert_eq!(m.state(), FaceState::Listening);
+        m.on_emotion(FaceState::Speaking, now);
+        assert_eq!(m.state(), FaceState::Speaking);
+        m.on_emotion(FaceState::Surprised, now);
+        assert_eq!(m.state(), FaceState::Surprised);
     }
 
     #[test]

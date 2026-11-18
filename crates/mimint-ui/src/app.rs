@@ -28,7 +28,7 @@ use crate::approval_text::{approval_detail, crop_preview, is_point_tool, target_
 use crate::approver::{approval_point, ApprovalJob, RepaintSignal};
 use crate::audit_view::{read_audit_tail, stop_banner, AuditRow};
 use crate::chat::{friendly_tool_error, ChatRole, ChatState, ControlState, TurnStatus};
-use crate::face::{breath_scale, is_blinking, EyeShape, FaceMachine, MouthShape};
+use crate::face::{breath_scale, is_blinking, EyeShape, FaceMachine, FaceState, MouthShape};
 use crate::motion::{MotionController, MotionTier};
 use crate::worker::{FailureKind, WorkerEvent, WorkerHandle};
 use egui::{Color32, Pos2, Rect, Stroke, Vec2};
@@ -291,14 +291,27 @@ impl MimintApp {
                     self.chat.status = TurnStatus::TryingBackend(name);
                 }
                 WorkerEvent::TurnProgress { progress } => {
-                    self.chat.status = match progress {
-                        BrainProgress::Analyzing => TurnStatus::Analyzing,
-                        BrainProgress::Acting { tool } => TurnStatus::Acting(tool),
-                        BrainProgress::Verifying => TurnStatus::Verifying,
-                        BrainProgress::ToolFailed { tool, error } => {
-                            TurnStatus::ToolFailed { tool, error }
+                    // An emotion signal changes the face, not the
+                    // turn status; the other progress events
+                    // change the status, not the face.
+                    match progress {
+                        BrainProgress::Emotion { code } => {
+                            self.face.on_emotion(FaceState::from_emotion(code), now);
+                            self.state_since = now;
                         }
-                    };
+                        BrainProgress::Analyzing => {
+                            self.chat.status = TurnStatus::Analyzing;
+                        }
+                        BrainProgress::Acting { tool } => {
+                            self.chat.status = TurnStatus::Acting(tool);
+                        }
+                        BrainProgress::Verifying => {
+                            self.chat.status = TurnStatus::Verifying;
+                        }
+                        BrainProgress::ToolFailed { tool, error } => {
+                            self.chat.status = TurnStatus::ToolFailed { tool, error };
+                        }
+                    }
                 }
                 WorkerEvent::WorkerFault { error } => {
                     self.chat.control_error = true;
