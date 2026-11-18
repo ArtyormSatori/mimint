@@ -45,13 +45,15 @@
 //! passes. Diagnostics go to stderr.
 
 use mimint_body::{
-    Body, FileOracle, Framebuffer, MockBody, MockWindow, ScreenRect, StopFlag, TargetOracle,
-    TargetSnapshotSlot, X11Body,
+    Body, Framebuffer, MockBody, MockWindow, ScreenRect, StopFlag, TargetOracle, TargetSnapshotSlot,
 };
+#[cfg(target_os = "linux")]
+use mimint_body::{FileOracle, X11Body};
 use mimint_control::{register_body_tools_configured, BodyActor, FrameStore, PrivacyFlag};
 use mimint_core::Registry;
 use serde_json::json;
 use std::env;
+#[cfg(target_os = "linux")]
 use std::fs;
 use std::process::exit;
 use std::sync::Arc;
@@ -370,11 +372,13 @@ fn check_n4(mode: &str) -> Outcome {
 // X11 mode
 // ---------------------------------------------------------------------------
 
+#[cfg(target_os = "linux")]
 struct X11Target {
     center: (i32, i32),
     class: String,
 }
 
+#[cfg(target_os = "linux")]
 fn check_target_x11(
     log: &str,
     control: &str,
@@ -455,6 +459,7 @@ fn check_target_x11(
     }
 }
 
+#[cfg(target_os = "linux")]
 fn check_n3_x11(control: &str, center: (i32, i32)) -> Outcome {
     let body = match X11Body::connect() {
         Ok(body) => body,
@@ -512,6 +517,7 @@ fn check_n3_x11(control: &str, center: (i32, i32)) -> Outcome {
     pass("N3 toctou x11: PASS swapped=target_changed unchanged=ok".to_string())
 }
 
+#[cfg(target_os = "linux")]
 fn check_n5_x11(center: (i32, i32)) -> Outcome {
     let body = match X11Body::connect() {
         Ok(body) => body,
@@ -622,19 +628,27 @@ fn main() {
         outcomes.push(check_n4("mock"));
         outcomes.push(check_n5_mock());
     } else {
-        match check_target_x11(&log, &control, expect == "refuse", spoof) {
-            Ok((outcome, target)) => {
-                let center = target.center;
-                outcomes.push(outcome);
-                if !only_target {
-                    outcomes.push(check_n3_x11(&control, center));
-                    outcomes.push(check_n4("x11"));
-                    outcomes.push(check_n5_x11(center));
+        #[cfg(target_os = "linux")]
+        {
+            match check_target_x11(&log, &control, expect == "refuse", spoof) {
+                Ok((outcome, target)) => {
+                    let center = target.center;
+                    outcomes.push(outcome);
+                    if !only_target {
+                        outcomes.push(check_n3_x11(&control, center));
+                        outcomes.push(check_n4("x11"));
+                        outcomes.push(check_n5_x11(center));
+                    }
+                }
+                Err(message) => {
+                    outcomes.push(fail(format!("N1 point-target x11: FAIL {message}")));
                 }
             }
-            Err(message) => {
-                outcomes.push(fail(format!("N1 point-target x11: FAIL {message}")));
-            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            eprintln!("fix4checks: --body x11 is Linux-only");
+            exit(2);
         }
     }
 

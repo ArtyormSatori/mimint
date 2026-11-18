@@ -245,7 +245,7 @@ fn window_exe_basename(window: HWND) -> Option<String> {
             &mut size,
         );
         let _ = CloseHandle(process);
-        if !ok.as_bool() || size == 0 {
+        if ok.is_err() || size == 0 {
             return None;
         }
         let path = String::from_utf16_lossy(&buffer[..size as usize]);
