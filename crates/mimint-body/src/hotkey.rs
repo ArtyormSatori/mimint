@@ -544,10 +544,14 @@ mod tests {
         listener.stop();
     }
 
-    /// Live proof of the second channel: another client grabs
-    /// the chord AFTER the listener starts (starving the grab
-    /// channel — the latest passive grab wins delivery), and a
-    /// HELD chord must still trip the flag via the keymap poll.
+    /// Live proof of the second channel: an ACTIVE keyboard
+    /// grab from another client starves the listener's passive
+    /// grab channel (key events go to the active grabber), and
+    /// a HELD chord must still trip the flag via the keymap
+    /// poll. (A second PASSIVE grab cannot starve delivery:
+    /// X11 rejects a duplicate passive grab on the same chord
+    /// with BadAccess — passive grabs are exclusive. The active
+    /// grab is the starvation mechanism that actually exists.)
     #[cfg(target_os = "linux")]
     #[test]
     #[ignore]
@@ -555,45 +559,28 @@ mod tests {
         use x11rb::connection::Connection;
         // Explicit names, not a glob: `xproto::*` would shadow
         // `std::sync::Arc` with the xproto `Arc` struct.
-        use x11rb::protocol::xproto::{get_keyboard_mapping, grab_key, GrabMode};
+        use x11rb::protocol::xproto::{grab_keyboard, GrabMode, GrabStatus};
         let flag = StopFlag::new();
         let listener = HotkeyListener::start(Arc::clone(&flag)).expect("start hotkey listener");
         assert!(
             listener.health().poll_channel_active(),
             "the poll channel must be active on this server"
         );
-        // A competing grab on the same chord, from a second
-        // connection: it steals delivery from the listener's
-        // grab. Dropping the connection releases it again.
+        // An active keyboard grab on the root, from a second
+        // connection: while it is held, key events go to the
+        // grabbing client, not to the listener's passive grab.
+        // Dropping the connection releases it again.
         let (conn, screen_num) = x11rb::connect(None).expect("second connection");
         let root = conn.setup().roots[screen_num].root;
-        let setup = conn.setup();
-        let (min, max) = (setup.min_keycode, setup.max_keycode);
-        let reply = get_keyboard_mapping(&conn, min, max - min + 1)
+        let reply = grab_keyboard(&conn, false, root, 0u32, GrabMode::ASYNC, GrabMode::ASYNC)
             .unwrap()
             .reply()
             .unwrap();
-        let per = usize::from(reply.keysyms_per_keycode);
-        let esc = reply
-            .keysyms
-            .chunks(per)
-            .position(|chunk| chunk.contains(&0xff1bu32))
-            .map(|i| min + i as u8)
-            .expect("Escape keycode");
-        for modifiers in grab_modifier_combinations() {
-            grab_key(
-                &conn,
-                false,
-                root,
-                modifiers.into(),
-                esc,
-                GrabMode::ASYNC,
-                GrabMode::ASYNC,
-            )
-            .unwrap()
-            .check()
-            .unwrap();
-        }
+        assert_eq!(
+            reply.status,
+            GrabStatus::SUCCESS,
+            "the active grab must succeed to starve delivery"
+        );
         conn.flush().unwrap();
         // Held chord: the grab channel is starved, so only the
         // keymap poll can see it.
@@ -633,6 +620,14 @@ mod tests {
                 if let Some(mut child) = self.0.take() {
                     let _ = child.kill();
                     let _ = child.wait();
+                    // SIGKILL leaves the socket + lock behind;
+                    // remove them so the next run is not
+                    // refused. Safe: the test verified the
+                    // socket did not exist before it started
+                    // its own server, so these files are its
+                    // own leftovers.
+                    let _ = std::fs::remove_file("/tmp/.X11-unix/X89");
+                    let _ = std::fs::remove_file("/tmp/.X89-lock");
                 }
             }
         }
@@ -660,6 +655,8 @@ mod tests {
         if let Some(mut child) = xvfb.0.take() {
             let _ = child.kill();
             let _ = child.wait();
+            let _ = std::fs::remove_file("/tmp/.X11-unix/X89");
+            let _ = std::fs::remove_file("/tmp/.X89-lock");
         }
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
         while !flag.is_tripped() && std::time::Instant::now() < deadline {
