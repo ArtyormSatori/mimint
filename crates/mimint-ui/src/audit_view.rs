@@ -145,10 +145,14 @@ impl AuditRow {
     /// checks, recorded experience, import approvals — and
     /// `None` for everything else. The category (tried /
     /// verified / applied / not-improved) comes only from the
-    /// record's kind + decision; the detail string carries the
-    /// skill/task name and counts. Nothing is inferred beyond
-    /// what the record says: a record that does not exist is
-    /// never shown as a result.
+    /// record's kind + decision; the detail (skill name, pass
+    /// counts, task id) is read from the record's full detail
+    /// object, NOT from the truncated 3-pair summary — the
+    /// summary's alphabetical cut hid the skill name behind
+    /// the hash (demo catch). Nothing is inferred beyond what
+    /// the record says: a record that does not exist is never
+    /// shown as a result, and a missing field falls back to
+    /// the summary string.
     pub fn learning_summary(&self) -> Option<String> {
         let category = match (self.kind.as_str(), self.decision.as_deref()) {
             ("skill_validation", Some("promoted")) => "Đã xác minh",
@@ -181,10 +185,79 @@ impl AuditRow {
             ("skill_trigger_conflict", _) => "Cảnh báo: trigger trùng nhau",
             _ => return None,
         };
-        if self.detail.is_empty() {
+        let detail = self
+            .learning_detail()
+            .unwrap_or_else(|| self.detail.clone());
+        if detail.is_empty() {
             Some(format!("[{category}]"))
         } else {
-            Some(format!("[{category}] {}", self.detail))
+            Some(format!("[{category}] {detail}"))
+        }
+    }
+
+    /// The informative part of a learning record, read from the
+    /// full detail object in the raw line: skill name + pass
+    /// counts, golden id + issue count, task id, trigger +
+    /// skill names. `None` when the raw line does not parse or
+    /// the kind carries no such fields (the caller falls back
+    /// to the truncated summary).
+    fn learning_detail(&self) -> Option<String> {
+        let value: Value = serde_json::from_str(&self.raw).ok()?;
+        let detail = value.get("detail")?.as_object()?;
+        let text = |key: &str| detail.get(key).and_then(Value::as_str).map(str::to_string);
+        let count = |key: &str| detail.get(key).and_then(Value::as_u64);
+        match self.kind.as_str() {
+            "skill_validation" => {
+                let skill = text("skill")?;
+                match (count("passed"), count("total")) {
+                    (Some(passed), Some(total)) => {
+                        Some(format!("kỹ năng {skill}: {passed}/{total} đạt"))
+                    }
+                    _ => Some(format!("kỹ năng {skill}")),
+                }
+            }
+            "skill_promote" | "skill_import_approved" => {
+                Some(format!("kỹ năng {}", text("skill")?))
+            }
+            "skill_evolve" => {
+                let skill = text("skill")?;
+                let scores = detail.get("scores").and_then(Value::as_array);
+                let mut parts = vec![format!("kỹ năng {skill}")];
+                if let Some(scores) = scores {
+                    for score in scores {
+                        let variant = score.get("variant").and_then(Value::as_str)?;
+                        let passed = score.get("passed").and_then(Value::as_u64)?;
+                        let total = score.get("total").and_then(Value::as_u64)?;
+                        parts.push(format!("{variant} {passed}/{total}"));
+                    }
+                }
+                Some(parts.join(" · "))
+            }
+            "drift_eval" => {
+                let golden = text("golden_id")?;
+                let issues = detail
+                    .get("issues")
+                    .and_then(Value::as_array)
+                    .map(|issues| issues.len())
+                    .unwrap_or(0);
+                Some(format!("prompt {golden}: {issues} vấn đề"))
+            }
+            "experience_recorded" => {
+                let task = text("task")?;
+                match text("recorded") {
+                    Some(recorded) => Some(format!("nhiệm vụ {task}: {recorded}")),
+                    None => Some(format!("nhiệm vụ {task}")),
+                }
+            }
+            "skill_trigger_conflict" => {
+                let trigger = text("trigger")?;
+                let skills = detail.get("skills").and_then(Value::as_array);
+                let names: Vec<&str> = skills
+                    .map(|names| names.iter().filter_map(Value::as_str).collect())
+                    .unwrap_or_default();
+                Some(format!("trigger \"{trigger}\": {}", names.join(", ")))
+            }
+            _ => None,
         }
     }
 }
@@ -464,6 +537,30 @@ mod tests {
             r#"{"skill":"ghi-chu","passed":2,"total":2}"#
         )
         .starts_with("[Đã xác minh]"));
+        // The detail names the skill and the counts even when
+        // the truncated summary would hide them behind the hash
+        // (demo catch: alphabetical cut).
+        let full = line(
+            "skill_validation",
+            "promoted",
+            r#"{"skill":"ghi-chu","passed":2,"total":2,"content_hash":"8e14ebfcb743c4aa","import_approved":false,"imported":false}"#,
+        );
+        assert!(full.contains("ghi-chu"), "{full}");
+        assert!(full.contains("2/2"), "{full}");
+        let evolve = line(
+            "skill_evolve",
+            "base_kept",
+            r#"{"skill":"ghi-chu","scores":[{"variant":"base","passed":3,"total":3},{"variant":"short-answer","passed":3,"total":3}]}"#,
+        );
+        assert!(evolve.contains("ghi-chu"), "{evolve}");
+        assert!(evolve.contains("base 3/3"), "{evolve}");
+        let drift = line(
+            "drift_eval",
+            "drift",
+            r#"{"golden_id":"V4-uncertainty","issues":["a","b"]}"#,
+        );
+        assert!(drift.contains("V4-uncertainty"), "{drift}");
+        assert!(drift.contains("2 vấn đề"), "{drift}");
         assert!(line(
             "skill_validation",
             "quarantined",

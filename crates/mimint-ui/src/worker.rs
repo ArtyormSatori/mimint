@@ -154,6 +154,11 @@ pub enum WorkerEvent {
         privacy_on: bool,
         order: Vec<String>,
         warning: Option<String>,
+        /// Bare SOUL file name of the new profile, so the UI
+        /// Settings section shows the active profile's file
+        /// (fix-pass demo catch: the startup file went stale
+        /// after a switch).
+        soul_file: String,
     },
     /// The worker thread caught a panic inside a turn. The loop
     /// keeps serving; the UI shows the control error state.
@@ -849,6 +854,7 @@ fn worker_loop(
                         privacy_on: profile_runtime.privacy_on,
                         order: profile_runtime.order.clone(),
                         warning,
+                        soul_file: profile_runtime.profile.soul_file.clone(),
                     };
                     if event_tx.send(event).is_err() {
                         break;
@@ -1572,11 +1578,13 @@ mod tests {
                 privacy_on,
                 order,
                 warning,
+                soul_file,
             } => {
                 assert_eq!(name, "Làm việc");
                 assert_eq!(greeting, "Chào làm việc");
                 assert!(soul_sent);
                 assert!(privacy_on);
+                assert_eq!(soul_file, "work.md");
                 assert_eq!(order, vec!["local".to_string()]);
                 assert_eq!(warning, None);
             }

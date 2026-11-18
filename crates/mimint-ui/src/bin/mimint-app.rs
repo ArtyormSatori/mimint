@@ -369,6 +369,7 @@ fn run() -> Result<(), MimintError> {
         finetune,
         fallback_active,
         soul_path,
+        data_dir: data_dir.clone(),
     };
     let app = MimintApp::new(worker, approval_rx, options);
     let pixels_per_point = env::var("MIMINT_UI_PIXELS_PER_POINT")

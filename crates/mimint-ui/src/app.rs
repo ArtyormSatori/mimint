@@ -109,6 +109,9 @@ pub struct AppOptions {
     /// Path of the active profile's SOUL file, for the Settings
     /// section (F5-11).
     pub soul_path: PathBuf,
+    /// User data directory, so the SOUL path can follow profile
+    /// switches (the switch event carries the bare file name).
+    pub data_dir: PathBuf,
 }
 
 pub struct MimintApp {
@@ -179,6 +182,8 @@ pub struct MimintApp {
     fallback_active: bool,
     /// Path of the active profile's SOUL file (Settings, F5-11).
     soul_path: PathBuf,
+    /// User data directory (SOUL path resolution on switch).
+    data_dir: PathBuf,
     /// Set when the worker reports the SOUL file changed
     /// outside the code path; the Settings warning stays up
     /// for the rest of the session (F5-11).
@@ -260,6 +265,7 @@ impl MimintApp {
             finetune_tracker,
             fallback_active: options.fallback_active,
             soul_path: options.soul_path,
+            data_dir: options.data_dir,
             soul_changed_warning: false,
             show_journal: false,
             journal_rows: Vec::new(),
@@ -412,12 +418,18 @@ impl MimintApp {
                     privacy_on,
                     order,
                     warning,
+                    soul_file,
                 } => {
                     self.active_profile = name.clone();
                     self.privacy_on = privacy_on;
                     self.backend_names = order;
                     self.selected_backend = String::new();
                     self.pending_backend_change = None;
+                    // The Settings SOUL path follows the switch
+                    // (demo catch): the file name is a validated
+                    // bare name inside the data directory.
+                    self.soul_path = self.data_dir.join(soul_file);
+                    self.soul_changed_warning = false;
                     self.chat
                         .add_system(format!("Đã chuyển sang hồ sơ \"{name}\". {greeting}"));
                     self.chat.add_system(
