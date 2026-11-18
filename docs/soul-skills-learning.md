@@ -344,12 +344,20 @@ exact normalized token with the query.
 An empty or whitespace-only query returns NO results. This is
 a deliberate, locked-in semantic: the old `LIKE '%%'`
 behavior (empty query returns everything) is gone, covered by
-a locking test. Search is a full scan per query, re-tokenizing
-every note: measured on the build machine with the
-`bm25-bench` example (5000 generated notes, 20 queries) —
-see the Phase 5 fix-pass report for the numbers and the
-50 ms/query decision threshold. The bench runs in debug and
-is conservative: a release build is only faster.
+a locking test. Search reads a cached inverted index (token
+frequencies + posting lists, invalidated on every mutation):
+measured on the build machine with the `bm25-bench` example
+(5000 generated notes, 20 queries, debug build) at median
+13.4 ms/query, p95 29.4 ms — within the 50 ms/query decision
+threshold. The uncached full scan measured 270 ms median on
+the same data, which is why the index exists; a first
+posting-only version measured 50.4 ms, and precomputed term
+frequencies brought it to 13.4 ms. All three versions return
+the identical hit count (47,996), so the index changed no
+ranking. The bench runs in debug and is conservative: a
+release build is only faster. BM25 runs inside the
+`notebook_search` tool mid-turn, not before planning, so its
+effect on time-to-first-token is indirect.
 
 Why Rust BM25 instead of SQLite FTS5: the bundled rusqlite
 build WAS verified to support FTS5 (SQLite 3.46.0, FTS5

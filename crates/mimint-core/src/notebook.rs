@@ -18,8 +18,13 @@
 //! error) and `unicode61` splits on punctuation, not whitespace.
 //! A hand-rolled BM25 gives exactly the specified tokenizer,
 //! deterministic ranking, zero migration risk, and no new
-//! dependency. At personal-notebook scale a full scan per query
-//! is cheap; FTS5 stays available if scale ever demands it.
+//! dependency. Search keeps a cached inverted index (F5-16):
+//! tokenized docs plus posting lists, built lazily on the
+//! first search and invalidated by every mutation. The index
+//! changes no ranking — same tokens, same BM25, same
+//! tie-break — it only avoids re-tokenizing every note on
+//! every query (the uncached scan measured 270 ms median on
+//! 5000 notes; see the `bm25-bench` example).
 //!
 //! Tokenizer baseline (locked by tests, no deep Vietnamese NLP
 //! claimed): Unicode NFC normalization (a minimal Vietnamese-only
@@ -60,6 +65,55 @@ pub struct Note {
 /// SQLite-backed notebook, synchronized for sharing between tools.
 pub struct Notebook {
     conn: Mutex<Connection>,
+    /// Cached search index, built lazily and invalidated by
+    /// every mutation. `None` means "not built yet", never
+    /// "empty notebook": an empty notebook builds an empty
+    /// index, which a later `add` invalidates.
+    index: Mutex<Option<SearchIndex>>,
+}
+
+/// Cached search index (F5-16): the notes plus their
+/// tokenized forms and posting lists (term -> doc positions).
+/// Built from one `all_notes` snapshot; every mutation
+/// invalidates it, so a search never sees stale tokens.
+struct SearchIndex {
+    notes: Vec<Note>,
+    /// Per-doc term frequencies (title + body tokens).
+    term_freqs: Vec<HashMap<String, usize>>,
+    /// Per-doc token counts, for length normalization.
+    doc_lens: Vec<usize>,
+    postings: HashMap<String, Vec<usize>>,
+    total_len: usize,
+}
+
+impl SearchIndex {
+    fn build(notes: Vec<Note>) -> Self {
+        let mut term_freqs = Vec::with_capacity(notes.len());
+        let mut doc_lens = Vec::with_capacity(notes.len());
+        let mut postings: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut total_len = 0;
+        for (pos, note) in notes.iter().enumerate() {
+            let mut tokens = tokenize_baseline(&note.title);
+            tokens.extend(tokenize_baseline(&note.body));
+            total_len += tokens.len();
+            doc_lens.push(tokens.len());
+            let mut freq: HashMap<String, usize> = HashMap::new();
+            for token in tokens {
+                *freq.entry(token).or_insert(0) += 1;
+            }
+            for term in freq.keys() {
+                postings.entry(term.clone()).or_default().push(pos);
+            }
+            term_freqs.push(freq);
+        }
+        Self {
+            notes,
+            term_freqs,
+            doc_lens,
+            postings,
+            total_len,
+        }
+    }
 }
 
 fn note_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Note> {
@@ -260,32 +314,29 @@ const BM25_B: f64 = 0.75;
 
 /// BM25 score of one document for one set of query terms.
 ///
-/// `doc_tokens` is the document's token list (title + body);
-/// `doc_freq` maps each query term to the number of documents
-/// containing it; `avg_len` is the mean document length in tokens.
-/// Terms absent from the document contribute 0. The IDF uses the
-/// `ln(1 + ...)` form so it stays non-negative even when a term
-/// appears in every document.
+/// `term_freq` maps each term in the document to its count
+/// (precomputed by the search index); `doc_len` is the
+/// document's length in tokens; `doc_freq` maps each query
+/// term to the number of documents containing it; `avg_len`
+/// is the mean document length in tokens. Terms absent from
+/// the document contribute 0. The IDF uses the `ln(1 + ...)`
+/// form so it stays non-negative even when a term appears in
+/// every document.
 fn bm25_score(
-    doc_tokens: &[String],
+    term_freq: &HashMap<String, usize>,
+    doc_len: usize,
     query_terms: &HashSet<String>,
     doc_freq: &HashMap<String, usize>,
     doc_count: usize,
     avg_len: f64,
 ) -> f64 {
-    if doc_tokens.is_empty() || query_terms.is_empty() {
+    if term_freq.is_empty() || query_terms.is_empty() {
         return 0.0;
     }
-    let mut term_freq: HashMap<&str, usize> = HashMap::new();
-    for token in doc_tokens {
-        if query_terms.contains(token) {
-            *term_freq.entry(token.as_str()).or_insert(0) += 1;
-        }
-    }
-    let doc_len = doc_tokens.len() as f64;
+    let doc_len = doc_len as f64;
     let mut score = 0.0;
     for term in query_terms {
-        let tf = match term_freq.get(term.as_str()) {
+        let tf = match term_freq.get(term) {
             Some(&count) => count as f64,
             None => continue,
         };
@@ -317,6 +368,7 @@ impl Notebook {
         )?;
         Ok(Self {
             conn: Mutex::new(conn),
+            index: Mutex::new(None),
         })
     }
 
@@ -327,15 +379,54 @@ impl Notebook {
         }
     }
 
+    /// Drop the cached search index. Called after every
+    /// successful mutation, with the connection guard already
+    /// released, so the two locks are never held nested.
+    fn invalidate_index(&self) {
+        let mut slot = match self.index.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *slot = None;
+    }
+
+    /// The cached index, building it from a fresh snapshot when
+    /// absent. The build reads the database WITHOUT holding the
+    /// index lock, so the locks are never held nested.
+    fn search_index(&self) -> Result<std::sync::MutexGuard<'_, Option<SearchIndex>>, MimintError> {
+        {
+            let slot = match self.index.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if slot.is_some() {
+                return Ok(slot);
+            }
+        }
+        let built = SearchIndex::build(self.all_notes()?);
+        let mut slot = match self.index.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if slot.is_none() {
+            *slot = Some(built);
+        }
+        Ok(slot)
+    }
+
     /// Insert a note, returning its id.
     pub fn add(&self, title: &str, body: &str) -> Result<i64, MimintError> {
         let now = now_ms() as i64;
-        let conn = self.connection();
-        conn.execute(
-            "INSERT INTO notes (title, body, created_ms, updated_ms) VALUES (?1, ?2, ?3, ?3)",
-            params![title, body, now],
-        )?;
-        Ok(conn.last_insert_rowid())
+        let id = {
+            let conn = self.connection();
+            conn.execute(
+                "INSERT INTO notes (title, body, created_ms, updated_ms) VALUES (?1, ?2, ?3, ?3)",
+                params![title, body, now],
+            )?;
+            conn.last_insert_rowid()
+        };
+        self.invalidate_index();
+        Ok(id)
     }
 
     /// Read one note by id.
@@ -368,6 +459,10 @@ impl Notebook {
     /// Results are ordered by score (highest first), ties broken
     /// by id (oldest first), so the order is deterministic.
     /// An empty or whitespace-only query returns no results.
+    /// Scoring reads the cached inverted index: only docs
+    /// containing a query term are scored, which is identical
+    /// to scoring every doc — a doc with no query term scores
+    /// exactly 0.0 and is filtered out either way.
     pub fn search(&self, query: &str) -> Result<Vec<Note>, MimintError> {
         Ok(self
             .search_ranked(query)?
@@ -384,35 +479,35 @@ impl Notebook {
         if query_terms.is_empty() {
             return Ok(Vec::new());
         }
-        let notes = self.all_notes()?;
-        if notes.is_empty() {
+        let slot = self.search_index()?;
+        let Some(index) = slot.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let doc_count = index.notes.len();
+        if doc_count == 0 {
             return Ok(Vec::new());
         }
-        let docs: Vec<Vec<String>> = notes
-            .iter()
-            .map(|note| {
-                let mut tokens = tokenize_baseline(&note.title);
-                tokens.extend(tokenize_baseline(&note.body));
-                tokens
-            })
-            .collect();
-        let total_len: usize = docs.iter().map(Vec::len).sum();
-        let avg_len = total_len as f64 / docs.len() as f64;
+        let avg_len = index.total_len as f64 / doc_count as f64;
         let mut doc_freq: HashMap<String, usize> = HashMap::new();
-        for doc in &docs {
-            let seen: HashSet<&String> = doc.iter().collect();
-            for term in query_terms.iter() {
-                if seen.contains(term) {
-                    *doc_freq.entry(term.clone()).or_insert(0) += 1;
-                }
+        let mut candidates: HashSet<usize> = HashSet::new();
+        for term in query_terms.iter() {
+            if let Some(posting) = index.postings.get(term) {
+                doc_freq.insert(term.clone(), posting.len());
+                candidates.extend(posting.iter().copied());
             }
         }
-        let mut scored: Vec<(Note, f64)> = notes
+        let mut scored: Vec<(Note, f64)> = candidates
             .into_iter()
-            .zip(docs.iter())
-            .map(|(note, doc)| {
-                let score = bm25_score(doc, &query_terms, &doc_freq, docs.len(), avg_len);
-                (note, score)
+            .map(|pos| {
+                let score = bm25_score(
+                    &index.term_freqs[pos],
+                    index.doc_lens[pos],
+                    &query_terms,
+                    &doc_freq,
+                    doc_count,
+                    avg_len,
+                );
+                (index.notes[pos].clone(), score)
             })
             .filter(|(_, score)| *score > 0.0)
             .collect();
@@ -427,18 +522,24 @@ impl Notebook {
     /// Replace a note's title and body. Returns false when the id is absent.
     pub fn update(&self, id: i64, title: &str, body: &str) -> Result<bool, MimintError> {
         let now = now_ms() as i64;
-        let conn = self.connection();
-        let changed = conn.execute(
-            "UPDATE notes SET title = ?2, body = ?3, updated_ms = ?4 WHERE id = ?1",
-            params![id, title, body, now],
-        )?;
+        let changed = {
+            let conn = self.connection();
+            conn.execute(
+                "UPDATE notes SET title = ?2, body = ?3, updated_ms = ?4 WHERE id = ?1",
+                params![id, title, body, now],
+            )?
+        };
+        self.invalidate_index();
         Ok(changed > 0)
     }
 
     /// Delete a note. Returns false when the id is absent.
     pub fn delete(&self, id: i64) -> Result<bool, MimintError> {
-        let conn = self.connection();
-        let changed = conn.execute("DELETE FROM notes WHERE id = ?1", params![id])?;
+        let changed = {
+            let conn = self.connection();
+            conn.execute("DELETE FROM notes WHERE id = ?1", params![id])?
+        };
+        self.invalidate_index();
         Ok(changed > 0)
     }
 
@@ -740,6 +841,46 @@ mod tests {
         let ranked = notebook.search_ranked("chung").unwrap();
         assert_eq!(ranked.len(), 3);
         assert!(ranked.iter().all(|(_, score)| *score >= 0.0));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn cached_index_is_invalidated_by_every_mutation() {
+        let path = temp_db("index-invalidation");
+        let notebook = Notebook::open(&path).expect("open notebook");
+        notebook.add("một", "quả táo").unwrap();
+        // Build the cache with a search.
+        assert_eq!(notebook.search("táo").unwrap().len(), 1);
+        assert!(notebook.search("xoài").unwrap().is_empty());
+        // Add: the new note is searchable at once.
+        let id = notebook.add("hai", "quả xoài").unwrap();
+        assert_eq!(notebook.search("xoài").unwrap().len(), 1);
+        // Update: the old term stops matching, the new one matches.
+        assert!(notebook.update(id, "hai", "quả cam").unwrap());
+        assert!(notebook.search("xoài").unwrap().is_empty());
+        assert_eq!(notebook.search("cam").unwrap().len(), 1);
+        // Delete: the note is gone from results.
+        assert!(notebook.delete(id).unwrap());
+        assert!(notebook.search("cam").unwrap().is_empty());
+        // Untouched notes still rank the same after rebuilds.
+        assert_eq!(notebook.search("táo").unwrap().len(), 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn repeated_searches_agree_with_a_fresh_notebook() {
+        let path = temp_db("index-repeatable");
+        let notebook = Notebook::open(&path).expect("open notebook");
+        notebook.add("mưa rào", "mưa to gió lớn").unwrap();
+        notebook.add("nắng", "nắng vàng rực rỡ").unwrap();
+        notebook.add("mưa phùn", "mưa nhỏ lất phất mưa").unwrap();
+        let first = notebook.search_ranked("mưa").unwrap();
+        let second = notebook.search_ranked("mưa").unwrap();
+        assert_eq!(first, second);
+        // A fresh handle over the same file ranks identically:
+        // the cache holds no state the database lacks.
+        let reopened = Notebook::open(&path).expect("reopen notebook");
+        assert_eq!(reopened.search_ranked("mưa").unwrap(), first);
         let _ = std::fs::remove_file(&path);
     }
 }
