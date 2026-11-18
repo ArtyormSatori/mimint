@@ -84,15 +84,18 @@ above the chat, approval card + status + input + mic + send below.
   runs, so the lamp honestly shows "Chưa điều khiển thiết bị"
   until a card waits (Chờ xác nhận) or the user stops (Đã dừng).
   In `--body` mode a body stop (hotkey or input-while-card-waits)
-  also shows Đã dừng, with a message saying a restart is needed.
-- **DỪNG NGAY / Tiếp tục**: STOP is enabled while a turn runs, a
+  also shows Đã dừng, with a message saying the body stack must
+  be rebuilt ("Khởi tạo lại bộ điều khiển", when a factory exists)
+  or the app restarted.
+- **DỪNG KHẨN CẤP / Tiếp tục**: STOP is enabled while a turn runs, a
   card waits, or a session is active. It trips the latching stop
   token (see `docs/stop-and-approval.md`): new turns are blocked
   until the user presses "Tiếp tục". "Hủy lượt" cancels only the
   running turn and is distinct from STOP. After a BODY stop the
   "Tiếp tục" button is NOT shown — the body's flag latches until
-  restart, and offering resume would lie; the UI says to restart
-  instead.
+  the body stack is rebuilt or the app restarts, and offering
+  resume would lie; the UI offers "Khởi tạo lại bộ điều khiển"
+  when a factory exists, and says to restart otherwise.
 - **Backend picker + Privacy toggle**: switching to a known-remote
   backend asks first (a warning bar: the question would leave
   this machine). Tooltips describe the real behavior; no

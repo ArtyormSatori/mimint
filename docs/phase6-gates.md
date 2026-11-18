@@ -51,7 +51,7 @@ agent.
 
 ### G6-3. Stop semantics
 
-One stop latch stops ALL agents. Tripping DỪNG NGAY, the
+One stop latch stops ALL agents. Tripping DỪNG KHẨN CẤP, the
 hotkey, or the approval-pending trip halts every agent: no
 agent keeps running, keeps a provider call open past its
 timeout, or executes an already-approved action after the

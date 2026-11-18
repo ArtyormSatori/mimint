@@ -1,6 +1,6 @@
 # Stop and approval semantics
 
-How DỪNG NGAY (STOP NOW) and the approval card actually behave —
+How DỪNG KHẨN CẤP (emergency stop) and the approval card actually behave —
 what is implemented, what level each mechanism reaches, and what
 is still future work. This document exists so no one overclaims
 the stop: a stop that only hides the UI is not a stop, and this
@@ -29,8 +29,8 @@ succeeded just because `abort()` was called.
   stays available for Retry. With parallelism on, every agent
   has its OWN turn token: cancelling one agent never cancels
   another ("Dừng agent này" in the agents panel).
-- **Stop token** — the latching emergency stop (the "DỪNG NGAY"
-  button and "DỪNG TẤT CẢ"). Once tripped it stays tripped until
+- **Stop token** — the latching emergency stop (the "DỪNG KHẨN CẤP"
+  buttons: header and agents panel, one latch). Once tripped it stays tripped until
   the user actively resumes ("Tiếp tục"), across turns. New turns
   cannot start while it is tripped (the UI refuses submits; the
   worker would cancel the turn immediately anyway). Tripping it
@@ -167,10 +167,10 @@ One request, one id, one decision:
   another agent's). Slots are reaped with the agent.
 - **Two different stop actions.** "Dừng agent này" stops one
   agent (and its children) without tripping the global latch —
-  unless that agent caused a body fault. "DỪNG TẤT CẢ" stops
-  every agent and trips the latch; it warns about its scope
-  before running. The header's "DỪNG NGAY" stays the unwarned
-  emergency button. All three show the stop transition
+  unless that agent caused a body fault. "DỪNG KHẨN CẤP" stops
+  every agent and trips the latch; the agents-panel button
+  warns about its scope before running, the header button does
+  not — both send the same stop. All three show the stop transition
   (requested → awaiting end → confirmed / unverifiable) and
   never show "stopped" merely because `abort()` was called.
 - **Body rebuild after a fault.** A body fault (timeout, panic,
@@ -251,5 +251,5 @@ One request, one id, one decision:
 - Resume-after-body-stop without restart: the body's stop flag
   has no untrip by design, but Phase 6 rebuilds the body stack
   (fresh body, fresh flag) through the body factory, and the UI
-  offers "Rebuild body" when a factory exists. Without a
+  offers "Khởi tạo lại bộ điều khiển" when a factory exists. Without a
   factory (no `--body`), only a restart clears a body stop.

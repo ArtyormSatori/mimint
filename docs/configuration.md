@@ -144,6 +144,14 @@ max_queued_per_agent = 16   # 1..1024, and no more than the total.
 action_timeout_secs = 30    # 1..600. Max time an action RUNS once started.
 
 [hierarchy]
+# Why OFF by default, in plain words: delegating to a
+# sub-agent costs extra tokens and extra wall time for the
+# same work (stub harness: 360 tokens flat vs 600 delegated
+# for two clicks, 1.67x; wall time also rises — see
+# docs/operations.md for the measured numbers). Most turns
+# do not need a hierarchy, so the default is one agent doing
+# the work directly. Turn it on only when splitting the work
+# across agents is worth the overhead.
 enabled = false             # default: OFF. Requires parallelism_enabled.
 max_children = 2            # 1..4, and no more than max_agents - 1.
 default_child_steps = 10    # 1..50.
@@ -191,7 +199,9 @@ three tiers, and the rules below are mandatory:
 - **Tier 1 — basic:** `parallelism_enabled`, `max_agents`,
   `enabled` (hierarchy). Plain language, no jargon. The panel
   states that adding agents does not guarantee speedup
-  (especially with a local CPU backend).
+  (especially with a local CPU backend), and that hierarchy
+  defaults OFF because delegation costs extra tokens and time
+  (measured numbers in `docs/operations.md`).
 - **Tier 2 — advanced:** queue SLA, queue caps, action timeout,
   child limits, sandbox timeout/output caps, the R6 threshold.
   Each value states what it bounds (a WAIT bound is never
