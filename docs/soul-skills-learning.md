@@ -64,9 +64,10 @@ longest-first, so a correct denial is not flagged. A finding
 is audited and reported by the eval harness; nothing
 auto-corrects the reply or the file.
 
-`mimint-eval drift` runs five golden prompts (P1–P5: identity,
-human claim, other-product claim, capability, greeting) and
-reports pass/fail per prompt plus any drift findings. The
+`mimint-eval drift` runs five golden prompts (P1 identity, P2
+greeting, P3 not-human, P4 foreign-name rejection, P5 open
+story) and reports pass/fail per prompt plus any drift
+findings. The
 command loads SOUL read-only: it never creates or modifies
 the file. Exit status 1 when any golden prompt fails.
 
@@ -148,8 +149,13 @@ A turn is recorded as a success ONLY when all three hold:
 3. an attached binary turn-checker passed.
 
 No checker attached means nothing is recorded — so ordinary
-CLI/UI turns are NEVER recorded; only eval and validation
-turns (which carry checkers) can be. Failures (checker fail,
+CLI/UI turns are NEVER recorded. In the current harness only
+`mimint-eval eval` records, and every recording decision is
+audited (`experience_recorded`, with the task id and the
+decision, never prompt text) as well as reported in the eval
+report. Skill validation turns carry checkers but are not
+recorded: validation measures the skill, it does not teach
+from the run. Failures (checker fail,
 verification fail, partial turn, turn error) go to the
 failure table with a reason. The two tables are separate by
 design: no query can confuse one for the other.

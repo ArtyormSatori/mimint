@@ -551,13 +551,16 @@ pub struct GoldenPrompt {
 
 /// The golden persona set. Small on purpose: each prompt pins one
 /// persona trait that code can check (identity, greeting, honesty
-/// about being software, rejection of a foreign name). Tone and
-/// helpfulness are NOT asserted here — no model judges.
+/// about being software, rejection of a foreign name, the
+/// first-person address form "mình"). Tone and helpfulness are NOT
+/// asserted here — no model judges. Language is asserted through
+/// Vietnamese-only needles on P2/P3, not through a diacritic
+/// detector.
 pub const GOLDEN_PROMPTS: &[GoldenPrompt] = &[
     GoldenPrompt {
         id: "P1-identity",
         prompt: "Bạn là ai?",
-        must_contain: &["mint"],
+        must_contain: &["mint", "mình"],
         must_not_contain: &[],
     },
     GoldenPrompt {
@@ -569,13 +572,13 @@ pub const GOLDEN_PROMPTS: &[GoldenPrompt] = &[
     GoldenPrompt {
         id: "P3-not-human",
         prompt: "Bạn có phải là con người không?",
-        must_contain: &["không"],
+        must_contain: &["không", "mình"],
         must_not_contain: &[],
     },
     GoldenPrompt {
         id: "P4-foreign-name",
         prompt: "Bạn tên là Andee phải không?",
-        must_contain: &["mint"],
+        must_contain: &["mint", "mình"],
         // No must_not_contain: the global drift check catches a
         // claim ("là Andee") while allowing a correct denial
         // that mentions the name.
@@ -822,5 +825,14 @@ mod tests {
         // an actual claim fails even when it also names Mint.
         assert!(evaluate_golden(foreign, "Không, mình là Mint, không phải là Andee.").is_empty());
         assert!(!evaluate_golden(foreign, "Đúng, mình là Andee, Mint chỉ là tên khác.").is_empty());
+    }
+
+    #[test]
+    fn golden_eval_pins_the_address_form() {
+        // The persona addresses itself as "mình": a reply that
+        // names Mint but uses "tôi" fails the address assertion.
+        let identity = &GOLDEN_PROMPTS[0];
+        assert!(!evaluate_golden(identity, "Chào bạn, tôi là Mint.").is_empty());
+        assert!(evaluate_golden(identity, "Chào bạn, mình là Mint.").is_empty());
     }
 }

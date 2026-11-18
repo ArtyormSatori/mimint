@@ -455,6 +455,24 @@ async fn cmd_eval(opts: &Opts) -> Result<bool, MimintError> {
             }
             _ => "not recorded".to_string(),
         };
+        // Every learning write is audited (P5.3): the task id and
+        // the recording decision, never prompt text.
+        if experience.is_some() {
+            audit.log(
+                &turn_id,
+                "experience_recorded",
+                None,
+                Some(if run.result.passed {
+                    "passed"
+                } else {
+                    "failed"
+                }),
+                json!({
+                    "task": task.id,
+                    "recorded": recorded,
+                }),
+            )?;
+        }
         eprintln!(
             "  [{}] {}: {}",
             if run.result.passed { "PASS" } else { "FAIL" },
