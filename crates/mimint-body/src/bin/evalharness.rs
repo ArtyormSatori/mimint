@@ -32,6 +32,10 @@
 //! Canvas v1 boxes (absolute pixels, from
 //! `phase0/golden-tasks-seed.md`):
 //!
+//! - test-environment banner [0,0,1024,34]: full-width band
+//!   reading `MÔI TRƯỜNG THỬ NGHIỆM · canvas-v1 · dữ liệu giả
+//!   lập`. The band labels the canvas as a test fixture; it
+//!   moves no box, so the layout version stays `canvas-v1`.
 //! - `Mở` [100,60,180,100]; `Lưu` [220,60,300,100];
 //!   `Đóng` [340,60,420,100]; `Lưu bản sao` [460,60,580,100]
 //! - `Đăng nhập` [100,140,220,180]
@@ -39,7 +43,11 @@
 //! - input box [160,200,500,240], label `Tên:` [100,200,150,240]
 //! - checkbox [100,300,120,320], label `Nhớ tôi` [128,300,200,320]
 //! - list rows ×32px from y=360; row 3 `Mục 3 — Báo cáo` [100,424,500,456]
-//! - close glyph `×` 16×16 [1000,8,1016,24]
+//! - close glyph `×` 16×16 [1000,8,1016,24], drawn text with
+//!   no function (decorative only); the caption `chỉ trang trí`
+//!   sits immediately left of it, inside the banner band.
+//!   Clicking the glyph logs a click like any other point —
+//!   the canvas never acts on clicks itself.
 //!
 //! Linux-only: other targets exit with an error. The harness
 //! runs until killed (the golden runner owns its lifetime).
@@ -248,6 +256,21 @@ mod linux_impl {
     fn draw_canvas(font: &FontRef, size: f32) -> Canvas {
         let mut canvas = Canvas::new();
 
+        // Test-environment banner (F4-19): y=0..34, full
+        // width. It labels the canvas as a test fixture and
+        // moves no box, so CANVAS_VERSION stays canvas-v1.
+        canvas.fill_rect(0, 0, WIDTH as i32, 34, (0xFF, 0xF3, 0xCD));
+        canvas.fill_rect(0, 33, WIDTH as i32, 1, (0xD9, 0xA4, 0x04));
+        draw_text(
+            &mut canvas,
+            font,
+            "MÔI TRƯỜNG THỬ NGHIỆM · canvas-v1 · dữ liệu giả lập",
+            8.0,
+            17.0 + size * 0.35,
+            size,
+            (0x33, 0x33, 0x33),
+        );
+
         // Buttons row.
         draw_button(&mut canvas, font, "Mở", (100, 60, 80, 40), size);
         draw_button(&mut canvas, font, "Lưu", (220, 60, 80, 40), size);
@@ -313,7 +336,21 @@ mod linux_impl {
             );
         }
 
-        // Close glyph × [1000,8,1016,24].
+        // Close glyph × [1000,8,1016,24]: drawn text with no
+        // function. The caption says so, right-aligned to end
+        // just left of the glyph, inside the banner band.
+        let caption = "chỉ trang trí";
+        let caption_size = 12.0;
+        let caption_x = 992.0 - text_width(font, caption, caption_size);
+        draw_text(
+            &mut canvas,
+            font,
+            caption,
+            caption_x,
+            17.0 + caption_size * 0.35,
+            caption_size,
+            (0x33, 0x33, 0x33),
+        );
         draw_text(
             &mut canvas,
             font,

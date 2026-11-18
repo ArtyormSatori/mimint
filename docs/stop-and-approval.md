@@ -2,7 +2,7 @@
 
 How DỪNG NGAY (STOP NOW) and the approval card actually behave —
 what is implemented, what level each mechanism reaches, and what
-is still Phase 4 work. This document exists so no one overclaims
+is still future work. This document exists so no one overclaims
 the stop: a stop that only hides the UI is not a stop, and this
 project says which one it built.
 
@@ -12,7 +12,7 @@ project says which one it built.
 |---|---|---|
 | 1. Hide the UI | The window stops showing progress; work continues underneath. | NOT what Mimint does. Never implemented as "stop". |
 | 2. Cooperative cancel | Checkpoints in the brain loop and the guard executor refuse to start the next provider call / tool execution once cancelled. Work already in flight finishes (bounded by timeouts). | IMPLEMENTED (Phase 3 fix pass). |
-| 3. Real cancel | In-flight HTTP requests are aborted and the connection dropped on cancel. | NOT implemented. The HTTP client has per-request timeouts, but no abort-on-cancel wiring. Phase 4+ work. |
+| 3. Real cancel | In-flight HTTP requests are aborted and the connection dropped on cancel. | NOT implemented. The HTTP client has per-request timeouts, but no abort-on-cancel wiring. BLOCKED for this fix pass: no design was approved and no wiring exists; future work. |
 
 Every stop surface in the app is level 2. The UI says "Đã dừng"
 only after the latch trips; it never claims an in-flight request
@@ -67,9 +67,15 @@ One request, one id, one decision:
   (rendered action-specifically — see `approval_text.rs`). What
   you see is what runs; there is no re-resolution between card
   and execution.
-- **Timeout: 120 seconds** by default (configurable via
+- **Timeout: 60 seconds** by default (configurable via
   `MIMINT_APPROVAL_TIMEOUT_SECS`, minimum 5). Nobody answering
-  denies as `Timeout` — the tool never runs.
+  denies as `Timeout` — the tool never runs. A decision that
+  arrives at or after the deadline is refused at the LOGIC
+  layer, not just hidden from the display: the approver
+  re-checks the deadline when the decision arrives, and the UI
+  re-checks it again before sending any decision — a late
+  Allow can never authorize the action, even if the card was
+  still on screen when the user clicked.
 - **Closed channel denies**: a disconnected UI fails the approval
   with an error, and errors deny by guard policy.
 - The audit log distinguishes `cancelled` ≠ `deny` ≠ `timeout`:
@@ -92,11 +98,25 @@ One request, one id, one decision:
   window is hidden or unfocused. Any grab failure fails the
   whole start (a partial grab would make the stop unreliable in
   exactly the cases the user cannot predict). Verified live
-  under Xvfb (ignored test in `hotkey.rs`). Other platforms:
+  under Xvfb (ignored tests in `hotkey.rs`). Other platforms:
   design only, recorded in `hotkey.rs` — macOS needs a
   CGEventTap (unverified), Windows a low-level hook (code only),
   Android has no global hotkey concept (the shell's kill switch
   is the equivalent).
+- **Hotkey second channel + death latch (fix pass):** the
+  listener also polls the keymap (`XQueryKeymap`, every 20ms)
+  on the same thread, so the chord still trips the stop even
+  when another client holds the grab and key events never
+  arrive. If the listener's X connection dies, or the keymap
+  poll fails, the listener trips the stop latch itself
+  (fail-closed: a dead hotkey must never look like a live one)
+  and marks itself dead (`HotkeyHealth`); a clean shutdown
+  does NOT trip. The chord and the death trip both record a
+  trip context — source, reason, time — and the worker
+  bridges it into an `emergency_stop` audit record, so the
+  audit trail says WHY the latch tripped, not just that it
+  did. The audit viewer shows a restart banner above the
+  newest trip until a new startup record appears.
 - **Approval-pending trip, wired:** `UiApprover` sets the shared
   pending flag for exactly the duration of each card wait; a
   consequential body attempt while it is set trips the stop
@@ -110,14 +130,17 @@ One request, one id, one decision:
   body on a dedicated thread with a 30s default timeout per
   action and a fail-fast broken latch. The `Body` trait stays
   synchronous; the timeout lives in the actor layer, which is
-  the layer the brain's tools go through. See
-  `docs/body-tools.md`.
+  the layer the brain's tools go through. A timeout, a
+  disconnect mid-action, or a body panic is reported as
+  `unknown_outcome` — the action may or may not have run — and
+  breaks the actor (fail-closed); it is never silently
+  retried. See `docs/body-tools.md`.
 
 ## What is NOT here (yet)
 
-- Real (level-3) cancel of in-flight HTTP: Phase 4+. The HTTP
-  client has per-request timeouts, but no abort-on-cancel
-  wiring.
+- Real (level-3) cancel of in-flight HTTP: still not
+  implemented (see the table above). The HTTP client has
+  per-request timeouts, but no abort-on-cancel wiring.
 - Global hotkey on macOS/Windows: design only (see above).
 - Resume-after-body-stop without restart: the body's stop flag
   has no untrip by design; rebuilding the body stack on resume

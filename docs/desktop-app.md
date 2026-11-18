@@ -137,9 +137,13 @@ always forces a 500ms repaint while a card is on screen.
   and cancellations; content is never silently lost.
 - The approval card (P0-17) shows ACTION-SPECIFIC content (what
   will happen, to what target, with what scope, what consequence,
-  whether reversible), a countdown, and Allow/Deny buttons. The
-  lifecycle (request id binding, 120s timeout, cancelled ≠ deny,
-  approved-then-STOPPED never runs) is specified in
+  whether reversible), the target window identity (class, exe
+  basename, window id — never the window title), a crop preview
+  of the observed screen around the target point, a warning
+  when the observation is older than the TTL, a countdown, and
+  Allow/Deny buttons. The lifecycle (request id binding, 60s
+  timeout, cancelled ≠ deny, approved-then-STOPPED never runs,
+  late Allow refused at the logic layer) is specified in
   `docs/stop-and-approval.md`. Deny is the safe default. If the UI
   disconnects while a decision is pending, the worker's approval
   fails and the guard denies.
@@ -174,6 +178,12 @@ always forces a 500ms repaint while a card is on screen.
 - `MIMINT_UI_DEGRADED=1`: static face + visible simple-mode label.
 - `MIMINT_REDUCED_MOTION=1`: OS reduced-motion signal (Linux hook).
 - `MIMINT_APPROVAL_TIMEOUT_SECS=<n>`: approval card timeout
-  (default 120, minimum 5).
+  (default 60, minimum 5).
+- `MIMINT_MAX_OBSERVATION_AGE_SECS=<n>`: how old the newest
+  stored screenshot may be before the body tools refuse a
+  non-screenshot action with `stale_observation` (default 300,
+  minimum 5). A fresh screenshot resets the age; the approval
+  card warns (but still allows a decision) when the observation
+  is older than this.
 - `MIMINT_UI_PIXELS_PER_POINT=<f>`: UI scale (demo screenshots at
   125%/150%).

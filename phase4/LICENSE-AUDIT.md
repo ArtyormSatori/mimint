@@ -1,5 +1,10 @@
 # Mimint Phase 4 — License Audit
 
+> SUPERSEDED by `phase4/LICENSE-AUDIT-FIXPASS.md`, which covers the
+> Phase 4 fix-pass dependency tree. This file is kept for the Phase 4
+> record; its table is byte-identical to the fix-pass table (the fix
+> pass added zero packages).
+
 > SOURCE OF TRUTH: this file is the authoritative license audit for the
 > Phase 4 dependency tree. `phase3/LICENSE-AUDIT.md` covers the Phase 3
 > tree only and is superseded by this file (see the notice at its top).

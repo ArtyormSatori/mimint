@@ -159,18 +159,67 @@ of pretending).
 
 **Broad forbidden zones (Phase 4, enforced on X11):** before
 every input action, `X11Body` reads the active window
-(`_NET_ACTIVE_WINDOW`, WM_CLASS + title) and refuses with
-`BodyError::ForbiddenWindow` when it matches the denylist in
-`forbidden.rs` — password managers, authenticators, OS
-permission prompts, banking/payment windows — default-deny for
-those categories, undeterminable → allow. The error names the
-window CLASS only, never the title (titles can carry secrets).
-`WindowsBody` checks the foreground window class the same way
-(code only, unverified); `AndroidBody` asks the shell for the
-focused window and applies the same denylist client-side;
-Wayland portals cannot report the focused window, so the
-`WaylandBody` cannot enforce this (documented as a gap in
+(`_NET_ACTIVE_WINDOW`, WM_CLASS + title + exe basename) and
+refuses with `BodyError::ForbiddenWindow` when it matches the
+denylist in `forbidden.rs` — password managers,
+authenticators, OS permission prompts, banking/payment windows
+— default-deny for those categories, undeterminable → allow.
+The check also runs at the TARGET POINT (the window under the
+action's coordinates, not just the focused one), with all
+three signals — class, title, exe basename — so a forbidden
+app cannot hide behind a spoofed class name. The error names
+the window CLASS only, never the title (titles can carry
+secrets) and never the exe path (basename only, and never
+echoed). `WindowsBody` checks the foreground window and the
+target point the same way (code only, unverified);
+`AndroidBody` asks the shell for the focused window and
+applies the same denylist client-side, but has no
+target-point check (the protocol carries no window-at-point
+query); Wayland portals cannot report the focused window, so
+the `WaylandBody` cannot enforce this (documented as a gap in
 `docs/wayland-body.md`, not faked).
+
+**Self-exclusion by window id (fix pass, X11):** in addition
+to the rectangle list, `X11Body` keeps a registry of its own
+window ids, scanned from `_NET_CLIENT_LIST` filtered by
+`_NET_WM_PID` == its own pid (1s cache; a window whose PID
+cannot be verified is NOT treated as its own — fail-closed
+against PID spoofing). A target point inside one of its own
+windows is refused even if the rectangle list is stale.
+
+## Target identity, re-verification, and observation freshness
+
+The `Body` trait offers two optional probes: `window_at(x, y)`
+(the identity of the window under a point: id, class, title,
+exe basename) and `snapshot_target(x, y)` (a one-shot 8×8
+luminance grid of the 64×64 region around the point — no
+pixels leave the body). The approval flow probes the target
+when the card is shown and stores the snapshot in a
+one-shot, point-bound slot; when the approved action runs,
+the body tools re-verify: if the window under the point
+changed, or the grid no longer matches, the action is
+refused with `target_changed` — a TOCTOU swap between card
+and execution cannot redirect the click. A missing probe
+never refuses: bodies that cannot probe simply skip
+re-verification (documented per body below), and a missing
+snapshot never blocks an action that was never snapshotted.
+
+Separately, the body tools refuse non-screenshot actions when
+the newest stored screenshot is older than the observation
+TTL (default 300s, `MIMINT_MAX_OBSERVATION_AGE_SECS`): a
+stale observation is refused with `stale_observation` rather
+than acted on. A fresh screenshot resets the age.
+
+Per-body support (fix pass):
+
+| Body | `window_at` | `snapshot_target` | Notes |
+|---|---|---|---|
+| `X11Body` | Yes (query_tree descent, mapped check) | Yes (GetImage sub-rect, grid only) | Full re-verification. |
+| `MockBody` | Yes (window stack) | Yes (same pixel function) | Fault injection incl. mid-action disconnect. |
+| `WindowsBody` | Yes (`WindowFromPoint`) | No | Code only, runtime unverified. Forbidden-point check works; re-verification skipped. |
+| `MacOsBody` | No | No | Code only, runtime unverified. No window-at-point API wrapped yet. |
+| `AndroidBody` | No | No | Protocol has no window-at-point query; focused-window check only. |
+| `WaylandBody` | No | No | Portals cannot report windows; transport itself is blocked. |
 
 ## GuardedBody: the body-level safety wrapper
 

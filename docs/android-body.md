@@ -22,8 +22,8 @@ Rust controller (this repo)          Android device
 │ AndroidBody             │  v2 over │ ProtocolServer (Kotlin)  │
 │  ├─ bounds/target checks│  loopback│  ├─ auth + role checks   │
 │  ├─ ProtocolClient      │◄────────►│  ├─ ScreenCapture        │
-│  └─ retry-once on       │  adb     │  ├─ InputInjector        │
-│     transport failure   │  reverse │  └─ AuditLog/OracleLog   │
+│  └─ reads retry once;   │  adb     │  ├─ InputInjector        │
+│     inputs never retry  │  reverse │  └─ AuditLog/OracleLog   │
 └─────────────────────────┘          │  MimintAccessibilityService
                                      └──────────────────────────┘
 ```
@@ -48,7 +48,13 @@ The authoritative spec is the module documentation in
 - Framing: u32 big-endian JSON length + JSON header + payload
   bytes (payloads are raw bytes, no base64).
 - Request: `{"v":2,"id":N,"method":"...","params":{...},
-  "auth":"<token>","role":"owner"|"guest","payload_len":0}`.
+  "auth":"<value>","auth_mode":"bound"|"raw",
+  "role":"owner"|"guest","payload_len":0}`. On a TLS
+  connection `auth` is the exporter-bound HMAC (see "Session
+  binding" below) and `auth_mode` is `"bound"`; on a plain
+  connection `auth` is the raw token and `auth_mode` is
+  `"raw"`. A mode that does not match the transport is
+  `unauthorized`.
 - Response: `{"v":2,"id":N,"ok":true,"result":{...},
   "payload_len":M}` or `{"ok":false,"error":{"code","message"}}`.
 - Response `id` must equal the request `id`; JSON headers are
@@ -86,7 +92,25 @@ code in the message — never silently swallowed.
 - **Pairing auth.** The token is generated on the device at
   pairing time (32 random bytes) and shown to the owner, who
   enters it on the Rust side. No default token, no tokenless
-  mode. Tokens are compared without early exit.
+  mode. Auth values are compared without early exit.
+- **Session binding (fix pass).** On a TLS connection the
+  client never sends the raw token: both ends derive the same
+  32-byte secret from the TLS exporter (RFC 5705, label
+  `"mimint android v2 auth"`, no context) and the client sends
+  `auth = hex(HMAC-SHA256(exporter, token))` with
+  `auth_mode = "bound"`. A captured auth value — or the raw
+  token itself — is useless on any other connection, because
+  every TLS session has a different exporter; the server
+  rejects the raw token outright in TLS mode. This is
+  implemented and tested on the Rust side only (client +
+  fake server). The Kotlin shell cannot use the exporter:
+  `javax.net.ssl.SSLSocket` exposes no keying-material API,
+  so the shell's binding design is challenge-response instead
+  (specified below, unimplemented on both ends). The current
+  Kotlin stub still accepts the raw token and MUST be updated
+  to the challenge-response design before any real deployment;
+  until then the Rust client in TLS mode and the Kotlin stub
+  do not interoperate, by design.
 - **TLS with certificate pinning.** The shell serves a
   self-signed certificate generated on first run (AndroidKeyStore);
   the client pins the SHA-256 of the certificate DER,
@@ -108,11 +132,51 @@ code in the message — never silently swallowed.
   and service immediately. The shell also exposes a persistent
   notification Stop action and an in-app STOP button. The
   service never restarts itself.
-- **Retry honesty.** The client reconnects once on a
-  transport-level failure. At-most-once is NOT guaranteed
-  across that retry: if the request reached the server but
-  the response was lost, the retry executes the action a
-  second time. Typed refusals are never retried.
+- **Retry honesty.** Idempotent reads (`display_size`,
+  `screenshot`, `permissions`, `focused_window`) reconnect
+  once and retry after a transport failure — re-reading the
+  screen cannot double-execute anything. Input methods NEVER
+  retry: a transport failure after an input request is
+  reported as `unknown_outcome` (the action may or may not
+  have run), and the client never guesses. Typed refusals
+  are never retried on any method.
+
+## Session binding on the Kotlin shell (design, unimplemented)
+
+`SSLSocket` cannot export keying material, so the shell binds
+the token to the connection with a challenge instead of the
+TLS exporter. This design is specified but NOT implemented —
+neither the shell nor the Rust client speaks it yet. Do not
+claim otherwise.
+
+1. On each accepted TLS connection, before reading any
+   request, the shell sends one challenge frame: a 32-byte
+   random value (`SecureRandom`), framed exactly like a
+   response header: `{"v":2,"id":0,"ok":true,"result":
+   {"challenge":"<64 lowercase hex>"},"payload_len":0}`. The
+   challenge is per-connection and never reused.
+2. The client answers every request on that connection with
+   `auth = hex(HMAC-SHA256(key = token bytes, message =
+   challenge bytes))` and `auth_mode = "challenge"`. The raw
+   token never crosses the wire.
+3. The shell verifies with a constant-time compare
+   (`MessageDigest.isEqual`) against its own HMAC over the
+   stored token and the challenge it sent. A wrong value, a
+   missing challenge, or `auth_mode` other than `"challenge"`
+   on a TLS connection is `unauthorized`.
+4. Plain mode keeps `auth_mode = "raw"` with the raw token
+   (debug-only, loopback, as today).
+
+Interop note: the Rust client currently speaks only `"bound"`
+(TLS exporter) and `"raw"`. Speaking `"challenge"` requires
+client work: read the challenge frame on connect, compute the
+HMAC per connection, send `auth_mode = "challenge"`. Until
+that work lands, a challenge-response shell and this client
+cannot pair — the modes are negotiated by what the server
+sends first, and a client that does not expect a challenge
+frame will misread it as a reply. The fake server does NOT
+implement the challenge mode; it implements the exporter
+mode, which is what the Rust tests verify.
 
 ## What the shell cannot do
 
@@ -161,6 +225,15 @@ on loopback sharing state with its oracle):
 - Focus verification through the `focused_window` query.
 - Kill switch, audit lines, version mismatch, bad token,
   unknown method, reconnect-once.
+- Session binding (fix pass): the bound auth value differs
+  across two TLS connections with the same token; the server
+  rejects the raw token over TLS and rejects a bound value
+  stolen from another connection. HMAC construction pinned
+  against the RFC 4231 test vector.
+- Retry split (fix pass): a read retries once after a lost
+  response and succeeds; an input after a lost response is
+  `unknown_outcome`, never retried, exactly one execution
+  recorded.
 - The `conformance --body android --shot` path end to end
   against the fake (arg parsing → connect → PPM write).
 

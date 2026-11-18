@@ -17,8 +17,30 @@ answer, not a failure — but it must say so.
 - [ ] A5. The pairing token + TLS fingerprint display in the app.
 - [ ] A6. `adb reverse tcp:18711 tcp:18711` succeeds; the Rust
       side connects (plain or pinned — record which).
+      WARNING: pinned mode currently does NOT work against
+      the Kotlin stub — the Rust client sends exporter-bound
+      auth values and the stub still expects the raw token
+      (see `docs/android-body.md`). Pinned runs are BLOCKED
+      until the shell implements challenge-response binding.
 - [ ] A7. A wrong token is refused with a typed error
       (connect once with a bad token and record the error).
+
+## Fix-pass additions (blocked until the shell implements them)
+
+- [ ] A23. Session binding: once the shell implements
+      challenge-response (see `docs/android-body.md`), the
+      raw token over TLS is refused, and a bound value
+      captured from another connection is refused on a new
+      connection. Until the shell implements it, record
+      "not run — unimplemented", not a failure.
+- [ ] A24. Retry split: drop the connection mid-input → the
+      client reports `unknown_outcome`, never retries, and
+      the shell audit shows exactly one execution. Drop it
+      mid-read → the client reconnects once and succeeds.
+- [ ] A25. Rotation: rotate the token in the app → the old
+      controller configuration is refused; re-pair with the
+      new token succeeds. BLOCKED until the rotation UI
+      exists (designed in `docs/pairing.md`, not built).
 
 ## Conformance (run-conformance.sh, two runs)
 
