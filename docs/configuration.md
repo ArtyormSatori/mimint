@@ -45,6 +45,15 @@ max_attempts = 3
 max_elapsed_secs = 120
 base_delay_ms = 200
 max_delay_ms = 5000
+
+default_profile = "Làm việc"
+
+[[profile]]
+name = "Làm việc"
+soul = "work.md"
+chain = ["local"]
+privacy = true
+cost_cap_usd = 0.0
 ```
 
 ### `[privacy]`
@@ -83,6 +92,28 @@ max_delay_ms = 5000
 | `max_elapsed_secs` | integer | 120 | Wall-clock budget for ONE `chat()` call, including backoff sleeps. Each call gets a fresh budget; the turn total is bounded by the brain's step cap (`--max-steps`). The budget is checked between attempts; an in-flight request is bounded by its per-request timeout. |
 | `base_delay_ms` | integer | 200 | First backoff delay. Backoff doubles per attempt up to `max_delay_ms`, with full jitter (each wait is uniform in `[0, delay]`). A provider's `Retry-After` header is honored as a minimum wait. |
 | `max_delay_ms` | integer | 5000 | Backoff cap. |
+
+### `default_profile` and `[[profile]]` (Phase 5)
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `default_profile` | string | first profile | Name of the profile used when no `--profile` flag is given. An unknown name falls back to the first profile with a warning. |
+| `name` | string | — (required) | Profile name, shown in the UI and used by `--profile`. Empty or duplicate names drop the profile with a warning. |
+| `soul` | string | `SOUL.md` | Bare SOUL file name in the data directory. Names that escape the directory drop the profile with a warning. |
+| `chain` | string list | top-level chain | Ordered backend names. A chain naming an unknown backend drops the profile with a warning. |
+| `voice` | string | none | Voice label: stored and displayed only, no TTS engine yet. |
+| `skills` | string list | all promoted | Selected skill names. An empty list means no skills; an empty skill name drops the profile with a warning. |
+| `proactive` | bool | `false` | Proactive mode: stored and displayed only, no scheduler yet. |
+| `budget_usd` | number | none | Proactive budget: stored and displayed only. Must be finite and `>= 0`. |
+| `privacy` | bool | top-level setting | Profile Privacy Mode. |
+| `cost_cap_usd` | number | top-level cap | Profile cost cap. Must be finite and `>= 0`. |
+| `avatar` | string | none | Avatar label: stored and displayed only. |
+
+Semantic profile errors drop the offending profile with a
+warning and fall closed to the remaining profiles (or the
+implicit "Mặc định" profile when none remain); they never
+fail the run. See `docs/profiles.md` for switching semantics
+and the stored-not-executed limits.
 
 ## Backend selection precedence
 

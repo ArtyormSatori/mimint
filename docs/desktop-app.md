@@ -53,8 +53,27 @@ padding in every mode, and no label is clipped. Left sidebar: conversations, pro
 card; collapsible via the ☰ button. Main area: the large Mint face
 above the chat, approval card + status + input + mic + send below.
 
-- **Profile**: the current profile is shown ("Mặc định"). Full
-  profile management is Phase 5+ work.
+- **Profile**: the current profile is shown in the header and
+  the sidebar lists every profile from the config file;
+  clicking one switches (chain, Privacy Mode, cost cap, SOUL,
+  and skill filter rebuild; the greeting becomes the new
+  profile's SOUL first line). Profile attributes that have no
+  engine yet (voice, proactive, budget, avatar) show as
+  labels only. See `docs/profiles.md`.
+- **Fine-tune**: the sidebar shows the hardware-gate verdict
+  per gate with measured values, and a "Kiểm tra lại" button
+  re-runs the probe. Real training is blocked in this build.
+  See `docs/finetune-gate.md`.
+- **Emotion**: the model signals emotion through the
+  `set_emotion` tool call (a structured channel, never
+  free-text parsing); the face changes to the matching state.
+  An unknown code falls back to the neutral face with an
+  audit record. In degraded mode the face is static but the
+  label still updates. See `docs/soul-skills-learning.md`.
+- **Approval card**: the buttons read "Cho phép thực hiện
+  hành động này" / "Từ chối hành động này", with hover texts
+  explaining the one-time scope. The decision semantics are
+  unchanged.
 - **Mic button**: disabled. There is no voice input or TTS in
   Phase 3.
 - **Robot card**: shows "chưa kết nối" (not connected). Robot
