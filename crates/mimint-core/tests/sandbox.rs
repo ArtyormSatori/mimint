@@ -4,9 +4,9 @@
 //! pass by running code unsandboxed.
 
 use mimint_core::{
-    Approver, AuditLog, CancelToken, ChildProcessRegistry, CodeRunRequest, ExecuteCodeTool,
-    GuardedExecutor, MimintError, Notebook, Registry, RunDirTracker, Sandbox, SandboxConfig,
-    SandboxPolicy, Tool,
+    sha256_hex, Approver, AuditLog, CancelToken, ChildProcessRegistry, CodeRunRequest,
+    ExecuteCodeTool, GuardedExecutor, MimintError, Notebook, Registry, RunDirTracker, Sandbox,
+    SandboxConfig, SandboxPolicy, Tool,
 };
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -393,6 +393,44 @@ fn execute_code_output_capped() {
 }
 
 #[test]
+fn sandbox_proc_shows_only_sandbox_pids() {
+    // F6-11: inside the sandbox, /proc lists only processes
+    // in the sandbox's PID namespace. The sandboxed
+    // process sees its own PID and never the host test
+    // process's PID.
+    let Some(sandbox) = available_sandbox(default_policy()) else {
+        return;
+    };
+    let host_pid = std::process::id();
+    let code = "import os, json; print(json.dumps({'pid': os.getpid(), 'pids': sorted(os.listdir('/proc'))}))";
+    let output = sandbox
+        .run(run_request("python3", code))
+        .expect("sandboxed run succeeds");
+    assert_eq!(output.exit_code, Some(0), "stderr: {}", output.stderr);
+    let seen: Value =
+        serde_json::from_str(output.stdout.trim()).expect("the child prints one JSON line");
+    let own_pid = seen["pid"].as_u64().expect("child pid");
+    let pids: Vec<String> = seen["pids"]
+        .as_array()
+        .expect("pid list")
+        .iter()
+        .filter_map(|v| v.as_str().map(str::to_string))
+        .collect();
+    assert!(
+        pids.contains(&own_pid.to_string()),
+        "the child must see its own PID in /proc: {pids:?}"
+    );
+    assert_ne!(
+        own_pid as u32, host_pid,
+        "the child runs in its own PID namespace"
+    );
+    assert!(
+        !pids.contains(&host_pid.to_string()),
+        "the host test process PID {host_pid} must not appear in the sandboxed /proc: {pids:?}"
+    );
+}
+
+#[test]
 fn execute_code_audit_has_hash_not_text() {
     let Some(sandbox) = available_sandbox(default_policy()) else {
         return;
@@ -453,6 +491,91 @@ fn execute_code_audit_has_hash_not_text() {
         "code_execution record present"
     );
     assert!(log.contains("\"sandbox_verdict\":\"bwrap\""), "{log}");
+    tracker.cleanup();
+    let _ = std::fs::remove_file(&db_path);
+    let _ = std::fs::remove_file(&audit_path);
+}
+
+#[test]
+fn execute_code_input_hashes_are_audited_and_verified() {
+    // F6-06 end to end: a real sandboxed run with an input
+    // file. The code_execution record must carry the
+    // approved input hash, the executed input hash, and
+    // input_hashes_verified=true; the executed hash must
+    // equal the hash of the approved content.
+    let Some(sandbox) = available_sandbox(default_policy()) else {
+        return;
+    };
+    let stem = temp_stem("input-hash");
+    let db_path = format!("{stem}.db");
+    let audit_path = format!("{stem}.jsonl");
+    let notebook = Arc::new(Notebook::open(&db_path).unwrap());
+    let audit = AuditLog::open(&audit_path).unwrap();
+    let tracker = Arc::new(RunDirTracker::new());
+    let tool = ExecuteCodeTool::new(
+        "agent-001",
+        Arc::new(sandbox),
+        Arc::clone(&tracker),
+        ChildProcessRegistry::new(),
+    );
+    let mut registry = Registry::new();
+    registry.register(Box::new(tool));
+    struct AllowApprover;
+    impl Approver for AllowApprover {
+        fn approve(&self, _tool: &str, _args: &Value) -> Result<bool, MimintError> {
+            Ok(true)
+        }
+        fn label(&self) -> &'static str {
+            "test allow"
+        }
+    }
+    let approver = AllowApprover;
+    let executor = GuardedExecutor::new(
+        &registry,
+        Some(&approver),
+        &audit,
+        "turn-sandbox-input-hash",
+        "agent-001",
+    );
+    let output = executor
+        .execute(
+            "execute_code",
+            &json!({
+                "language": "python3",
+                "code": "print(open('data.txt').read())",
+                "inputs": [{"name": "data.txt", "content": "hello-input"}],
+            }),
+        )
+        .expect("approved run executes");
+    assert!(output["stdout"].as_str().unwrap().contains("hello-input"));
+    assert_eq!(
+        output["input_files_sha256"][0]["sha256"],
+        sha256_hex(b"hello-input")
+    );
+    drop(executor);
+    drop(audit);
+    drop(notebook);
+    let log = std::fs::read_to_string(&audit_path).unwrap();
+    assert!(
+        !log.contains("hello-input"),
+        "audit must carry hashes, never input content"
+    );
+    let record = log
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find(|r| r["kind"] == "code_execution")
+        .expect("code_execution record");
+    let detail = &record["detail"];
+    assert_eq!(detail["input_hashes_verified"], true, "{detail}");
+    assert_eq!(detail["input_files_sha256"][0]["name"], "data.txt");
+    assert_eq!(
+        detail["input_files_sha256"][0]["sha256"],
+        sha256_hex(b"hello-input")
+    );
+    assert_eq!(
+        detail["executed_input_files_sha256"], detail["input_files_sha256"],
+        "{detail}"
+    );
     tracker.cleanup();
     let _ = std::fs::remove_file(&db_path);
     let _ = std::fs::remove_file(&audit_path);

@@ -53,6 +53,7 @@ use mimint_body::{ActOutcome, Action, Body, BodyError, StopFlag, TargetProbe};
 use mimint_core::{AuditLog, AGENT_DEFAULT};
 use serde_json::json;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -122,6 +123,12 @@ enum RequestReply {
 struct Request {
     agent_id: String,
     kind: RequestKind,
+    /// Approval-time mutation generation (F6-03): when set,
+    /// the loop refuses the action at dequeue time unless
+    /// the generation still matches — another agent's action
+    /// in the meantime invalidates the approval. Only
+    /// `act_for_checked` sets it; probes never carry one.
+    expected_seq: Option<u64>,
     enqueued_at: Instant,
     /// Enqueue + queue SLA (actions) or probe SLA (probes).
     /// The loop denies the request past this instant.
@@ -168,6 +175,17 @@ struct ActorInner {
     /// field. Written by the waiting caller, never by the
     /// loop, so no cross-agent race is possible.
     last_queued: Arc<Mutex<HashMap<String, u64>>>,
+    /// Body mutation generation (F6-03): the count of
+    /// non-screenshot actions the loop has dispatched.
+    /// Incremented by the loop thread only, after every
+    /// dispatched non-screenshot `body.act()` returns (Ok or
+    /// Err — a refused action may have partially executed,
+    /// so it still invalidates approvals). Probes and
+    /// denied requests never bump it. Shared with callers:
+    /// re-verification compares the approval snapshot's
+    /// generation against it, and probe replies are stamped
+    /// with it.
+    mutation_seq: Arc<AtomicU64>,
 }
 
 /// A body behind a dedicated thread, with a per-action timeout.
@@ -245,9 +263,11 @@ impl BodyActor {
         let broken = Arc::new(Mutex::new(false));
         let cancelled = Arc::new(Mutex::new(HashSet::new()));
         let last_queued = Arc::new(Mutex::new(HashMap::new()));
+        let mutation_seq = Arc::new(AtomicU64::new(0));
         let thread_stop = Arc::clone(&stop);
         let thread_broken = Arc::clone(&broken);
         let thread_cancelled = Arc::clone(&cancelled);
+        let thread_mutation_seq = Arc::clone(&mutation_seq);
         std::thread::spawn(move || {
             actor_loop(
                 body,
@@ -257,6 +277,7 @@ impl BodyActor {
                 config,
                 thread_cancelled,
                 audit,
+                thread_mutation_seq,
             )
         });
         BodyActor {
@@ -265,6 +286,7 @@ impl BodyActor {
                 broken,
                 cancelled,
                 last_queued,
+                mutation_seq,
             }),
             stop,
             timeout: config.action_timeout,
@@ -314,6 +336,12 @@ impl BodyActor {
         self.config
     }
 
+    /// Current body mutation generation (F6-03): the count
+    /// of non-screenshot actions dispatched so far.
+    pub fn mutation_seq(&self) -> u64 {
+        self.inner.mutation_seq.load(Ordering::SeqCst)
+    }
+
     fn record_queued(&self, agent_id: &str, queued_ms: u64) {
         self.inner
             .last_queued
@@ -328,7 +356,7 @@ impl BodyActor {
     /// the action may have executed, and must not be retried.
     /// Single-agent entry: attributed to the default agent.
     pub fn act(&self, action: Action) -> Result<ActOutcome, BodyError> {
-        self.act_inner(AGENT_DEFAULT, action, false)
+        self.act_inner(AGENT_DEFAULT, action, false, None)
     }
 
     /// Execute one action for `agent_id` (Phase 6, §9): the
@@ -338,7 +366,22 @@ impl BodyActor {
     /// `QueueExpired` and does NOT break the actor; an
     /// execution timeout reports `UnknownOutcome` and does.
     pub fn act_for(&self, agent_id: &str, action: Action) -> Result<ActOutcome, BodyError> {
-        self.act_inner(agent_id, action, true)
+        self.act_inner(agent_id, action, true, None)
+    }
+
+    /// Like [`BodyActor::act_for`], but the action carries
+    /// the approval-time mutation generation (F6-03): the
+    /// loop refuses it at dequeue time when the generation
+    /// has moved, before `Started` — nothing executed. Body
+    /// tools use this when a snapshot was consumed by
+    /// re-verification.
+    pub fn act_for_checked(
+        &self,
+        agent_id: &str,
+        action: Action,
+        expected_seq: u64,
+    ) -> Result<ActOutcome, BodyError> {
+        self.act_inner(agent_id, action, true, Some(expected_seq))
     }
 
     fn act_inner(
@@ -346,6 +389,7 @@ impl BodyActor {
         agent_id: &str,
         action: Action,
         phased: bool,
+        expected_seq: Option<u64>,
     ) -> Result<ActOutcome, BodyError> {
         self.check_entry(agent_id)?;
         let (reply_tx, reply_rx) = channel::<RequestReply>();
@@ -361,6 +405,7 @@ impl BodyActor {
             .send(Request {
                 agent_id: agent_id.to_string(),
                 kind: RequestKind::Act(action),
+                expected_seq,
                 enqueued_at,
                 deadline: enqueued_at + queue_bound,
                 reply: reply_tx,
@@ -480,6 +525,7 @@ impl BodyActor {
             .send(Request {
                 agent_id: agent_id.to_string(),
                 kind: RequestKind::ProbeTarget { x, y },
+                expected_seq: None,
                 enqueued_at,
                 deadline: enqueued_at + PROBE_QUEUE_SLA,
                 reply: reply_tx,
@@ -762,6 +808,9 @@ fn pick_next(
     None
 }
 
+// 8 args: the F6-03 shared mutation generation counter is the
+// 8th. Same allow as fallback.rs/mcp.rs/skills.rs/brain.rs.
+#[allow(clippy::too_many_arguments)]
 fn actor_loop(
     mut body: Box<dyn Body>,
     rx: Receiver<Request>,
@@ -770,6 +819,7 @@ fn actor_loop(
     config: ActorConfig,
     cancelled: Arc<Mutex<HashSet<String>>>,
     audit: Option<Arc<AuditLog>>,
+    mutation_seq: Arc<AtomicU64>,
 ) {
     let mut queues: HashMap<String, VecDeque<Request>> = HashMap::new();
     let mut order: Vec<String> = Vec::new();
@@ -829,6 +879,27 @@ fn actor_loop(
             audit_queue_deny(&audit, &agent_id, "queue_sla_expired", queued_ms, sla_secs);
             continue;
         }
+        // Mutation-generation check (F6-03): an action
+        // carrying the approval-time generation is refused
+        // when any non-screenshot action ran since the
+        // approval snapshot was taken — another agent may
+        // have moved the world. Refused BEFORE Started:
+        // nothing executed, and the caller sees a
+        // recoverable refusal, not an unknown outcome.
+        if let (RequestKind::Act(_), Some(expected)) = (&request.kind, request.expected_seq) {
+            let current = mutation_seq.load(Ordering::SeqCst);
+            if current != expected {
+                let reply = deny_reply(
+                    &request.kind,
+                    BodyError::TargetChangedSinceApproval {
+                        snapshot_seq: expected,
+                        current_seq: current,
+                    },
+                );
+                let _ = request.reply.send(reply);
+                continue;
+            }
+        }
         // Started BEFORE execution: a failed send means the
         // caller went away — never execute work nobody waits
         // for (§9, anti-late-run).
@@ -850,12 +921,28 @@ fn actor_loop(
                 RequestKind::Act(ref action) => RequestReply::Action(body.act(action)),
                 RequestKind::ProbeTarget { x, y } => {
                     let identity = body.window_at(x, y);
-                    let snapshot = body.snapshot_target(x, y);
+                    let mut snapshot = body.snapshot_target(x, y);
+                    // Stamp the generation the probe observed:
+                    // the loop is serialized, so no action can
+                    // run between the snapshot and this read.
+                    if let Some(snap) = snapshot.as_mut() {
+                        snap.mutation_seq = mutation_seq.load(Ordering::SeqCst);
+                    }
                     RequestReply::ProbeTarget(Ok(TargetProbe { identity, snapshot }))
                 }
             }));
         match outcome {
             Ok(reply) => {
+                // The generation moves on every dispatched
+                // non-screenshot action, Ok or Err: a refused
+                // action may have partially executed, so it
+                // still invalidates approvals taken before it.
+                // Screenshots and probes never bump it.
+                if let RequestKind::Act(action) = &request.kind {
+                    if !matches!(action, Action::Screenshot) {
+                        mutation_seq.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
                 if request.reply.send(reply).is_err() {
                     // The requester went away (timed out): the
                     // loop keeps running — the NEXT request will
@@ -976,6 +1063,55 @@ mod tests {
         let err = actor.act(Action::Click { x: 10, y: 10 }).unwrap_err();
         assert!(err.message().contains("emergency stop"));
         assert!(oracle.received_clicks().is_empty());
+    }
+
+    #[test]
+    fn mutation_seq_counts_mutations_and_stamps_probes() {
+        let body = MockBody::new();
+        let actor = BodyActor::spawn(Box::new(body), StopFlag::new());
+        assert_eq!(actor.mutation_seq(), 0);
+        let probe = actor.probe_target(10, 10).unwrap();
+        assert_eq!(probe.snapshot.unwrap().mutation_seq, 0);
+        // Screenshots and probes never bump the generation.
+        assert!(actor.act(Action::Screenshot).is_ok());
+        assert_eq!(actor.mutation_seq(), 0);
+        let _ = actor.probe_target(10, 10).unwrap();
+        assert_eq!(actor.mutation_seq(), 0);
+        // A dispatched click bumps it; the next probe is
+        // stamped with the new generation.
+        assert!(actor.act(Action::Click { x: 10, y: 10 }).is_ok());
+        assert_eq!(actor.mutation_seq(), 1);
+        let probe = actor.probe_target(10, 10).unwrap();
+        assert_eq!(probe.snapshot.unwrap().mutation_seq, 1);
+        // Even a refused action bumps it (fail-closed: it
+        // may have partially executed).
+        let _ = actor.act(Action::Click { x: 9999, y: 9999 });
+        assert_eq!(actor.mutation_seq(), 2);
+    }
+
+    #[test]
+    fn act_for_checked_refuses_a_stale_generation_before_starting() {
+        let body = MockBody::new();
+        let mut oracle = body.oracle();
+        let actor = BodyActor::spawn(Box::new(body), StopFlag::new());
+        let probe = actor.probe_target(10, 10).unwrap();
+        let seq = probe.snapshot.unwrap().mutation_seq;
+        assert!(actor.act(Action::Click { x: 20, y: 20 }).is_ok());
+        let err = actor
+            .act_for_checked("agent-001", Action::Click { x: 10, y: 10 }, seq)
+            .unwrap_err();
+        assert_eq!(err.code(), "target_changed_since_approval");
+        assert!(
+            err.message().contains("mutation 0 -> 1"),
+            "{}",
+            err.message()
+        );
+        // The refused click never reached the body.
+        assert_eq!(oracle.received_clicks(), vec![(20, 20)]);
+        // The current generation dispatches fine.
+        assert!(actor
+            .act_for_checked("agent-001", Action::Click { x: 10, y: 10 }, 1)
+            .is_ok());
     }
 
     #[test]

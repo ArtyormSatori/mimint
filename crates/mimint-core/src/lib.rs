@@ -46,9 +46,9 @@ pub use brain::{Brain, BrainProgress, StepVerifier, TurnOutcome, DELEGATE_OUTPUT
 pub use cancel::{CancelReport, CancelToken, KillLedger, WaitAnyCancelled};
 pub use claude::{ClaudeClient, ANTHROPIC_BASE_URL, ANTHROPIC_VERSION, DEFAULT_MAX_TOKENS};
 pub use config::{
-    default_config_path, is_valid_mcp_server_name, load_config_file, validate_mcp_unsandboxed,
-    AgentsConfig, FileConfig, HierarchyConfig, McpServerConfig, ResolvedConfig, RoutingConfig,
-    SandboxConfig, MAX_MCP_SERVERS,
+    default_config_path, is_valid_mcp_server_name, load_config_file, load_config_file_hashed,
+    validate_mcp_unsandboxed, AgentsConfig, FileConfig, HierarchyConfig, McpServerConfig,
+    ResolvedConfig, RoutingConfig, SandboxConfig, MAX_MCP_SERVERS,
 };
 pub use egress::{url_is_loopback, EgressPolicy, GuardedHttpClient};
 pub use emotion::{handle_emotion_args, EmotionCode, EmotionOutcome};
@@ -92,12 +92,12 @@ pub use registry::{
 };
 pub use routing::{
     action_fingerprint, canonical_json, tool_family, BatchLoopGuard, BatchLoopTrip, ToolFamily,
-    VerificationStatus, ROUTING_RULE_FIRST, ROUTING_RULE_SWITCH,
+    VerificationKind, VerificationStatus, ROUTING_RULE_FIRST, ROUTING_RULE_SWITCH,
 };
 pub use sandbox::{
-    bwrap_argv, os_sandbox_denial, Artifact, ChildProcessRegistry, CodeRunOutput, CodeRunRequest,
-    ExecuteCodeTool, KillOutcome, KillVerdict, RunDirTracker, Sandbox, SandboxPolicy,
-    TMPFS_SIZE_BYTES, VERDICT_BWRAP,
+    bwrap_argv, execute_code_input_hashes, os_sandbox_denial, Artifact, ChildProcessRegistry,
+    CodeRunOutput, CodeRunRequest, ExecuteCodeTool, InputFileHash, KillOutcome, KillVerdict,
+    RunDirTracker, Sandbox, SandboxPolicy, TMPFS_SIZE_BYTES, VERDICT_BWRAP,
 };
 pub use skills::{
     approve_import, builtin_skills, checker_passes_on_empty_evidence, demote,

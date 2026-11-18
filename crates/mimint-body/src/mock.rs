@@ -786,7 +786,11 @@ impl Body for MockBody {
             cw,
             ch,
         );
-        Some(TargetSnapshot { window_id, grid })
+        Some(TargetSnapshot {
+            window_id,
+            grid,
+            mutation_seq: 0,
+        }) // 0: the actor loop stamps the real seq (F6-03).
     }
 
     fn expected_focus(&self) -> Option<u64> {

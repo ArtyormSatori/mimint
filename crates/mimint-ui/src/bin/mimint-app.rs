@@ -41,9 +41,9 @@ use mimint_body::ScreenRect;
 use mimint_control::{ActorConfig, DEFAULT_MAX_OBSERVATION_AGE};
 use mimint_core::{
     build_chain, config_path_outside_workdirs, default_config_path, default_data_dir,
-    default_vault, egress::url_is_loopback, evaluate_finetune, load_config_file, probe_finetune,
-    probe_local_backends, suggestion_text, AuditLog, EgressPolicy, ExperienceStore, FileConfig,
-    MimintError, Notebook, ResolvedConfig, SkillStore, SoulStore,
+    default_vault, egress::url_is_loopback, evaluate_finetune, load_config_file_hashed,
+    probe_finetune, probe_local_backends, suggestion_text, AuditLog, EgressPolicy, ExperienceStore,
+    FileConfig, MimintError, Notebook, ResolvedConfig, SkillStore, SoulStore,
 };
 use mimint_ui::app::{AppOptions, BackendInfo};
 use mimint_ui::approver::{approval_channel, RepaintSignal, TokenSlot, DEFAULT_APPROVAL_TIMEOUT};
@@ -205,9 +205,12 @@ fn run() -> Result<(), MimintError> {
 
     let config_path = args.config.clone().or_else(default_config_path);
     let config_required = args.config.is_some();
-    let resolved: ResolvedConfig = match &config_path {
-        Some(path) => load_config_file(path, config_required)?.validate()?,
-        None => FileConfig::empty().validate()?,
+    let (resolved, config_sha256): (ResolvedConfig, Option<String>) = match &config_path {
+        Some(path) => {
+            let (file_config, hash) = load_config_file_hashed(path, config_required)?;
+            (file_config.validate()?, hash)
+        }
+        None => (FileConfig::empty().validate()?, None),
     };
     let config_display = config_path
         .as_ref()
@@ -283,6 +286,21 @@ fn run() -> Result<(), MimintError> {
             "source": if args.profile.is_some() { "command line --profile" } else { "config file" },
             "config_path": config_display,
             "profile": profile.name,
+        }),
+    )?;
+    // F6-09: record the SHA-256 of the exact config bytes
+    // parsed, for traceability. A failed audit write fails
+    // the start, like the privacy record above. There is no
+    // config reload: the hash is never re-checked, it only
+    // proves which config this run started with.
+    audit.log(
+        "ui-startup",
+        "config_loaded",
+        None,
+        None,
+        json!({
+            "config_sha256": config_sha256,
+            "config_path": config_display,
         }),
     )?;
 
@@ -455,6 +473,7 @@ fn run() -> Result<(), MimintError> {
         shared_exclusion,
         frame_store: body_frames,
         greeting,
+        hierarchy_enabled: resolved.hierarchy.enabled,
         profiles: resolved.profiles,
         active_profile: profile.name,
         profile_warnings,

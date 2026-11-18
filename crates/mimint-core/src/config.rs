@@ -802,10 +802,24 @@ fn validate_mcp_servers(entries: &[McpServerEntry]) -> Result<Vec<McpServerConfi
 /// empty configuration; when true, a missing file is an error. Parse and
 /// validation errors always fail, and name the file.
 pub fn load_config_file(path: &Path, required: bool) -> Result<FileConfig, MimintError> {
+    load_config_file_hashed(path, required).map(|(config, _)| config)
+}
+
+/// Load a config file, returning the parsed config plus the
+/// SHA-256 of the exact bytes parsed (F6-09), for the startup
+/// audit record. `None` when no file was read (missing file,
+/// not required). The hash is traceability, not enforcement:
+/// there is no config reload, so nothing re-checks it later —
+/// it only lets an audit reader prove which config a run
+/// started with.
+pub fn load_config_file_hashed(
+    path: &Path,
+    required: bool,
+) -> Result<(FileConfig, Option<String>), MimintError> {
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound && !required => {
-            return Ok(FileConfig::empty());
+            return Ok((FileConfig::empty(), None));
         }
         Err(err) => {
             return Err(MimintError::Config(format!(
@@ -814,8 +828,10 @@ pub fn load_config_file(path: &Path, required: bool) -> Result<FileConfig, Mimin
             )));
         }
     };
+    let hash = crate::audit::sha256_hex(text.as_bytes());
     FileConfig::parse(&text)
         .map_err(|err| MimintError::Config(format!("{}: {}", path.display(), err.message())))
+        .map(|config| (config, Some(hash)))
 }
 
 #[cfg(test)]
@@ -847,6 +863,34 @@ timeout_secs = 60
 chain = ["local", "cloud"]
 max_attempts = 2
 "#;
+
+    #[test]
+    fn load_config_file_hashed_reports_the_bytes_parsed() {
+        // F6-09: the hash covers exactly the file bytes; a
+        // missing optional file yields an empty config and
+        // no hash.
+        let dir = std::env::temp_dir().join(format!(
+            "mimint-config-hash-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mimint.toml");
+        std::fs::write(&path, VALID).unwrap();
+        let (config, hash) = load_config_file_hashed(&path, true).unwrap();
+        assert!(config.validate().is_ok());
+        assert_eq!(
+            hash.as_deref(),
+            Some(crate::audit::sha256_hex(VALID.as_bytes()).as_str())
+        );
+        let (empty, hash) = load_config_file_hashed(&dir.join("absent.toml"), false).unwrap();
+        assert!(empty.validate().is_ok());
+        assert_eq!(hash, None);
+        assert!(load_config_file_hashed(&dir.join("absent.toml"), true).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn valid_config_resolves() {

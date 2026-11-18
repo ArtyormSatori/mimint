@@ -41,6 +41,7 @@ fn audit_args(tool_name: &str, args: &Value) -> Value {
         "language": args.get("language").cloned().unwrap_or(Value::Null),
         "code_sha256": sha256_hex(code.as_bytes()),
         "code_len": code.len(),
+        "input_files_sha256": json!(crate::sandbox::execute_code_input_hashes(args)),
     })
 }
 
@@ -59,6 +60,7 @@ fn audit_output(tool_name: &str, output: &Value) -> Value {
         "duration_ms": output.get("duration_ms").cloned().unwrap_or(Value::Null),
         "truncated": output.get("truncated").cloned().unwrap_or(Value::Null),
         "code_sha256": output.get("code_sha256").cloned().unwrap_or(Value::Null),
+        "input_files_sha256": output.get("input_files_sha256").cloned().unwrap_or(Value::Null),
         "stdout_len": stdout_len,
         "stderr_len": stderr_len,
     })
@@ -545,6 +547,7 @@ impl<'a> GuardedExecutor<'a> {
     ) -> Result<(), MimintError> {
         let code = args.get("code").and_then(|c| c.as_str()).unwrap_or("");
         let approved_hash = sha256_hex(code.as_bytes());
+        let approved_inputs = json!(crate::sandbox::execute_code_input_hashes(args));
         let mut detail = serde_json::Map::new();
         detail.insert(
             "language".to_string(),
@@ -552,6 +555,7 @@ impl<'a> GuardedExecutor<'a> {
         );
         detail.insert("code_len".to_string(), json!(code.len()));
         detail.insert("code_sha256".to_string(), json!(approved_hash));
+        detail.insert("input_files_sha256".to_string(), approved_inputs.clone());
         if let Some(output) = output {
             // Hash verification (§15.2): the code that ran must
             // be the code that was approved. The tool reports
@@ -567,6 +571,24 @@ impl<'a> GuardedExecutor<'a> {
                 "code_hash_verified".to_string(),
                 json!(executed == Some(approved_hash.as_str())),
             );
+            // Input-hash verification (F6-06): the executed
+            // input list must equal the approved one, in
+            // order. A missing executed list verifies only
+            // when nothing was approved (both empty is a
+            // match; an approved input with no executed list
+            // is a mismatch, never silent).
+            let executed_inputs = output.get("input_files_sha256").cloned();
+            detail.insert(
+                "executed_input_files_sha256".to_string(),
+                executed_inputs.clone().unwrap_or(Value::Null),
+            );
+            let inputs_verified = match &executed_inputs {
+                Some(Value::Array(list)) => Value::Array(list.clone()) == approved_inputs,
+                _ => approved_inputs
+                    .as_array()
+                    .is_some_and(|list| list.is_empty()),
+            };
+            detail.insert("input_hashes_verified".to_string(), json!(inputs_verified));
             detail.insert(
                 "sandbox_verdict".to_string(),
                 output

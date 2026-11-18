@@ -59,8 +59,8 @@ use mimint_core::{
     ChildProcessRegistry, CostCap, CostLedger, EgressPolicy, ExecuteCodeTool, ExperienceStore,
     FallbackChain, HierarchyConfig, KillLedger, McpManager, McpServerConfig, MimintError, Notebook,
     Profile, ProfileSet, Provider, RetryPolicy, RoutingConfig, RunDirTracker, Sandbox,
-    SandboxConfig, SkillDef, SkillStore, SoulDoc, SoulStore, VerificationStatus, AGENT_DEFAULT,
-    DEFAULT_MAX_TOKENS, SOUL_FORMAT_VERSION,
+    SandboxConfig, SkillDef, SkillStore, SoulDoc, SoulStore, VerificationKind, VerificationStatus,
+    AGENT_DEFAULT, DEFAULT_MAX_TOKENS, SOUL_FORMAT_VERSION,
 };
 use serde_json::json;
 use std::collections::{HashMap, VecDeque};
@@ -208,6 +208,13 @@ pub enum WorkerEvent {
         partial: bool,
         backend: Option<String>,
         verified: Option<VerificationStatus>,
+        /// What kind of verification the verified steps carry
+        /// (F6-05): travels with `verified` so a mixed turn is
+        /// never presented as bare GUI verification.
+        verification_kind: VerificationKind,
+        /// Paths an `execute_code` step failed to access inside
+        /// the sandbox (F6-17), detected from the tool result.
+        sandbox_denied_paths: Vec<String>,
         delegate_failures: Vec<String>,
     },
     /// A turn failed (provider error, guard error, audit failure).
@@ -1487,6 +1494,8 @@ impl LoopState {
                     partial: turn.partial,
                     backend,
                     verified: turn.verification,
+                    verification_kind: turn.verification_kind,
+                    sandbox_denied_paths: turn.sandbox_denied_paths.clone(),
                     delegate_failures,
                 }),
                 TaskOutcome::Failed { error, .. } => self.send(WorkerEvent::TurnFailed {
@@ -1638,7 +1647,28 @@ impl LoopState {
     /// closes, unless it is stuck inside a body call — that
     /// thread can never be killed (§10), and the limitation is
     /// documented, not hidden.
+    /// Rebuild wrapper (F6-15): a failed rebuild is audited
+    /// (`body_rebuild_failed`, with the raw error), so the
+    /// user-facing message can stay friendly without losing
+    /// the cause. Success already audits `body_rebuilt`.
     fn rebuild_body_stack(&mut self, reason: &str) -> Result<(), String> {
+        let result = self.rebuild_body_stack_inner(reason);
+        if let Err(error) = &result {
+            let _ = self.audit.log(
+                "ui-control",
+                "body_rebuild_failed",
+                None,
+                Some("error"),
+                json!({
+                    "reason": reason,
+                    "error": error,
+                }),
+            );
+        }
+        result
+    }
+
+    fn rebuild_body_stack_inner(&mut self, reason: &str) -> Result<(), String> {
         let Some(factory) = self.body_factory.clone() else {
             return Err("no body factory: cannot rebuild the body stack".to_string());
         };
@@ -1692,7 +1722,19 @@ impl LoopState {
                 self.handle_stop_all(runtime);
             }
             WorkerRequest::RebuildBody => match self.rebuild_body_stack("user request") {
-                Ok(()) => self.send(WorkerEvent::BodyRebuilt),
+                Ok(()) => {
+                    // A user-requested rebuild is the active
+                    // re-enable: clear the shared stop latch
+                    // the user tripped, or every new turn is
+                    // born cancelled (the UI clears its flags
+                    // on BodyRebuilt and never offers
+                    // "Tiếp tục" afterwards). Only this
+                    // user-requested path clears the latch;
+                    // the fail-all automatic rebuild leaves
+                    // it alone.
+                    self.stop_slot.replace(CancelToken::new());
+                    self.send(WorkerEvent::BodyRebuilt)
+                }
                 Err(error) => self.send(WorkerEvent::BodyRebuildFailed { error }),
             },
             WorkerRequest::AgentFinished {
@@ -4087,6 +4129,37 @@ mod tests {
     }
 
     #[test]
+    fn rebuild_after_user_stop_clears_the_stop_latch() {
+        // Demo-found bug (fix pass, F6-16 area): DỪNG KHẨN
+        // CẤP cancels the shared stop latch; a
+        // user-requested rebuild is the active re-enable,
+        // so the latch must not outlive it — otherwise
+        // every new turn is born cancelled while the UI
+        // promises recovery.
+        let (handle, approvals, _dir, _flag) = spawn_fake_with_body(
+            FakeProvider::answering("fresh turn"),
+            AgentsConfig::default(),
+            HierarchyConfig::default(),
+            Box::new(MockBody::new()),
+        );
+        auto_allow(approvals);
+        wait_startup(&handle);
+        handle.stop_now();
+        assert!(handle.is_stopped());
+        handle.rebuild_body();
+        let seen = collect_until(&handle, 500, |seen| {
+            seen.iter().any(|e| matches!(e, WorkerEvent::BodyRebuilt))
+        });
+        assert!(seen.iter().any(|e| matches!(e, WorkerEvent::BodyRebuilt)));
+        assert!(!handle.is_stopped(), "rebuild must clear the stop latch");
+        handle.run_turn("hi".to_string());
+        match wait_terminal(&handle) {
+            WorkerEvent::TurnDone { text, .. } => assert_eq!(text, "fresh turn"),
+            other => panic!("turn must complete after rebuild, got: {other:?}"),
+        }
+    }
+
+    #[test]
     fn g6_9_rebuild_does_not_rewrite_unknown() {
         // Call sequence across both turns: turn 1 clicks
         // (panic, fail-all, automatic rebuild); turn 2
@@ -4698,16 +4771,45 @@ mod tests {
                 *entry = ts;
             }
         }
-        // Each agent executed its click under its own id.
+        // Each agent attempted its click under its own id. F6-03:
+        // a click whose snapshot predates another agent's
+        // dispatched action is refused with
+        // target_changed_since_approval instead of executing, so
+        // under load an agent may legitimately have no executed
+        // click — but the attempt must still be attributed to
+        // that agent, executed or refused. At least one click
+        // executes: the first to reach re-verification always
+        // does, since no dispatch precedes it.
+        let mut executed_agents = 0;
         for agent in ["agent-001", "agent-002", "agent-003"] {
+            let attempts: Vec<_> = records
+                .iter()
+                .filter(|r| {
+                    r["kind"] == "execution" && r["tool"] == "body_click" && r["agent_id"] == agent
+                })
+                .collect();
             assert!(
-                records.iter().any(|r| r["kind"] == "execution"
-                    && r["tool"] == "body_click"
-                    && r["agent_id"] == agent
-                    && r["decision"] == "executed"),
-                "{agent} must have an executed click under its own id"
+                !attempts.is_empty(),
+                "{agent} must have a click attempt under its own id"
             );
+            for record in &attempts {
+                assert!(
+                    record["decision"] == "executed"
+                        || record["detail"]["error"]
+                            .as_str()
+                            .unwrap_or("")
+                            .contains("target_changed_since_approval"),
+                    "{agent} click must be executed or F6-03-refused: {record}"
+                );
+            }
+            if attempts.iter().any(|r| r["decision"] == "executed") {
+                executed_agents += 1;
+            }
         }
+        assert!(
+            executed_agents >= 1,
+            "at least one agent's click must execute"
+        );
         // The viewer half: the tail parses, the agent list is
         // exact, and filtering by agent shows only that agent.
         let rows = read_audit_tail(&path, 10_000);
@@ -5473,5 +5575,209 @@ mod tests {
             );
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn click_msg(x: i32, y: i32) -> ChatMessage {
+        ChatMessage {
+            role: "assistant".to_string(),
+            content: None,
+            tool_calls: Some(vec![ToolCall {
+                id: format!("call-click-{x}-{y}"),
+                kind: "function".to_string(),
+                function: FunctionCall {
+                    name: "body_click".to_string(),
+                    arguments: format!(r#"{{"x": {x}, "y": {y}}}"#),
+                },
+            }]),
+            tool_call_id: None,
+            usage: Some(TokenUsage {
+                prompt_tokens: 80,
+                completion_tokens: 40,
+            }),
+        }
+    }
+
+    fn delegate_msg() -> ChatMessage {
+        ChatMessage {
+            role: "assistant".to_string(),
+            content: None,
+            tool_calls: Some(vec![ToolCall {
+                id: "call-delegate".to_string(),
+                kind: "function".to_string(),
+                function: FunctionCall {
+                    name: "delegate".to_string(),
+                    arguments: r#"{"task":"click twice"}"#.to_string(),
+                },
+            }]),
+            tool_call_id: None,
+            usage: Some(TokenUsage {
+                prompt_tokens: 80,
+                completion_tokens: 40,
+            }),
+        }
+    }
+
+    /// One measured run: a fresh worker, a scripted provider
+    /// (120 tokens per reply), and a mock body. Flat runs do
+    /// two clicks directly (3 provider attempts); delegated
+    /// runs delegate to a child that clicks twice (5
+    /// attempts). Identical agent config except
+    /// `hierarchy.enabled`. Wall time runs from `run_turn`
+    /// to `TurnDone`; time-to-first-action is the receipt of
+    /// the first `Acting` progress event; tokens, attempts,
+    /// and queue waits come from the audit file.
+    fn measure_one(run: usize, delegated: bool) -> serde_json::Value {
+        let provider = if delegated {
+            ScriptedByAgent::new(
+                vec![
+                    ("agent-001", vec![delegate_msg(), usage_msg("done", 80, 40)]),
+                    (
+                        "agent-002",
+                        vec![
+                            click_msg(10, 10),
+                            click_msg(20, 20),
+                            usage_msg("done", 80, 40),
+                        ],
+                    ),
+                ],
+                Recorder::default(),
+            )
+        } else {
+            ScriptedByAgent::new(
+                vec![(
+                    "agent-001",
+                    vec![
+                        click_msg(10, 10),
+                        click_msg(20, 20),
+                        usage_msg("done", 80, 40),
+                    ],
+                )],
+                Recorder::default(),
+            )
+        };
+        let (handle, approvals, dir, _flag) = spawn_fake_with_body(
+            provider,
+            AgentsConfig {
+                parallelism_enabled: true,
+                ..Default::default()
+            },
+            HierarchyConfig {
+                enabled: delegated,
+                max_children: 2,
+                default_child_steps: 10,
+                default_child_time_secs: 300,
+            },
+            Box::new(MockBody::new()),
+        );
+        auto_allow(approvals);
+        wait_startup(&handle);
+        let started = std::time::Instant::now();
+        handle.run_turn("measure".to_string());
+        let mut first_action_ms = None;
+        let mut text = None;
+        for _ in 0..500 {
+            match wait_event(&handle) {
+                WorkerEvent::TurnProgress { progress } => {
+                    if first_action_ms.is_none() && matches!(progress, BrainProgress::Acting { .. })
+                    {
+                        first_action_ms = Some(started.elapsed().as_millis() as u64);
+                    }
+                }
+                WorkerEvent::TryingBackend { .. } => {}
+                // Delegated runs emit AgentSpawned and the
+                // child's TurnDone before the parent
+                // finishes: only agent-001's TurnDone ends
+                // the measured turn. Anything else is
+                // ignored; the 500-event cap plus the
+                // expect below catch a stuck run.
+                WorkerEvent::TurnDone {
+                    agent_id,
+                    text: done,
+                    ..
+                } if agent_id == "agent-001" => {
+                    text = Some(done);
+                    break;
+                }
+                WorkerEvent::TurnDone { .. } => {}
+                _ => {}
+            }
+        }
+        let wall_ms = started.elapsed().as_millis() as u64;
+        let text = text.expect("the measured turn must complete");
+        let records = audit_records(&dir.join("audit.jsonl"));
+        let attempts: Vec<&serde_json::Value> = records
+            .iter()
+            .filter(|r| r["kind"] == "provider_attempt")
+            .collect();
+        let tokens: u64 = attempts
+            .iter()
+            .filter_map(|r| r["detail"]["charged_tokens"].as_u64())
+            .sum();
+        let mut agents_seen: Vec<String> = attempts
+            .iter()
+            .filter_map(|r| r["agent_id"].as_str().map(str::to_string))
+            .collect();
+        agents_seen.sort();
+        agents_seen.dedup();
+        let queued: Vec<u64> = records
+            .iter()
+            .filter(|r| r["kind"] == "execution")
+            .filter_map(|r| r["detail"]["queued_ms"].as_u64())
+            .collect();
+        let _ = std::fs::remove_dir_all(&dir);
+        json!({
+            "measurement": "hierarchy",
+            "harness": "p6_hierarchy_stub_measurement",
+            "provider": "stub",
+            "mode": if delegated { "delegated" } else { "flat" },
+            "delegated": delegated,
+            "run": run,
+            "max_steps": 5,
+            "child_steps": 10,
+            "wall_ms": wall_ms,
+            "time_to_first_action_ms": first_action_ms.expect("an action must run"),
+            "provider_attempts": attempts.len(),
+            "tokens_charged": tokens,
+            "queued_ms": queued,
+            "agents_seen": agents_seen,
+            "outcome": "done",
+            "text": text,
+        })
+    }
+
+    /// Hierarchy stub measurement (F6-10): the Phase 6
+    /// measurement harness, restored into the tree. Ignored
+    /// by default — run explicitly:
+    /// `cargo test -p mimint-ui p6_hierarchy_stub_measurement -- --ignored`
+    /// with `MIMINT_P6_MEASURE_OUT` set to a JSONL path
+    /// (default: a temp file, path printed) and
+    /// `MIMINT_P6_MEASURE_RUNS` (default 3). No threshold
+    /// gating: every run must complete, and the numbers are
+    /// recorded as-is.
+    #[test]
+    #[ignore]
+    fn p6_hierarchy_stub_measurement() {
+        let runs: usize = std::env::var("MIMINT_P6_MEASURE_RUNS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(3);
+        let out_path = std::env::var("MIMINT_P6_MEASURE_OUT")
+            .ok()
+            .unwrap_or_else(|| {
+                std::env::temp_dir()
+                    .join(format!("mimint-p6-measure-{}.jsonl", std::process::id()))
+                    .to_string_lossy()
+                    .into_owned()
+            });
+        let mut out = std::fs::File::create(&out_path).expect("create measurement output");
+        eprintln!("p6 measurement output: {out_path}");
+        for run in 1..=runs {
+            for delegated in [false, true] {
+                let row = measure_one(run, delegated);
+                use std::io::Write;
+                writeln!(out, "{}", serde_json::to_string(&row).unwrap()).unwrap();
+            }
+        }
+        eprintln!("p6 measurement: {runs} runs x flat/delegated written to {out_path}");
     }
 }

@@ -42,6 +42,16 @@
 //!   snapshot through the actor and compares: a changed window
 //!   or changed pixels refuse with `target_changed`, and the
 //!   user must re-approve against the current screen.
+//! - **Mutation generation (F6-03):** the re-verify check
+//!   first compares the approval snapshot's generation
+//!   against the actor's counter: any action by any agent
+//!   since the approval refuses with
+//!   `target_changed_since_approval`, even when the pixels
+//!   under the point look unchanged. The surviving
+//!   generation is then carried into the actor's dequeue
+//!   check, closing the gap between re-verification and
+//!   execution. Coordinate actions only — type/key actions
+//!   carry no snapshot and get no generation check.
 
 use crate::actor::BodyActor;
 use crate::frames::{FrameMeta, FrameStore};
@@ -162,11 +172,19 @@ impl BodyTool {
 
     fn execute(&self, args: &Value) -> Result<Value, MimintError> {
         let action = parse_action(self.spec.name, args)?;
-        if !matches!(action, Action::Screenshot) {
+        let expected_seq = if !matches!(action, Action::Screenshot) {
             self.check_observation_fresh()?;
-            self.reverify_target(&action)?;
-        }
-        let outcome = self.actor.act_for(&self.agent_id, action);
+            self.reverify_target(&action)?
+        } else {
+            None
+        };
+        let outcome = match expected_seq {
+            // A consumed snapshot binds the dispatch to its
+            // generation: the actor refuses at dequeue time
+            // when another agent acted in between.
+            Some(seq) => self.actor.act_for_checked(&self.agent_id, action, seq),
+            None => self.actor.act_for(&self.agent_id, action),
+        };
         // Record the queue wait on BOTH paths: the guard
         // executor reads it for the execution record even
         // when the call failed (§9).
@@ -229,20 +247,37 @@ impl BodyTool {
     }
 
     /// Re-verify the target against the approval-time snapshot
-    /// (F4-07). Only coordinate actions carry a snapshot, and
-    /// only when the approver stored one for this exact point:
-    /// no snapshot means no re-verification (gates, bodies
-    /// without snapshot support), never a refusal. A fresh
-    /// snapshot the body cannot produce (`None`) also proceeds.
-    /// A mismatch refuses with `target_changed` and the action
-    /// never runs.
-    fn reverify_target(&self, action: &Action) -> Result<(), MimintError> {
+    /// (F4-07 + F6-03). Only coordinate actions carry a
+    /// snapshot, and only when the approver stored one for
+    /// this exact point: no snapshot means no re-verification
+    /// (gates, bodies without snapshot support), never a
+    /// refusal. A fresh snapshot the body cannot produce
+    /// (`None`) also proceeds. Returns the consumed
+    /// snapshot's generation when one was consumed, so the
+    /// dispatch can carry it into the actor's dequeue check;
+    /// `None` when no snapshot applied.
+    ///
+    /// The generation is checked FIRST: any body mutation
+    /// since the approval refuses with
+    /// `target_changed_since_approval`, even when the pixels
+    /// under the point look unchanged. Only a surviving
+    /// generation reaches the pixel comparison, which refuses
+    /// with `target_changed` on mismatch. The action never
+    /// runs on either refusal.
+    fn reverify_target(&self, action: &Action) -> Result<Option<u64>, MimintError> {
         let Some((x, y)) = action_point(action) else {
-            return Ok(());
+            return Ok(None);
         };
         let Some(expected) = self.snapshot_slot.take_for(x, y) else {
-            return Ok(());
+            return Ok(None);
         };
+        let current = self.actor.mutation_seq();
+        if current != expected.mutation_seq {
+            return Err(body_err_to_tool(BodyError::TargetChangedSinceApproval {
+                snapshot_seq: expected.mutation_seq,
+                current_seq: current,
+            }));
+        }
         let fresh = match self.actor.probe_target_for(&self.agent_id, x, y) {
             Ok(probe) => probe.snapshot,
             Err(err) => return Err(body_err_to_tool(err)),
@@ -252,7 +287,7 @@ impl BodyTool {
                 return Err(body_err_to_tool(BodyError::TargetChanged { reason }));
             }
         }
-        Ok(())
+        Ok(Some(expected.mutation_seq))
     }
 }
 
@@ -732,6 +767,81 @@ mod tests {
     }
 
     #[test]
+    fn generation_check_refuses_after_another_agent_acts() {
+        use mimint_body::TargetOracle;
+        // F6-03: A is approved against a snapshot; B clicks
+        // elsewhere (the pixels under A's point do not
+        // change); A's execution must be refused on the
+        // generation alone, and A's click must never reach
+        // the body. A fresh approval then runs fine.
+        let body = MockBody::new();
+        let mut oracle = body.oracle();
+        let actor = BodyActor::spawn(Box::new(body), StopFlag::new());
+        let frames = Arc::new(FrameStore::new());
+        let slots = AgentSnapshotSlots::new();
+        let mut reg_a = mimint_core::Registry::new();
+        register_body_tools_for_agent(
+            &mut reg_a,
+            actor.clone(),
+            Arc::clone(&frames),
+            PrivacyFlag::new(false),
+            &slots,
+            "agent-001",
+            DEFAULT_MAX_OBSERVATION_AGE,
+        );
+        let mut reg_b = mimint_core::Registry::new();
+        register_body_tools_for_agent(
+            &mut reg_b,
+            actor.clone(),
+            Arc::clone(&frames),
+            PrivacyFlag::new(false),
+            &slots,
+            "agent-002",
+            DEFAULT_MAX_OBSERVATION_AGE,
+        );
+        // A's approval-time snapshot, as the approver would
+        // take it through the actor.
+        let probe = actor.probe_target_for("agent-001", 200, 200).unwrap();
+        slots
+            .slot_for("agent-001")
+            .set(200, 200, probe.snapshot.unwrap());
+        // B acts: the click runs, the generation moves.
+        assert!(reg_b
+            .get("body_click")
+            .unwrap()
+            .execute(&json!({"x": 10, "y": 10}))
+            .is_ok());
+        // A's execution is refused on the generation — the
+        // pixels under (200, 200) never changed.
+        let err = reg_a
+            .get("body_click")
+            .unwrap()
+            .execute(&json!({"x": 200, "y": 200}))
+            .unwrap_err();
+        let err_text = err.to_string();
+        assert!(
+            err_text.contains("target_changed_since_approval"),
+            "{err_text}"
+        );
+        // A recoverable refusal, not a body fault: it must
+        // never trip the fail-all path.
+        assert!(!mimint_core::is_body_fault_message(&err_text));
+        assert_eq!(oracle.received_clicks(), vec![(10, 10)]);
+        // A fresh approval against the current generation
+        // runs.
+        let probe = actor.probe_target_for("agent-001", 200, 200).unwrap();
+        slots
+            .slot_for("agent-001")
+            .set(200, 200, probe.snapshot.unwrap());
+        assert!(reg_a
+            .get("body_click")
+            .unwrap()
+            .execute(&json!({"x": 200, "y": 200}))
+            .is_ok());
+        assert_eq!(oracle.received_clicks(), vec![(10, 10), (200, 200)]);
+    }
+
+    #[test]
     fn cancelled_agent_maps_to_cancelled_not_a_tool_error() {
         let actor = BodyActor::spawn(Box::new(MockBody::new()), StopFlag::new());
         actor.cancel_agent("agent-001");
@@ -909,6 +1019,7 @@ mod tests {
             TargetSnapshot {
                 window_id: Some(1),
                 grid: [0u8; 64],
+                mutation_seq: 0,
             },
         );
         // B clicks first: B never consults A's snapshot, so

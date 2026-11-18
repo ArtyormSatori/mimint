@@ -374,6 +374,38 @@ pub struct CodeRunRequest {
     pub run_dirs: Option<Arc<RunDirTracker>>,
 }
 
+/// SHA-256 of one `execute_code` input file's content
+/// (F6-06): hashed at approval time from the arguments, and
+/// again from the bytes actually written into the workdir, so
+/// the audit trail can prove the run used the approved
+/// inputs. Names are plain relative file names; content is
+/// hashed as UTF-8 bytes, exactly as written.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct InputFileHash {
+    pub name: String,
+    pub sha256: String,
+}
+
+/// Hash every input in `execute_code` ARGS (approval time).
+/// Items without a string `name`/`content` are skipped — the
+/// tool itself rejects such arguments before any run, so a
+/// skipped item here can never reach execution.
+pub fn execute_code_input_hashes(args: &Value) -> Vec<InputFileHash> {
+    let Some(list) = args.get("inputs").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    list.iter()
+        .filter_map(|item| {
+            let name = item.get("name")?.as_str()?;
+            let content = item.get("content")?.as_str()?;
+            Some(InputFileHash {
+                name: name.to_string(),
+                sha256: sha256_hex(content.as_bytes()),
+            })
+        })
+        .collect()
+}
+
 /// One file the run left in the workdir (excluding the code
 /// file and the inputs), for R4 artifact re-hashing.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -397,6 +429,9 @@ pub struct CodeRunOutput {
     pub duration_ms: u64,
     pub sandbox_verdict: &'static str,
     pub code_sha256: String,
+    /// Hashes of the input files actually written into the
+    /// workdir for this run (F6-06), in argument order.
+    pub input_files_sha256: Vec<InputFileHash>,
     pub language: String,
     pub code_len: usize,
     pub workdir: PathBuf,
@@ -416,6 +451,10 @@ impl CodeRunOutput {
             "duration_ms": self.duration_ms,
             "sandbox_verdict": self.sandbox_verdict,
             "code_sha256": self.code_sha256,
+            "input_files_sha256": self.input_files_sha256.iter().map(|h| json!({
+                "name": h.name,
+                "sha256": h.sha256,
+            })).collect::<Vec<_>>(),
             "language": self.language,
             "code_len": self.code_len,
             "workdir": self.workdir.to_string_lossy(),
@@ -425,6 +464,68 @@ impl CodeRunOutput {
             })).collect::<Vec<_>>(),
         })
     }
+}
+
+/// Paths an `execute_code` run failed to access because the
+/// sandbox hides them (F6-17), detected from the TOOL RESULT:
+/// a non-zero exit code, stderr carrying an access-error
+/// keyword, and stderr naming an absolute path under one of
+/// the trees the sandbox overlays with an empty tmpfs
+/// (`/home/`, `/root/`, `/tmp/`). Only those trees count: a
+/// genuinely missing file inside `/work` (relative paths, or
+/// a missing `/work/...` path) is NOT a sandbox denial, and
+/// traceback frames from the read-only `/usr/lib` tree must
+/// never false-positive. Returns the denied paths in order of
+/// first mention, deduplicated. A missing or zero exit code
+/// detects nothing — the tool's own report decides.
+pub(crate) fn sandbox_denied_paths(output: &Value) -> Vec<String> {
+    let exit_denied = matches!(
+        output.get("exit_code").and_then(Value::as_i64),
+        Some(code) if code != 0
+    );
+    if !exit_denied {
+        return Vec::new();
+    }
+    let Some(stderr) = output.get("stderr").and_then(Value::as_str) else {
+        return Vec::new();
+    };
+    const KEYWORDS: [&str; 5] = [
+        "No such file or directory",
+        "Permission denied",
+        "Operation not permitted",
+        "PermissionError",
+        "FileNotFoundError",
+    ];
+    if !KEYWORDS.iter().any(|kw| stderr.contains(kw)) {
+        return Vec::new();
+    }
+    const TREES: [&str; 3] = ["/home/", "/root/", "/tmp/"];
+    let mut paths: Vec<String> = Vec::new();
+    let mut push = |raw: &str| {
+        let trimmed = raw.trim_matches(|c| matches!(c, '\'' | '"' | ',' | '.' | ')' | ':' | ';'));
+        if TREES.iter().any(|tree| trimmed.starts_with(tree))
+            && !paths.contains(&trimmed.to_string())
+        {
+            paths.push(trimmed.to_string());
+        }
+    };
+    // Quoted paths first (tracebacks, shell errors), then
+    // bare whitespace-separated tokens.
+    let mut rest = stderr;
+    while let Some(start) = rest.find(['\'', '"']) {
+        let quote = rest.as_bytes()[start] as char;
+        let after = &rest[start + 1..];
+        if let Some(end) = after.find(quote) {
+            push(&after[..end]);
+            rest = &after[end + 1..];
+        } else {
+            break;
+        }
+    }
+    for token in stderr.split_whitespace() {
+        push(token);
+    }
+    paths
 }
 
 /// The sandbox: policy + cached preflight verdict + the run
@@ -633,6 +734,16 @@ impl Sandbox {
         )?;
         let duration_ms = started.elapsed().as_millis() as u64;
         let artifacts = list_artifacts(&workdir, script_name, &input_names);
+        // Hash the input bytes as written (F6-06): the same
+        // content the tool wrote verbatim into the workdir.
+        let input_files_sha256: Vec<InputFileHash> = request
+            .inputs
+            .iter()
+            .map(|(name, content)| InputFileHash {
+                name: name.clone(),
+                sha256: sha256_hex(content.as_bytes()),
+            })
+            .collect();
         Ok(CodeRunOutput {
             stdout: raw.stdout,
             stderr: raw.stderr,
@@ -645,6 +756,7 @@ impl Sandbox {
             duration_ms,
             sandbox_verdict: VERDICT_BWRAP,
             code_sha256: sha256_hex(request.code.as_bytes()),
+            input_files_sha256,
             language: request.language,
             code_len: request.code.len(),
             workdir,
@@ -1320,6 +1432,106 @@ impl Tool for ExecuteCodeTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sandbox_denied_paths_detects_only_overlayed_trees() {
+        // Python traceback: the /home path counts, the
+        // /usr/lib frame does not.
+        let out = json!({
+            "exit_code": 1,
+            "stderr": "  File \"/usr/lib/python3.11/runpy.py\", line 198\nFileNotFoundError: [Errno 2] No such file or directory: '/home/adminis/g2-secret.txt'",
+        });
+        assert_eq!(
+            sandbox_denied_paths(&out),
+            vec!["/home/adminis/g2-secret.txt".to_string()]
+        );
+        // Shell form, bare token with a trailing colon.
+        let out = json!({
+            "exit_code": 1,
+            "stderr": "cat: /root/secret.txt: Permission denied",
+        });
+        assert_eq!(
+            sandbox_denied_paths(&out),
+            vec!["/root/secret.txt".to_string()]
+        );
+        // Deduplicated, in order of first mention.
+        let out = json!({
+            "exit_code": 1,
+            "stderr": "open('/tmp/a.txt') failed; open('/tmp/a.txt') failed; open('/tmp/b.txt') failed: No such file or directory",
+        });
+        assert_eq!(
+            sandbox_denied_paths(&out),
+            vec!["/tmp/a.txt".to_string(), "/tmp/b.txt".to_string()]
+        );
+        // Zero exit: nothing, even with the same stderr.
+        let out = json!({
+            "exit_code": 0,
+            "stderr": "FileNotFoundError: '/home/adminis/x.txt'",
+        });
+        assert!(sandbox_denied_paths(&out).is_empty());
+        // Missing exit code: nothing.
+        let out = json!({"stderr": "Permission denied: '/home/adminis/x.txt'"});
+        assert!(sandbox_denied_paths(&out).is_empty());
+        // No access-error keyword: nothing.
+        let out = json!({
+            "exit_code": 1,
+            "stderr": "saw path /home/adminis/x.txt in a log line",
+        });
+        assert!(sandbox_denied_paths(&out).is_empty());
+        // A missing file inside /work is not a denial.
+        let out = json!({
+            "exit_code": 1,
+            "stderr": "FileNotFoundError: [Errno 2] No such file or directory: 'missing.txt'",
+        });
+        assert!(sandbox_denied_paths(&out).is_empty());
+        let out = json!({
+            "exit_code": 1,
+            "stderr": "cat: /work/nope.txt: No such file or directory",
+        });
+        assert!(sandbox_denied_paths(&out).is_empty());
+    }
+
+    #[test]
+    fn execute_code_input_hashes_hash_name_and_content() {
+        let args = json!({
+            "language": "python3",
+            "code": "print(1)",
+            "inputs": [
+                {"name": "data.txt", "content": "hello"},
+                {"name": "other.txt", "content": ""},
+            ],
+        });
+        let hashes = execute_code_input_hashes(&args);
+        assert_eq!(hashes.len(), 2);
+        assert_eq!(hashes[0].name, "data.txt");
+        assert_eq!(hashes[0].sha256, sha256_hex(b"hello"));
+        assert_eq!(hashes[1].sha256, sha256_hex(b""));
+        // No inputs key, or a non-array, hashes nothing.
+        assert!(execute_code_input_hashes(&json!({"code": "x"})).is_empty());
+        assert!(execute_code_input_hashes(&json!({"inputs": {"a": "b"}})).is_empty());
+        // The output JSON carries the hashes for the audit layer.
+        let out = CodeRunOutput {
+            stdout: String::new(),
+            stderr: String::new(),
+            exit_code: Some(0),
+            terminated_by_signal: None,
+            truncated: false,
+            duration_ms: 1,
+            sandbox_verdict: VERDICT_BWRAP,
+            code_sha256: sha256_hex(b"print(1)"),
+            input_files_sha256: hashes,
+            language: "python3".to_string(),
+            code_len: 8,
+            workdir: PathBuf::from("/work"),
+            artifacts: Vec::new(),
+        };
+        let rendered = out.to_json();
+        assert_eq!(rendered["input_files_sha256"][0]["name"], "data.txt");
+        assert_eq!(
+            rendered["input_files_sha256"][0]["sha256"],
+            sha256_hex(b"hello")
+        );
+    }
 
     #[test]
     fn bwrap_argv_matches_the_proven_flag_order() {

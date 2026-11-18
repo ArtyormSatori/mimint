@@ -25,12 +25,12 @@
 //!   screenshots at 125%/150%; applied by `main`, not here).
 
 use crate::agent_state::{
-    display_state, next_stop_phase, AgentView, BodyDisplayState, BodyNotReadyReason, FailAllRole,
-    StopEvent, StopPhase,
+    display_state, next_stop_phase, AgentDisplayState, AgentView, BodyDisplayState,
+    BodyNotReadyReason, FailAllRole, StopEvent, StopPhase,
 };
 use crate::approval_text::{
     approval_detail_with_context, crop_preview, execute_code_hash, impact_labels, is_point_tool,
-    short_hash, target_row,
+    target_row,
 };
 use crate::approver::{approval_point, ApprovalJob, RepaintSignal};
 use crate::audit_view::{distinct_agents, read_audit_tail, stop_banner, AuditRow};
@@ -43,8 +43,9 @@ use egui::{Color32, Pos2, Rect, Stroke, Vec2};
 use mimint_body::ScreenRect;
 use mimint_control::FrameStore;
 use mimint_core::{
-    evaluate_finetune, probe_finetune, ApprovalDecision, BrainProgress, CostDisplay,
-    FineTuneStatus, Profile, ProfileSet, VerdictTracker, VerificationStatus, AGENT_DEFAULT,
+    evaluate_finetune, execute_code_input_hashes, probe_finetune, ApprovalDecision, BrainProgress,
+    CostDisplay, FineTuneStatus, Profile, ProfileSet, VerdictTracker, VerificationKind,
+    VerificationStatus, AGENT_DEFAULT,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -127,6 +128,9 @@ pub struct AppOptions {
     pub parallelism_enabled: bool,
     /// Phase 6: configured agent cap, for the panel note.
     pub max_agents: usize,
+    /// Phase 6: hierarchy enabled in the config, for the
+    /// agents panel line explaining the default (F6-18).
+    pub hierarchy_enabled: bool,
     /// Phase 6: a body factory exists, so a body rebuild is
     /// possible after a stop/fault (the header offers it).
     pub can_rebuild_body: bool,
@@ -172,8 +176,19 @@ fn agent_display_name(agent_id: &str) -> String {
 /// The verification badge label for a turn outcome (§15.5), or
 /// `None` when the turn had no verification-relevant step (no
 /// badge at all — not even "unverified").
-fn verification_badge(verified: Option<VerificationStatus>) -> Option<&'static str> {
-    verified.map(|status| status.badge_label())
+/// The §15.5 badge. A mixed turn (some steps GUI-verified,
+/// some artifact-verified) gets the combined kind label —
+/// never the bare GUI label the aggregate alone would give
+/// (F6-05). Every other case uses the aggregate's label.
+fn verification_badge(
+    verified: Option<VerificationStatus>,
+    kind: VerificationKind,
+) -> Option<&'static str> {
+    match (verified, kind) {
+        (Some(_), VerificationKind::Mixed) => Some(kind.label()),
+        (Some(status), _) => Some(status.badge_label()),
+        (None, _) => None,
+    }
 }
 
 /// True when a verification outcome counts as "all verified"
@@ -254,7 +269,7 @@ pub struct MimintApp {
     /// verified) — no new agents until restart.
     degraded: bool,
     degraded_reason: Option<String>,
-    /// Phase 6: the DỪNG TẤT CẢ scope warning is on screen.
+    /// Phase 6: the DỪNG KHẨN CẤP scope warning is on screen.
     pending_stop_all: bool,
     /// Phase 6: last MCP server status from the worker.
     mcp_servers: Vec<McpServerStatus>,
@@ -263,6 +278,8 @@ pub struct MimintApp {
     /// Phase 6: parallelism enabled (from AppOptions).
     multi_agent: bool,
     max_agents: usize,
+    /// Phase 6: hierarchy enabled (from AppOptions).
+    hierarchy_enabled: bool,
     /// Phase 6: a body factory exists, so a body rebuild is
     /// possible after a stop/fault (the header offers it).
     can_rebuild_body: bool,
@@ -371,6 +388,7 @@ impl MimintApp {
             audit_agent_filter: None,
             multi_agent: options.parallelism_enabled,
             max_agents: options.max_agents,
+            hierarchy_enabled: options.hierarchy_enabled,
             can_rebuild_body: options.can_rebuild_body,
             profiles: options.profiles,
             active_profile: options.active_profile,
@@ -443,6 +461,8 @@ impl MimintApp {
                     partial,
                     backend,
                     verified,
+                    verification_kind,
+                    sandbox_denied_paths,
                     delegate_failures,
                 } => {
                     let is_default = agent_id == AGENT_DEFAULT;
@@ -462,7 +482,7 @@ impl MimintApp {
                     // The §15.5 verification badge rides with
                     // the reply; no badge when the turn had no
                     // verification-relevant step.
-                    if let Some(badge) = verification_badge(verified) {
+                    if let Some(badge) = verification_badge(verified, verification_kind) {
                         text.push_str(&format!("\n({badge})"));
                     }
                     let had_tools = !tools_used.is_empty();
@@ -529,6 +549,29 @@ impl MimintApp {
                             delegate_failures.len(),
                             delegate_failures.join("; ")
                         ));
+                    }
+                    // F6-17: sandbox denials, detected from the
+                    // TOOL RESULT (never from the model's
+                    // words). Two labels, kept apart: what
+                    // actually ran, and what it means. At most
+                    // 3 paths; never a suggestion to disable
+                    // the sandbox.
+                    if !sandbox_denied_paths.is_empty() {
+                        let shown: Vec<&str> = sandbox_denied_paths
+                            .iter()
+                            .take(3)
+                            .map(String::as_str)
+                            .collect();
+                        let note = format!(
+                            "Trạng thái thực thi: code đã chạy trong sandbox nhưng không truy cập được file ngoài vùng làm việc: {}. Kết quả: nội dung file chưa được đọc; \"không tồn tại\" chỉ nghĩa là file nằm ngoài vùng làm việc của lượt này. Hãy đặt file vào vùng làm việc của lượt rồi thử lại.",
+                            shown.join(", ")
+                        );
+                        if is_default {
+                            self.chat.add_system(note);
+                        } else {
+                            let name = agent_display_name(&agent_id);
+                            self.chat.add_system(format!("{name}: {note}"));
+                        }
                     }
                     self.sync_busy();
                 }
@@ -722,17 +765,28 @@ impl MimintApp {
                     }
                     self.log_event("profile_switched");
                 }
-                WorkerEvent::StopTripped { reason } => {
+                WorkerEvent::StopTripped { reason: _ } => {
                     // The body's emergency stop latched: the lamp
-                    // shows Stopped, turns block, and only a
-                    // restart clears it. The running turn reports
-                    // its own cancellation separately.
+                    // shows Stopped, turns block, and only a body
+                    // rebuild (when possible) or a restart clears
+                    // it. The running turn reports its own
+                    // cancellation separately. The raw reason
+                    // stays in the audit record, never in the
+                    // chat line (F6-15).
                     self.pending_stop_all = false;
                     self.chat.request_body_stop();
                     self.chat.on_cancelled();
-                    self.chat.add_system(format!(
-                        "Đã DỪNG KHẨN CẤP — phiên điều khiển đã dừng và sẽ không chạy tiếp. Khởi động lại ứng dụng để điều khiển tiếp. ({reason})"
-                    ));
+                    if self.can_rebuild_body {
+                        self.chat.add_system(
+                            "Đã DỪNG KHẨN CẤP — phiên điều khiển đã dừng và sẽ không chạy tiếp; trò chuyện cũng đang dừng. Bấm \"Khởi tạo lại bộ điều khiển\" để điều khiển và trò chuyện tiếp."
+                                .to_string(),
+                        );
+                    } else {
+                        self.chat.add_system(
+                            "Đã DỪNG KHẨN CẤP — phiên điều khiển đã dừng và sẽ không chạy tiếp; trò chuyện cũng đang dừng. Khởi động lại ứng dụng để điều khiển tiếp."
+                                .to_string(),
+                        );
+                    }
                     self.face.on_error(now);
                     self.state_since = now;
                     self.clear_stale_card(now);
@@ -776,6 +830,16 @@ impl MimintApp {
                     scope,
                     cause,
                 } => {
+                    // F6-15: the raw cause stays in the audit
+                    // record; the chat line names only what the
+                    // user must know. Unknown outcomes get their
+                    // own plain wording; anything else points at
+                    // the audit log.
+                    let cause_text = if cause.contains("unknown_outcome") {
+                        "không rõ hành động cuối có chạy hay không"
+                    } else {
+                        "lỗi nội bộ (chi tiết trong nhật ký kiểm tra)"
+                    };
                     if matches!(scope, FailureScope::All) {
                         self.body_state = BodyDisplayState::NotReady(BodyNotReadyReason::Broken);
                         for (id, row) in self.agents.iter_mut() {
@@ -788,12 +852,12 @@ impl MimintApp {
                         }
                         let name = agent_display_name(&agent_id);
                         self.chat.add_system(format!(
-                            "Lỗi chạm tới body từ {name} ({cause}): mọi agent đều dừng, body phải rebuild mới chạy lại. Agent gây lỗi: {name}; các agent khác bị dừng theo hệ thống; agent nào kết thúc chưa xác minh sẽ hiện \"Kết quả chưa xác định\"."
+                            "Lỗi chạm tới body từ {name} ({cause_text}): mọi agent đều dừng, cần khởi tạo lại bộ điều khiển mới chạy lại. Agent gây lỗi: {name}; các agent khác bị dừng theo hệ thống; agent nào kết thúc chưa xác minh sẽ hiện \"Kết quả chưa xác định\"."
                         ));
                     } else {
                         let name = agent_display_name(&agent_id);
                         self.chat.add_system(format!(
-                            "{name} gặp lỗi nội bộ và dừng một mình: {cause}. Các agent khác không bị ảnh hưởng."
+                            "{name} gặp lỗi nội bộ và dừng một mình: {cause_text}. Các agent khác không bị ảnh hưởng."
                         ));
                     }
                     self.log_event("agent_fault");
@@ -838,16 +902,21 @@ impl MimintApp {
                     self.chat.body_stopped = false;
                     self.chat.stopped = false;
                     self.chat.add_system(
-                        "Body đã rebuild xong. Lượt tiếp theo sẽ chụp màn hình mới trước khi hành động."
+                        "Bộ điều khiển đã khởi tạo lại xong. Lượt tiếp theo sẽ chụp màn hình mới trước khi hành động."
                             .to_string(),
                     );
                     self.log_event("body_rebuilt");
                 }
-                WorkerEvent::BodyRebuildFailed { error } => {
+                WorkerEvent::BodyRebuildFailed { error: _ } => {
+                    // F6-15: the raw error is in the
+                    // `body_rebuild_failed` audit record (the
+                    // worker logs it); the chat line stays
+                    // friendly and names the recovery path.
                     self.body_state = BodyDisplayState::NotReady(BodyNotReadyReason::Broken);
-                    self.chat.add_system(format!(
-                        "Rebuild body thất bại: {error}. Body chưa sẵn sàng — thử rebuild lại hoặc khởi động lại ứng dụng."
-                    ));
+                    self.chat.add_system(
+                        "Khởi tạo lại bộ điều khiển thất bại. Bộ điều khiển chưa sẵn sàng — thử khởi tạo lại hoặc khởi động lại ứng dụng. Chi tiết lỗi đã ghi vào nhật ký kiểm tra."
+                            .to_string(),
+                    );
                 }
                 WorkerEvent::McpStatus { servers } => {
                     self.mcp_servers = servers;
@@ -1057,6 +1126,22 @@ impl MimintApp {
     }
 
     fn status_line(&self) -> Option<String> {
+        // F6-16: a latched body stop is NOT a plain stop —
+        // control is locked AND chat is blocked until the
+        // body stack is rebuilt (or the app restarts).
+        // Offering "Tiếp tục" here would lie.
+        if self.chat.body_stopped {
+            if self.can_rebuild_body {
+                return Some(
+                    "Đã DỪNG KHẨN CẤP: điều khiển bị khóa và trò chuyện đang dừng. Bấm \"Khởi tạo lại bộ điều khiển\" để tiếp tục."
+                        .to_string(),
+                );
+            }
+            return Some(
+                "Đã DỪNG KHẨN CẤP: điều khiển bị khóa và trò chuyện đang dừng. Khởi động lại ứng dụng để tiếp tục."
+                    .to_string(),
+            );
+        }
         if self.chat.stopped {
             return Some("Đã dừng. Bấm Tiếp tục để trò chuyện tiếp.".to_string());
         }
@@ -1211,7 +1296,14 @@ impl eframe::App for MimintApp {
                     // without either would lie (the body flag
                     // stays tripped).
                     if self.can_rebuild_body {
-                        if ui.button("Rebuild body").clicked() {
+                        // F6-14: the name says what it does, and
+                        // the hover text states the consequence:
+                        // stopped actions never re-run, and
+                        // unknown outcomes are not undone.
+                        let rebuild = ui.button("Khởi tạo lại bộ điều khiển").on_hover_text(
+                            "Khởi tạo lại bộ điều khiển: hành động đã dừng không tự chạy lại; không hoàn tác kết quả chưa xác định.",
+                        );
+                        if rebuild.clicked() {
                             self.body_state =
                                 BodyDisplayState::NotReady(BodyNotReadyReason::Rebuilding);
                             self.worker.rebuild_body();
@@ -1228,15 +1320,22 @@ impl eframe::App for MimintApp {
                     let can_stop = self.chat.busy
                         || self.chat.pending_approval.is_some()
                         || self.chat.control_active;
+                    // F6-16: one latch, one name. This button
+                    // and the panel's stop button send the same
+                    // StopAll: both are "DỪNG KHẨN CẤP".
                     let stop =
-                        ui.add_enabled(can_stop, egui::Button::new("DỪNG NGAY"));
+                        ui.add_enabled(can_stop, egui::Button::new("DỪNG KHẨN CẤP"));
                     if stop.clicked() {
                         self.worker.stop_now();
                         self.chat.request_stop_now();
                     }
-                    if !can_stop {
+                    if can_stop {
                         stop.on_hover_text(
-                            "DỪNG NGAY chỉ dùng khi đang có lượt trò chuyện, thẻ phê duyệt, hoặc phiên điều khiển.",
+                            "Dừng mọi agent và khóa điều khiển cho tới khi khởi tạo lại bộ điều khiển hoặc khởi động lại ứng dụng.",
+                        );
+                    } else {
+                        stop.on_hover_text(
+                            "DỪNG KHẨN CẤP chỉ dùng khi đang có lượt trò chuyện, thẻ phê duyệt, hoặc phiên điều khiển.",
                         );
                     }
                 }
@@ -1434,11 +1533,11 @@ impl eframe::App for MimintApp {
                     ui.heading("Phím dừng khẩn cấp");
                     #[cfg(target_os = "linux")]
                     ui.label(
-                        "Ctrl+Alt+Shift+Escape — dừng ngay mọi điều khiển, kể cả khi cửa sổ Mimint không được chọn. Đã dừng thì phải khởi động lại ứng dụng mới điều khiển tiếp.",
+                        "Ctrl+Alt+Shift+Escape — dừng ngay mọi điều khiển, kể cả khi cửa sổ Mimint không được chọn. Đã dừng thì phải khởi tạo lại bộ điều khiển hoặc khởi động lại ứng dụng mới điều khiển tiếp.",
                     );
                     #[cfg(not(target_os = "linux"))]
                     ui.label(
-                        "Phím dừng khẩn cấp toàn cục chưa có trên nền tảng này. Dùng nút DỪNG NGAY trong ứng dụng.",
+                        "Phím dừng khẩn cấp toàn cục chưa có trên nền tảng này. Dùng nút DỪNG KHẨN CẤP trong ứng dụng.",
                     );
                     ui.separator();
                     ui.heading("Chó robot (ESP32)");
@@ -1608,10 +1707,12 @@ impl eframe::App for MimintApp {
                             .get(&req.agent_id)
                             .map(|row| row.label.clone())
                             .unwrap_or_default();
-                        if label.is_empty() || label == name {
-                            ui.label(format!("Agent yêu cầu: {name}"));
-                        } else {
-                            ui.label(format!("Agent yêu cầu: {name} · {label}"));
+                        // F6-12: two fields, never one fused
+                        // line — the agent and its task stay
+                        // distinguishable at a glance.
+                        ui.label(format!("Agent: {name}"));
+                        if !label.is_empty() && label != name {
+                            ui.label(format!("Nhiệm vụ: {label}"));
                         }
                     }
                     // §15.2: queue position (a snapshot taken
@@ -1637,21 +1738,30 @@ impl eframe::App for MimintApp {
                     for (label, value) in &detail.rows {
                         ui.label(format!("{label}: {value}"));
                     }
-                    // §15.2: the full code hash on demand. The
-                    // short hash is in the rows above; the full
-                    // hash is one expand away. Post-run hash
-                    // verification is reported in the audit
-                    // panel (the card only exists pre-run).
+                    // F6-13: the full code hash is ALWAYS
+                    // visible (no expand), selectable, with a
+                    // copy button; input hashes (F6-06) ride in
+                    // the same section. The short hash stays in
+                    // the rows above. Post-run hash verification
+                    // is reported in the audit panel (the card
+                    // only exists pre-run).
                     if req.tool == "execute_code" {
                         if let Some(code) = req.args.get("code").and_then(|v| v.as_str()) {
                             let full = execute_code_hash(code);
-                            let short = short_hash(&full);
-                            ui.collapsing("Hash code đầy đủ (SHA-256)", |ui| {
-                                ui.label(format!("{short} → {full}"));
-                                ui.label(
-                                    "Sau khi chạy, nhật ký kiểm tra sẽ ghi hash của code đã chạy và xác nhận có khớp hash này không.",
-                                );
-                            });
+                            ui.label("Hash SHA-256 đầy đủ của code đã phê duyệt:");
+                            ui.add(egui::Label::new(full.clone()).selectable(true));
+                            if ui.button("Sao chép hash").clicked() {
+                                ui.ctx().copy_text(full);
+                            }
+                            for input in execute_code_input_hashes(&req.args) {
+                                ui.label(format!(
+                                    "Đầu vào {}: {}",
+                                    input.name, input.sha256
+                                ));
+                            }
+                            ui.label(
+                                "Sau khi chạy, nhật ký kiểm tra sẽ ghi hash của code và file đầu vào đã chạy, và xác nhận có khớp hash này không.",
+                            );
                         }
                     }
                     // §15.2: the full JSON args on demand (the
@@ -1722,9 +1832,20 @@ impl eframe::App for MimintApp {
                     let waited = now.duration_since(req.created_at).as_secs();
                     if let Some(deadline) = req.deadline {
                         let left = deadline.saturating_duration_since(now).as_secs();
-                        ui.label(format!(
-                            "Đã chờ {waited} giây · còn {left} giây — hết giờ sẽ tự từ chối."
-                        ));
+                        // F6-13: under 15s the countdown turns
+                        // red and names the urgency.
+                        if left < 15 {
+                            ui.colored_label(
+                                Color32::from_rgb(0xDC, 0x26, 0x26),
+                                format!(
+                                    "SẮP HẾT HẠN: đã chờ {waited} giây · còn {left} giây — hết giờ sẽ tự từ chối."
+                                ),
+                            );
+                        } else {
+                            ui.label(format!(
+                                "Đã chờ {waited} giây · còn {left} giây — hết giờ sẽ tự từ chối."
+                            ));
+                        }
                     } else {
                         ui.label(format!("Đã chờ {waited} giây."));
                     }
@@ -1743,6 +1864,11 @@ impl eframe::App for MimintApp {
                         let deny = ui
                             .button("Từ chối hành động này")
                             .on_hover_text("Công cụ sẽ không chạy. Bạn có thể yêu cầu lại sau — mỗi lần đều cần phê duyệt riêng.");
+                        // F6-04: keyboard focus defaults to
+                        // Deny, re-requested every frame while
+                        // the card waits — Enter/Space never
+                        // lands on Allow by default.
+                        deny.request_focus();
                         if deny.clicked() {
                             self.decide_approval(&req.agent_id, req.id, ApprovalDecision::Deny);
                         }
@@ -2074,9 +2200,17 @@ impl MimintApp {
                 Color32::from_rgb(0xDC, 0x26, 0x26),
                 format!("{}: {}", self.body_state.label(), reason),
             );
-            if self.can_rebuild_body && ui.button("Rebuild body").clicked() {
-                self.body_state = BodyDisplayState::NotReady(BodyNotReadyReason::Rebuilding);
-                self.worker.rebuild_body();
+            if self.can_rebuild_body {
+                let rebuild = ui.button("Khởi tạo lại bộ điều khiển").on_hover_text(
+                    "Khởi tạo lại bộ điều khiển: hành động đã dừng không tự chạy lại; không hoàn tác kết quả chưa xác định.",
+                );
+                if rebuild.clicked() {
+                    self.body_state = BodyDisplayState::NotReady(BodyNotReadyReason::Rebuilding);
+                    self.worker.rebuild_body();
+                }
+                ui.label(
+                    "Hành động đã dừng không tự chạy lại; không hoàn tác kết quả chưa xác định.",
+                );
             }
         }
         if self.degraded {
@@ -2095,6 +2229,20 @@ impl MimintApp {
             "Tối đa {} agent cùng lúc. Thêm agent không đảm bảo tăng tốc (đặc biệt với backend cục bộ trên CPU).",
             self.max_agents
         ));
+        // F6-18: why hierarchy defaults OFF, in plain words
+        // with the measured token cost (stub harness: 360 vs
+        // 600 tokens for the same two clicks). Wall-time
+        // numbers live in docs/operations.md.
+        if self.hierarchy_enabled {
+            ui.colored_label(
+                Color32::from_rgb(0xB4, 0x53, 0x09),
+                "Thứ bậc (hierarchy): BẬT — thử nghiệm. Ủy quyền cho sub-agent tốn thêm token (đo stub: 1,67× cho cùng một việc) và thời gian; chỉ bật khi thật sự cần chia việc.",
+            );
+        } else {
+            ui.label(
+                "Thứ bậc (hierarchy): TẮT (mặc định). Ủy quyền cho sub-agent tốn thêm token (đo stub: 1,67× cho cùng một việc) và thời gian, nên mặc định tắt — bật trong [hierarchy] của file cấu hình nếu cần.",
+            );
+        }
         // One row per agent, in id order.
         let mut ids: Vec<String> = self.agents.keys().cloned().collect();
         ids.sort();
@@ -2114,6 +2262,11 @@ impl MimintApp {
                 title.push_str(&format!(" (con của {})", agent_display_name(parent)));
             }
             ui.label(format!("• {title}: {}", state.label()));
+            // F6-18: an unknown outcome is not a retry
+            // prompt — the user checks reality first.
+            if matches!(state, AgentDisplayState::UnknownOutcome) {
+                ui.label("    Không tự thử lại: kiểm tra thực tế trên màn hình trước, rồi mới quyết định bước tiếp theo.");
+            }
             if let Some(role) = row.fail_role {
                 ui.label(format!("    Vai trò sau lỗi: {}", role.label()));
             }
@@ -2141,17 +2294,16 @@ impl MimintApp {
             self.worker.cancel_agent(id);
         }
         ui.separator();
-        // DỪNG TẤT CẢ (§15.3): a different action from stopping
-        // one agent, with a scope warning before it runs. The
-        // header's DỪNG NGAY stays the unwarned emergency
-        // button; this one always warns first.
+        // DỪNG KHẨN CẤP (§15.3): the same latch as the
+        // header button, with a scope warning before it runs.
+        // Stopping ONE agent keeps its own button above.
         if self.pending_stop_all {
             ui.colored_label(
                 Color32::from_rgb(0xDC, 0x26, 0x26),
-                "DỪNG TẤT CẢ sẽ: dừng mọi agent; khóa dừng toàn hệ thống (latch) sẽ bật; thread body đang kẹt (nếu có) không giật được — nó chỉ dừng khi hành động hiện tại xong hoặc hết thời gian chờ.",
+                "DỪNG KHẨN CẤP sẽ: dừng mọi agent; khóa dừng toàn hệ thống (latch) sẽ bật; thread body đang kẹt (nếu có) không giật được — nó chỉ dừng khi hành động hiện tại xong hoặc hết thời gian chờ.",
             );
             ui.horizontal(|ui| {
-                if ui.button("Xác nhận dừng tất cả").clicked() {
+                if ui.button("Xác nhận dừng khẩn cấp").clicked() {
                     self.pending_stop_all = false;
                     self.worker.stop_all();
                 }
@@ -2159,7 +2311,11 @@ impl MimintApp {
                     self.pending_stop_all = false;
                 }
             });
-        } else if ui.button("DỪNG TẤT CẢ").clicked() {
+        } else if ui
+            .button("DỪNG KHẨN CẤP")
+            .on_hover_text("Dừng mọi agent và khóa điều khiển cho tới khi khởi tạo lại bộ điều khiển hoặc khởi động lại ứng dụng.")
+            .clicked()
+        {
             self.pending_stop_all = true;
         }
         // MCP status: the continuous unsandboxed indicator

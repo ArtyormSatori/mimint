@@ -1094,7 +1094,11 @@ impl Body for X11Body {
             cw,
             ch,
         );
-        Some(TargetSnapshot { window_id, grid })
+        Some(TargetSnapshot {
+            window_id,
+            grid,
+            mutation_seq: 0,
+        }) // 0: the actor loop stamps the real seq (F6-03).
     }
 
     fn check_target(&self, x: i32, y: i32) -> Result<(), BodyError> {

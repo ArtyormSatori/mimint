@@ -18,8 +18,8 @@ use crate::memory::ExperienceStore;
 use crate::notebook::Notebook;
 use crate::provider::{CallContext, ChatMessage, Provider};
 use crate::routing::{
-    tool_family, BatchLoopGuard, ToolFamily, VerificationStatus, ROUTING_RULE_FIRST,
-    ROUTING_RULE_SWITCH,
+    tool_family, BatchLoopGuard, ToolFamily, VerificationKind, VerificationStatus,
+    ROUTING_RULE_FIRST, ROUTING_RULE_SWITCH,
 };
 use crate::skills::{retrieve_skills, SkillDef};
 use crate::tools::Registry;
@@ -61,6 +61,18 @@ pub struct TurnOutcome {
     /// Aggregate verification status (§7.2). `None` when no step
     /// needed verification (no badge).
     pub verification: Option<VerificationStatus>,
+    /// What kind of verification the verified steps carry
+    /// (F6-05): `Gui` / `Artifact` / `Mixed` / `None`. Travels
+    /// with `verification` everywhere it is used, so a mixed
+    /// turn is never presented as bare GUI verification.
+    pub verification_kind: VerificationKind,
+    /// Absolute paths an `execute_code` step failed to access
+    /// inside the sandbox during this turn (F6-17), detected
+    /// from the tool result — never from the model's words.
+    /// Empty for turns without a sandbox denial. The UI turns
+    /// these into a system note; cancelled turns produce no
+    /// outcome and no note.
+    pub sandbox_denied_paths: Vec<String>,
 }
 
 /// Maximum characters of any single retrieved section injected
@@ -593,6 +605,7 @@ impl Brain {
         let mut tools_used: Vec<String> = Vec::new();
         let mut verified: Vec<(String, bool)> = Vec::new();
         let mut step_verifications: Vec<(String, VerificationStatus)> = Vec::new();
+        let mut sandbox_denied_paths: Vec<String> = Vec::new();
         let mut pending: Vec<PendingVerification> = Vec::new();
         let mut emotions: Vec<EmotionCode> = Vec::new();
         let mut emotion_fallbacks: usize = 0;
@@ -698,6 +711,11 @@ impl Brain {
                 // one; the success path must too, or the trail
                 // cannot tell a finished turn from an interrupted
                 // one.
+                let statuses: Vec<VerificationStatus> = step_verifications
+                    .iter()
+                    .map(|(_, status)| *status)
+                    .collect();
+                let verification_kind = VerificationKind::from_statuses(&statuses);
                 self.log(
                     &self.turn_id,
                     "turn_end",
@@ -706,6 +724,7 @@ impl Brain {
                     json!({
                         "steps": step + 1,
                         "tools_used": tools_used.clone(),
+                        "verification_kind": verification_kind.as_str(),
                     }),
                 )?;
                 return Ok(TurnOutcome {
@@ -722,12 +741,9 @@ impl Brain {
                     verified_steps: verified,
                     skills_used,
                     agent_id: self.agent_id.clone(),
-                    verification: VerificationStatus::aggregate(
-                        &step_verifications
-                            .iter()
-                            .map(|(_, status)| *status)
-                            .collect::<Vec<_>>(),
-                    ),
+                    verification: VerificationStatus::aggregate(&statuses),
+                    verification_kind,
+                    sandbox_denied_paths: sandbox_denied_paths.clone(),
                     step_verifications,
                 });
             }
@@ -884,6 +900,18 @@ impl Brain {
                         });
                         match executor.execute(&call.function.name, &args) {
                             Ok(output) => {
+                                // F6-17: detect sandbox denials
+                                // from the TOOL RESULT (exit
+                                // code + stderr), never from
+                                // the model's words. Dedup:
+                                // one note per path per turn.
+                                if call.function.name == "execute_code" {
+                                    for path in crate::sandbox::sandbox_denied_paths(&output) {
+                                        if !sandbox_denied_paths.contains(&path) {
+                                            sandbox_denied_paths.push(path);
+                                        }
+                                    }
+                                }
                                 // R6 accounting: a run action
                                 // counts; a non-body tool resets.
                                 if call.function.name.starts_with("body_") {
@@ -1018,6 +1046,11 @@ impl Brain {
             batch_guard.note_frame_hash(frame_hash.as_deref());
             verified.push((prev.tool, ok));
         }
+        let statuses: Vec<VerificationStatus> = step_verifications
+            .iter()
+            .map(|(_, status)| *status)
+            .collect();
+        let verification_kind = VerificationKind::from_statuses(&statuses);
         self.log(
             &self.turn_id,
             "turn_end",
@@ -1027,6 +1060,7 @@ impl Brain {
                 "reason": "step_budget_exhausted",
                 "steps": self.max_steps,
                 "tools_used": tools_used.clone(),
+                "verification_kind": verification_kind.as_str(),
             }),
         )?;
         Ok(TurnOutcome {
@@ -1043,12 +1077,9 @@ impl Brain {
             verified_steps: verified,
             skills_used,
             agent_id: self.agent_id.clone(),
-            verification: VerificationStatus::aggregate(
-                &step_verifications
-                    .iter()
-                    .map(|(_, status)| *status)
-                    .collect::<Vec<_>>(),
-            ),
+            verification: VerificationStatus::aggregate(&statuses),
+            verification_kind,
+            sandbox_denied_paths,
             step_verifications,
         })
     }
@@ -2324,6 +2355,8 @@ mod tests {
             all_verified: true,
             step_verifications: Vec::new(),
             verification: None,
+            verification_kind: VerificationKind::None,
+            sandbox_denied_paths: Vec::new(),
             skills_used: Vec::new(),
         };
         let checker = crate::skills::Checker::Contains {
@@ -4129,6 +4162,120 @@ mod tests {
         let _ = std::fs::remove_file(&audit_path);
         let _ = std::fs::remove_file(&db2);
         let _ = std::fs::remove_file(&audit2_path);
+    }
+
+    #[tokio::test]
+    async fn f6_05_artifact_turn_reports_artifact_kind_in_outcome_and_audit() {
+        // No verifier: execute_code verifies by artifact
+        // re-read. The outcome and the turn_end record must
+        // both carry kind "artifact" — never the bare GUI
+        // presentation.
+        let stem = temp_stem("f6-05-kind");
+        let db_path = format!("{stem}.db");
+        let audit_path = format!("{stem}.jsonl");
+        let dir = format!("{stem}-workdir");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(format!("{dir}/out.txt"), b"hello artifact").unwrap();
+        let hash = crate::audit::sha256_hex(b"hello artifact");
+        let notebook = Arc::new(Notebook::open(&db_path).unwrap());
+        let audit = AuditLog::open(&audit_path).unwrap();
+        let registry = registry_with(vec![Box::new(FakeCodeTool {
+            output: json!({
+                "stdout": "",
+                "exit_code": 0,
+                "workdir": dir,
+                "artifacts": [{"name": "out.txt", "sha256": hash}],
+            }),
+        })]);
+        let provider = ScriptProvider {
+            replies: std::sync::Mutex::new(std::collections::VecDeque::from([
+                tool_call_message("execute_code", r#"{"language": "sh", "code": "true"}"#),
+                text_message("Done."),
+            ])),
+        };
+        let provider: Arc<dyn Provider> = Arc::new(provider);
+        let registry = Arc::new(registry);
+        let audit = Arc::new(audit);
+        let brain = Brain::new(
+            Arc::clone(&provider),
+            Arc::clone(&registry),
+            None,
+            Arc::clone(&audit),
+            Arc::clone(&notebook),
+            "turn-f6-05-kind",
+            "agent-001",
+            3,
+        )
+        .unwrap();
+        let outcome = brain.run("code").await.expect("turn succeeds");
+        assert_eq!(
+            outcome.verification,
+            Some(VerificationStatus::VerifiedArtifact)
+        );
+        assert_eq!(outcome.verification_kind, VerificationKind::Artifact);
+        assert!(outcome.all_verified);
+        let records = audit_records(&audit_path);
+        let turn_end = records
+            .iter()
+            .find(|r| r["kind"] == "turn_end")
+            .expect("turn_end record");
+        assert_eq!(turn_end["detail"]["verification_kind"], "artifact");
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(&audit_path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn f6_17_sandbox_denied_paths_come_from_the_tool_result() {
+        // The tool result (exit 1 + stderr naming a path
+        // outside the workdir) is collected; the /usr/lib
+        // traceback frame is not. A zero exit collects
+        // nothing even with identical stderr.
+        let denied_stderr = "Traceback (most recent call last):\n  File \"/usr/lib/python3.11/runpy.py\", line 198\nFileNotFoundError: [Errno 2] No such file or directory: '/home/adminis/g2-secret.txt'";
+        for (tag, exit_code, expected) in [
+            ("denied", 1, vec!["/home/adminis/g2-secret.txt".to_string()]),
+            ("clean-exit", 0, Vec::<String>::new()),
+        ] {
+            let stem = temp_stem(tag);
+            let db_path = format!("{stem}.db");
+            let audit_path = format!("{stem}.jsonl");
+            let notebook = Arc::new(Notebook::open(&db_path).unwrap());
+            let audit = AuditLog::open(&audit_path).unwrap();
+            let registry = registry_with(vec![Box::new(FakeCodeTool {
+                output: json!({
+                    "stdout": "",
+                    "stderr": denied_stderr,
+                    "exit_code": exit_code,
+                }),
+            })]);
+            let provider = ScriptProvider {
+                replies: std::sync::Mutex::new(std::collections::VecDeque::from([
+                    tool_call_message(
+                        "execute_code",
+                        r#"{"language": "python3", "code": "open('/home/adminis/g2-secret.txt')"}"#,
+                    ),
+                    text_message("The file does not exist."),
+                ])),
+            };
+            let provider: Arc<dyn Provider> = Arc::new(provider);
+            let registry = Arc::new(registry);
+            let audit = Arc::new(audit);
+            let brain = Brain::new(
+                Arc::clone(&provider),
+                Arc::clone(&registry),
+                None,
+                Arc::clone(&audit),
+                Arc::clone(&notebook),
+                format!("turn-f6-17-{tag}"),
+                "agent-001",
+                3,
+            )
+            .unwrap();
+            let outcome = brain.run("code").await.expect("turn succeeds");
+            assert_eq!(outcome.sandbox_denied_paths, expected, "{tag}");
+            let _ = std::fs::remove_file(&db_path);
+            let _ = std::fs::remove_file(&audit_path);
+        }
     }
 
     #[tokio::test]

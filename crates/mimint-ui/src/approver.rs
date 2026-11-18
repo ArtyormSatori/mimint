@@ -867,6 +867,78 @@ mod tests {
     }
 
     #[test]
+    fn pending_flag_clears_when_a_waiting_agent_is_withdrawn() {
+        // F6-08: withdrawing the agent whose card waits
+        // resolves the wait as Cancelled, and the shared
+        // flag clears once the wait thread has joined.
+        let (tx, rx) = approval_channel();
+        let flag = Arc::new(AtomicBool::new(false));
+        let approver = Arc::new(UiApprover::new(tx).with_pending_flag(Arc::clone(&flag)));
+        let waiter = Arc::clone(&approver);
+        let handle = thread::spawn(move || {
+            waiter.approve_request(&ApprovalRequest {
+                id: 20,
+                agent_id: "agent-001".to_string(),
+                tool: "body_click".to_string(),
+                args: json!({"x": 1, "y": 2}),
+                context: json!({}),
+            })
+        });
+        let job = rx.recv().unwrap();
+        assert!(flag.load(Ordering::SeqCst));
+        assert_eq!(approver.withdraw_agent("agent-001"), 1);
+        assert!(job.withdrawn.load(Ordering::SeqCst));
+        let outcome = handle.join().unwrap().unwrap();
+        assert_eq!(outcome.decision, ApprovalDecision::Cancelled);
+        assert!(!flag.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn pending_flag_survives_one_of_two_waits_resolving() {
+        // F6-08: the flag is ONE shared refcounted flag
+        // (D-FIX6-1). Two concurrent waits hold it; resolving
+        // the first must NOT clear it while the second still
+        // waits; resolving the second clears it.
+        let (tx, rx) = approval_channel();
+        let flag = Arc::new(AtomicBool::new(false));
+        let approver = Arc::new(UiApprover::new(tx).with_pending_flag(Arc::clone(&flag)));
+        let mut handles = std::collections::HashMap::new();
+        for (id, agent) in [(21u64, "agent-001"), (22u64, "agent-002")] {
+            let waiter = Arc::clone(&approver);
+            let agent = agent.to_string();
+            handles.insert(
+                id,
+                thread::spawn(move || {
+                    waiter.approve_request(&ApprovalRequest {
+                        id,
+                        agent_id: agent,
+                        tool: "body_click".to_string(),
+                        args: json!({"x": 1, "y": 2}),
+                        context: json!({}),
+                    })
+                }),
+            );
+        }
+        let job_a = rx.recv().unwrap();
+        let job_b = rx.recv().unwrap();
+        assert!(flag.load(Ordering::SeqCst));
+        // Resolve the first wait (whichever arrived first)
+        // and join its thread: the flag must stay set.
+        job_a.reply.send(ApprovalDecision::Deny).unwrap();
+        let outcome = handles.remove(&job_a.id).unwrap().join().unwrap().unwrap();
+        assert_eq!(outcome.decision, ApprovalDecision::Deny);
+        assert!(
+            flag.load(Ordering::SeqCst),
+            "one wait still holds the shared flag"
+        );
+        // Resolve the second: the flag clears.
+        job_b.reply.send(ApprovalDecision::Allow).unwrap();
+        let outcome = handles.remove(&job_b.id).unwrap().join().unwrap().unwrap();
+        assert_eq!(outcome.decision, ApprovalDecision::Allow);
+        assert!(!flag.load(Ordering::SeqCst));
+    }
+
+    #[test]
     fn default_timeout_is_sixty_seconds() {
         assert_eq!(DEFAULT_APPROVAL_TIMEOUT, Duration::from_secs(60));
     }
@@ -904,6 +976,7 @@ mod tests {
             snapshot: Some(mimint_body::TargetSnapshot {
                 window_id: Some(0xabc),
                 grid: [128; 64],
+                mutation_seq: 0,
             }),
         }
     }

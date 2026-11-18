@@ -13,7 +13,7 @@
 //! rendering, which lists every argument — never hidden.
 
 use mimint_body::{Framebuffer, WindowIdentity};
-use mimint_core::sha256_hex;
+use mimint_core::{execute_code_input_hashes, sha256_hex};
 use serde_json::Value;
 
 /// One card's content: a title plus label/value rows, and whether the
@@ -187,16 +187,22 @@ pub fn approval_detail_with_context(tool: &str, args: &Value, context: &Value) -
             let language = arg_str(args, "language").unwrap_or("(không rõ)");
             let code = arg_str(args, "code").unwrap_or("");
             let hash = execute_code_hash(code);
-            let inputs = args
-                .get("inputs")
-                .and_then(|v| v.as_object())
-                .map(|obj| {
-                    let mut names: Vec<&str> = obj.keys().map(String::as_str).collect();
-                    names.sort_unstable();
-                    names.join(", ")
-                })
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| "không có".to_string());
+            // F6-06: `inputs` is an ARRAY of {name, content}
+            // (the schema in sandbox.rs, enforced by the
+            // tool). The old code read it as an OBJECT, so
+            // the card always showed "không có" even when
+            // inputs were approved. Show each input's name
+            // with the short hash of its approved content.
+            let input_hashes = execute_code_input_hashes(args);
+            let inputs = if input_hashes.is_empty() {
+                "không có".to_string()
+            } else {
+                input_hashes
+                    .iter()
+                    .map(|h| format!("{} ({})", h.name, short_hash(&h.sha256)))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
             ApprovalDetail {
                 title: "Chạy code trong sandbox".to_string(),
                 rows: vec![
@@ -207,7 +213,7 @@ pub fn approval_detail_with_context(tool: &str, args: &Value, context: &Value) -
                     scope_row("Chỉ chạy một lần trong sandbox biệt lập: không mạng, không đọc file ngoài vùng làm việc."),
                     (
                         "Kiểm chứng".to_string(),
-                        "Hash này là hash đã phê duyệt; sau khi chạy, bản ghi audit xác nhận hash thực thi có khớp hay không.".to_string(),
+                        "Hash code và hash từng file đầu vào là hash đã phê duyệt; sau khi chạy, bản ghi audit xác nhận hash thực thi có khớp hay không.".to_string(),
                     ),
                 ],
                 reversible: "Code chạy trong sandbox biệt lập; file tạo ra chỉ nằm trong vùng làm việc của lượt này.".to_string(),
@@ -805,6 +811,41 @@ mod tests {
         // The full hash is the real SHA-256 of the approved code.
         assert_eq!(full, sha256_hex(code.as_bytes()));
         assert!(detail.rows.iter().any(|(k, _)| k == "Kiểm chứng"));
+    }
+
+    #[test]
+    fn execute_code_card_shows_input_names_and_hashes() {
+        // F6-06 regression: inputs arrive as an array; the
+        // card must name each input with its content hash,
+        // not "không có".
+        let detail = approval_detail_with_context(
+            "execute_code",
+            &json!({
+                "language": "python3",
+                "code": "print(open('data.txt').read())",
+                "inputs": [{"name": "data.txt", "content": "hello"}],
+            }),
+            &json!({}),
+        );
+        let inputs_row = detail
+            .rows
+            .iter()
+            .find(|(k, _)| k == "Đầu vào")
+            .expect("Đầu vào row");
+        assert!(inputs_row.1.contains("data.txt"), "{}", inputs_row.1);
+        let expected = short_hash(&sha256_hex(b"hello"));
+        assert!(inputs_row.1.contains(&expected), "{}", inputs_row.1);
+        assert!(!inputs_row.1.contains("không có"));
+        // No inputs: still "không có".
+        let detail = approval_detail_with_context(
+            "execute_code",
+            &json!({"language": "sh", "code": "true"}),
+            &json!({}),
+        );
+        assert!(detail
+            .rows
+            .iter()
+            .any(|(k, v)| k == "Đầu vào" && v == "không có"));
     }
 
     #[test]

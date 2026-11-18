@@ -351,6 +351,14 @@ impl ExperienceStore {
                 "partial: step budget exhausted before a final answer",
             );
         }
+        // The trajectory gate (F6-05): `all_verified` is
+        // unchanged — artifact verification counts for turns
+        // with no body stack, because the artifact re-read is
+        // the verification those turns can have. The KIND of
+        // verification (GUI / artifact / mixed) is not stored
+        // in the experience schema; it lives in the turn_end
+        // audit record (`verification_kind`), where the UI
+        // and any audit reader can tell the two apart.
         if !outcome.all_verified {
             return self.record_failure_for(
                 agent_id,
@@ -697,6 +705,8 @@ mod tests {
             agent_id: "agent-001".to_string(),
             step_verifications: Vec::new(),
             verification: None,
+            verification_kind: crate::routing::VerificationKind::None,
+            sandbox_denied_paths: Vec::new(),
         }
     }
 

@@ -379,10 +379,111 @@ impl VerificationStatus {
     }
 }
 
+/// What KIND of verification a turn's verified steps carry
+/// (F6-05, D-FIX6-2): the aggregate [`VerificationStatus`]
+/// collapses a mixed turn to `VerifiedGui`, hiding the
+/// artifact-verified steps. The kind travels alongside every
+/// use of the aggregate so the UI can never present artifact
+/// verification as bare "verified". `None` whenever any step
+/// is unverified/failed/unavailable, or no step needed
+/// verification at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerificationKind {
+    /// Every verified step was verified by GUI.
+    Gui,
+    /// Every verified step was verified by artifact re-read.
+    Artifact,
+    /// Some steps GUI, some artifact.
+    Mixed,
+    /// No verified kind: nothing verified, or a step failed
+    /// / stayed unverified / was unavailable.
+    None,
+}
+
+impl VerificationKind {
+    /// Derive the kind from a turn's step statuses. Any
+    /// non-verified status (or an empty list) yields `None`.
+    pub fn from_statuses(statuses: &[VerificationStatus]) -> Self {
+        if statuses.is_empty() || statuses.iter().any(|s| !s.is_verified()) {
+            return Self::None;
+        }
+        let gui = statuses.contains(&VerificationStatus::VerifiedGui);
+        let artifact = statuses.contains(&VerificationStatus::VerifiedArtifact);
+        match (gui, artifact) {
+            (true, true) => Self::Mixed,
+            (true, false) => Self::Gui,
+            (false, true) => Self::Artifact,
+            (false, false) => Self::None,
+        }
+    }
+
+    /// Stable machine-readable name, used in audit records.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Gui => "gui",
+            Self::Artifact => "artifact",
+            Self::Mixed => "mixed",
+            Self::None => "none",
+        }
+    }
+
+    /// The UI badge label. The mixed label names BOTH kinds:
+    /// it must never collapse to the bare GUI label.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Gui => "Đã xác minh bằng giao diện",
+            Self::Artifact => "Đã đọc lại artifact",
+            Self::Mixed => "Đã xác minh: giao diện + đọc lại artifact",
+            Self::None => "Chưa xác minh",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn verification_kind_splits_gui_artifact_and_mixed() {
+        use VerificationStatus::*;
+        assert_eq!(
+            VerificationKind::from_statuses(&[VerifiedGui, VerifiedGui]),
+            VerificationKind::Gui
+        );
+        assert_eq!(
+            VerificationKind::from_statuses(&[VerifiedArtifact]),
+            VerificationKind::Artifact
+        );
+        assert_eq!(
+            VerificationKind::from_statuses(&[VerifiedGui, VerifiedArtifact]),
+            VerificationKind::Mixed
+        );
+        // Any non-verified step voids the kind.
+        for status in [Unverified, Failed, Unavailable] {
+            assert_eq!(
+                VerificationKind::from_statuses(&[VerifiedGui, status]),
+                VerificationKind::None,
+                "{status:?}"
+            );
+        }
+        assert_eq!(VerificationKind::from_statuses(&[]), VerificationKind::None);
+        // The aggregate hides the mix; the kind does not.
+        assert_eq!(
+            VerificationStatus::aggregate(&[VerifiedGui, VerifiedArtifact]),
+            Some(VerifiedGui)
+        );
+        assert_eq!(VerificationKind::Mixed.as_str(), "mixed");
+        assert_eq!(
+            VerificationKind::Mixed.label(),
+            "Đã xác minh: giao diện + đọc lại artifact"
+        );
+        assert_eq!(
+            serde_json::to_string(&VerificationKind::Artifact).unwrap(),
+            "\"artifact\""
+        );
+    }
 
     #[test]
     fn canonical_json_sorts_keys_and_unifies_numbers() {

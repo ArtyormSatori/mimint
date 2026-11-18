@@ -138,7 +138,9 @@ impl ControlState {
 /// the raw error is always kept in the audit trail.
 pub fn friendly_tool_error(error: &str) -> String {
     let lower = error.to_lowercase();
-    if lower.contains("target_changed") {
+    if lower.contains("target_changed_since_approval") {
+        "một agent khác đã hành động sau lúc phê duyệt, cần phê duyệt lại".to_string()
+    } else if lower.contains("target_changed") {
         "mục tiêu dưới con trỏ đã đổi so với lúc phê duyệt".to_string()
     } else if lower.contains("stale_observation") {
         "ảnh chụp Mimint dựa vào đã quá cũ".to_string()
@@ -197,8 +199,9 @@ pub struct ChatState {
     pub stopped: bool,
     /// The BODY's emergency stop tripped (hotkey or input while a
     /// card waited). Unlike `stopped`, this does NOT clear on
-    /// resume: the body's flag latches until the app restarts.
-    /// Blocks new turns while set, same as `stopped`.
+    /// resume: the body's flag latches until the body stack is
+    /// rebuilt or the app restarts. Blocks new turns while
+    /// set, same as `stopped`.
     pub body_stopped: bool,
     /// A control/worker fault is showing (lamp Error state).
     pub control_error: bool,
@@ -456,15 +459,15 @@ impl ChatState {
 
     /// The body's emergency stop tripped. Latches like STOP NOW,
     /// but resume does NOT clear it: the body's flag only clears
-    /// on restart.
+    /// on a body rebuild or a restart.
     pub fn request_body_stop(&mut self) {
         self.stopped = true;
         self.body_stopped = true;
     }
 
     /// The user actively re-enables after STOP NOW. A body stop
-    /// is NOT cleared here: only a restart clears the body's
-    /// latched flag.
+    /// is NOT cleared here: only a body rebuild or a restart
+    /// clears the body's latched flag.
     pub fn resume(&mut self) {
         self.stopped = false;
         self.stop_requested = false;
@@ -588,6 +591,10 @@ mod tests {
     #[test]
     fn friendly_tool_error_maps_known_codes() {
         assert!(friendly_tool_error("target_changed: window differs").contains("đã đổi"));
+        assert!(
+            friendly_tool_error("target_changed_since_approval: mutation 0 -> 1")
+                .contains("agent khác")
+        );
         assert!(friendly_tool_error("stale_observation: age 400s").contains("quá cũ"));
         assert!(friendly_tool_error("unknown_outcome: maybe ran").contains("không rõ"));
         assert!(friendly_tool_error("forbidden_target: x").contains("bị cấm"));

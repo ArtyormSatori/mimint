@@ -348,6 +348,15 @@ pub struct TargetSnapshot {
     pub window_id: Option<u64>,
     /// 8x8 mean-luminance grid over the 64x64 crop.
     pub grid: [u8; 64],
+    /// Body mutation generation at snapshot time (F6-03): the
+    /// actor's counter of non-screenshot actions dispatched
+    /// so far. Stamped by the actor loop on probe replies;
+    /// bodies construct snapshots with 0 and never see the
+    /// counter. `matches`/`mismatch_reason` deliberately
+    /// ignore it — the generation check is a separate refusal
+    /// (`TargetChangedSinceApproval`), checked before the
+    /// pixel comparison.
+    pub mutation_seq: u64,
 }
 
 /// Maximum mean absolute grid difference for two snapshots of
@@ -1046,7 +1055,14 @@ mod tests {
         let base = TargetSnapshot {
             window_id: Some(7),
             grid: [100; 64],
+            mutation_seq: 0,
         };
+        // The generation is ignored by the pixel comparison:
+        // a newer generation alone is not a target change.
+        let mut seq_bumped = base.clone();
+        seq_bumped.mutation_seq = 5;
+        assert!(base.matches(&seq_bumped));
+        assert!(base.mismatch_reason(&seq_bumped).is_none());
         assert!(base.matches(&base.clone()));
         // Small drift (blinking cursor): still matches.
         let mut drifted = base.clone();
@@ -1071,6 +1087,7 @@ mod tests {
         let unknown = TargetSnapshot {
             window_id: None,
             grid: [100; 64],
+            mutation_seq: 0,
         };
         assert!(base.matches(&unknown));
         assert!(base.mismatch_reason(&unknown).is_none());
@@ -1083,6 +1100,7 @@ mod tests {
         let snap = TargetSnapshot {
             window_id: Some(1),
             grid: [0; 64],
+            mutation_seq: 0,
         };
         slot.set(10, 10, snap);
         assert!(
@@ -1097,6 +1115,7 @@ mod tests {
             TargetSnapshot {
                 window_id: None,
                 grid: [1; 64],
+                mutation_seq: 0,
             },
         );
         slot.clear();

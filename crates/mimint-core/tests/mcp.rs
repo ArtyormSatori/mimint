@@ -833,6 +833,45 @@ fn mcp_name_collision_between_servers_rejects_later() {
 }
 
 #[test]
+fn mcp_name_collision_within_server_after_truncation_rejects_server() {
+    if !sandbox_available() {
+        eprintln!("SKIP: sandbox preflight failed on this machine");
+        return;
+    }
+    // Two tools of ONE server whose registry names collide
+    // only after the 64-char truncation: "mcp_srv_" is 8
+    // chars, so two 61-char tool names sharing their first
+    // 56 characters truncate to the same 64-char name. The
+    // within-server check (clamp_catalog) must reject the
+    // whole server; no tool from it may register.
+    let tool_a = format!("{}x", "a".repeat(60));
+    let tool_b = format!("{}y", "a".repeat(60));
+    let tools = json!([
+        {"name": tool_a, "description": "first",
+         "inputSchema": {"type": "object", "properties": {}}},
+        {"name": tool_b, "description": "second",
+         "inputSchema": {"type": "object", "properties": {}}},
+    ]);
+    let h = harness(vec![server_config(
+        "srv",
+        "echo",
+        &[("FAKE_MCP_TOOLS", &tools.to_string())],
+        30,
+    )]);
+    let outcomes = h.manager.connect_all();
+    let err = outcomes[0]
+        .1
+        .as_ref()
+        .expect_err("within-server collision must reject the server");
+    assert!(
+        err.contains("duplicate tool name after truncation"),
+        "unexpected error: {err}"
+    );
+    assert!(h.manager.tools_for(AGENT_DEFAULT).is_empty());
+    h.manager.disconnect_all();
+}
+
+#[test]
 fn mcp_manager_rejects_ninth_server() {
     let dir = temp_dir("ninth");
     let audit = Arc::new(AuditLog::open(dir.join("audit.jsonl")).unwrap());

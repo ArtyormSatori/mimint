@@ -143,6 +143,15 @@ fn note_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Note> {
 /// Columns selected by every note query, in `note_from_row` order.
 const NOTE_COLUMNS: &str = "id, title, body, created_ms, updated_ms, owner_agent_id, shared";
 
+/// How long a write waits for the database lock before
+/// failing (F6-07). One writer (the `Mutex` in `Notebook`)
+/// plus a second process or a stale connection can still
+/// collide; a 5s busy timeout absorbs brief locks instead of
+/// failing the turn. WAL mode stays deferred: the timeout
+/// covers the realistic contention, and WAL changes the
+/// durability story (see docs/operations.md).
+const NOTEBOOK_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Baseline tokenizer: NFC-normalize (Vietnamese-only, see
 /// [`normalize_nfc_vietnamese`]), Unicode-lowercase, then split on
 /// any character that is not alphanumeric. Diacritics are kept;
@@ -394,6 +403,10 @@ impl Notebook {
     /// shared.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, MimintError> {
         let conn = Connection::open(path.as_ref())?;
+        // F6-07: wait out brief locks instead of failing the
+        // write at once. Set before any schema work, so the
+        // migration statements wait too.
+        conn.busy_timeout(NOTEBOOK_BUSY_TIMEOUT)?;
         conn.execute(
             "CREATE TABLE IF NOT EXISTS notes (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -736,6 +749,75 @@ mod tests {
             std::process::id(),
             nanos
         ))
+    }
+
+    #[test]
+    fn busy_timeout_waits_out_a_brief_lock() {
+        // F6-07: a second connection holds BEGIN IMMEDIATE
+        // for 300ms; the write must wait and succeed.
+        let path = temp_db("busy-brief");
+        let notebook = Notebook::open(&path).expect("open notebook");
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn({
+            let path = path.clone();
+            move || {
+                let conn = Connection::open(&path).unwrap();
+                conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+                tx.send(()).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                conn.execute_batch("COMMIT").unwrap();
+            }
+        });
+        rx.recv().expect("holder took the lock");
+        let started = std::time::Instant::now();
+        let id = notebook
+            .add("waiting", "the lock clears in time")
+            .expect("write waits out the brief lock");
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(150),
+            "the write should have waited for the lock"
+        );
+        assert_eq!(notebook.get(id).unwrap().unwrap().title, "waiting");
+        holder.join().unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn busy_timeout_gives_up_after_five_seconds_on_a_stuck_lock() {
+        // F6-07: a lock held past the timeout fails with a
+        // locked error in ~5s — it must not wait for the
+        // 7s release, and must not fail at once either.
+        let path = temp_db("busy-stuck");
+        let notebook = Notebook::open(&path).expect("open notebook");
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn({
+            let path = path.clone();
+            move || {
+                let conn = Connection::open(&path).unwrap();
+                conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+                tx.send(()).unwrap();
+                std::thread::sleep(std::time::Duration::from_secs(7));
+                conn.execute_batch("COMMIT").unwrap();
+            }
+        });
+        rx.recv().expect("holder took the lock");
+        let started = std::time::Instant::now();
+        let err = notebook.add("stuck", "never lands").unwrap_err();
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= std::time::Duration::from_secs(4),
+            "gave up too fast: {elapsed:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(6500),
+            "waited for the release instead of timing out: {elapsed:?}"
+        );
+        assert!(
+            err.to_string().to_lowercase().contains("locked"),
+            "expected a locked error, got: {err}"
+        );
+        holder.join().unwrap();
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

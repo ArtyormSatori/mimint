@@ -120,11 +120,20 @@ impl AuditRow {
             }
             "reflection" => "Mimint tự xem lại tiến độ của lượt.".to_string(),
             "emergency_stop" => {
+                // F6-15: no raw reason in the friendly line;
+                // the source names the button when it was one.
                 let source = self.source.as_deref().unwrap_or("không rõ nguồn");
-                let reason = self.reason.as_deref().unwrap_or("dừng khẩn cấp");
+                let source_label = if source == "ui_stop" {
+                    "nút DỪNG KHẨN CẤP"
+                } else {
+                    source
+                };
                 format!(
-                    "Dừng khẩn cấp ({source}): {reason}. Khởi động lại ứng dụng để điều khiển tiếp."
+                    "Dừng khẩn cấp ({source_label}). Điều khiển đang bị khóa. Khởi động lại ứng dụng (hoặc khởi tạo lại bộ điều khiển) để điều khiển tiếp."
                 )
+            }
+            "config_loaded" => {
+                "Đã nạp file cấu hình lúc khởi động (hash SHA-256 đã ghi vào bản ghi audit).".to_string()
             }
             "privacy_mode" => match self.decision.as_deref() {
                 Some("on") => "Chế độ riêng tư: BẬT.".to_string(),
@@ -186,7 +195,10 @@ impl AuditRow {
             }
             "body_rebuilt" => {
                 let generation = self.detail_count("generation").unwrap_or(0);
-                format!("Body đã rebuild (generation {generation}). Lượt sau sẽ chụp màn hình mới trước khi hành động.")
+                format!("Bộ điều khiển đã khởi tạo lại (generation {generation}). Lượt sau sẽ chụp màn hình mới trước khi hành động.")
+            }
+            "body_rebuild_failed" => {
+                "Khởi tạo lại bộ điều khiển thất bại. Bộ điều khiển chưa sẵn sàng — thử lại hoặc khởi động lại ứng dụng.".to_string()
             }
             "task_end_unverified" => {
                 let source = self.source.clone().unwrap_or_default();
@@ -273,6 +285,25 @@ impl AuditRow {
                         );
                     }
                 }
+            }
+            None => {}
+        }
+        // Input-hash verification (F6-06): same shape as the
+        // code-hash verdict. Records written before the fix
+        // have no `input_hashes_verified` field and make no
+        // claim; a verified run with no inputs stays silent
+        // (nothing to compare).
+        match self.detail_bool("input_hashes_verified") {
+            Some(true) => {
+                if let Some(Value::Array(list)) = self.detail_value("input_files_sha256") {
+                    if !list.is_empty() {
+                        summary
+                            .push_str(" Hash của các file đầu vào đã chạy khớp hash đã phê duyệt.");
+                    }
+                }
+            }
+            Some(false) => {
+                summary.push_str(" CẢNH BÁO: hash của file đầu vào KHÔNG khớp hash đã phê duyệt.");
             }
             None => {}
         }
@@ -537,10 +568,16 @@ pub fn stop_banner(rows: &[AuditRow]) -> Option<String> {
         }
     }
     let row = &rows[last_stop];
+    // F6-15: the banner names the source and the locked
+    // state, never the raw reason string.
     let source = row.source.as_deref().unwrap_or("không rõ nguồn");
-    let reason = row.reason.as_deref().unwrap_or("dừng khẩn cấp");
+    let source_label = if source == "ui_stop" {
+        "nút DỪNG KHẨN CẤP"
+    } else {
+        source
+    };
     Some(format!(
-        "Đã DỪNG KHẨN CẤP ({source}, lúc {} UTC) — {reason}. Khởi động lại ứng dụng để điều khiển tiếp.",
+        "Đã DỪNG KHẨN CẤP ({source_label}, lúc {} UTC) — điều khiển đang bị khóa. Khởi tạo lại bộ điều khiển (hoặc khởi động lại ứng dụng) để điều khiển tiếp.",
         format_time_ms(row.ts_ms)
     ))
 }
@@ -858,6 +895,20 @@ mod tests {
         )
         .unwrap();
         assert!(row.friendly_summary().contains("lặp action GUI"));
+        // F6-06: input-hash verdicts in the code_execution
+        // summary — verified inputs say so, a mismatch warns.
+        let row = parse_audit_line(
+            r#"{"ts_ms":1,"turn_id":"t","kind":"code_execution","tool":"execute_code","decision":"executed","detail":{"language":"python3","code_sha256":"aaaa","executed_code_sha256":"aaaa","code_hash_verified":true,"input_files_sha256":[{"name":"data.txt","sha256":"h1"}],"executed_input_files_sha256":[{"name":"data.txt","sha256":"h1"}],"input_hashes_verified":true,"sandbox_verdict":"bwrap","exit_code":0}}"#,
+        )
+        .unwrap();
+        let summary = row.friendly_summary();
+        assert!(summary.contains("file đầu vào"), "{summary}");
+        assert!(!summary.contains("CẢNH BÁO"), "{summary}");
+        let row = parse_audit_line(
+            r#"{"ts_ms":1,"turn_id":"t","kind":"code_execution","tool":"execute_code","decision":"executed","detail":{"language":"python3","code_sha256":"aaaa","executed_code_sha256":"aaaa","code_hash_verified":true,"input_files_sha256":[{"name":"data.txt","sha256":"h1"}],"executed_input_files_sha256":[{"name":"data.txt","sha256":"h2"}],"input_hashes_verified":false,"sandbox_verdict":"bwrap","exit_code":0}}"#,
+        )
+        .unwrap();
+        assert!(row.friendly_summary().contains("CẢNH BÁO"));
         // Queue decisions name the cause.
         let row = parse_audit_line(
             r#"{"ts_ms":1,"turn_id":"t","kind":"decision","tool":"body_click","decision":"deny","detail":{"reason":"queue_sla_expired"}}"#,

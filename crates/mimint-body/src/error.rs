@@ -92,6 +92,16 @@ pub enum BodyError {
     /// (see `TargetSnapshot`). Nothing was executed; the user
     /// must re-approve against the current screen.
     TargetChanged { reason: String },
+    /// Another action ran after the approval snapshot was
+    /// taken (F6-03): the body mutation generation moved from
+    /// `snapshot_seq` to `current_seq`, so the approval no
+    /// longer binds the world the action would touch — even
+    /// when the pixels under the point look unchanged.
+    /// Nothing was executed; the user must re-approve
+    /// against the current screen. This is a recoverable
+    /// refusal, NOT a body fault: it never trips the
+    /// fail-all path.
+    TargetChangedSinceApproval { snapshot_seq: u64, current_seq: u64 },
     /// The observation the action was planned from is older
     /// than the allowed age: the screen may have changed since
     /// the screenshot the model saw. Nothing was executed; the
@@ -141,6 +151,7 @@ impl BodyError {
             BodyError::ApprovalPending => "approval_pending",
             BodyError::UnknownOutcome { .. } => "unknown_outcome",
             BodyError::TargetChanged { .. } => "target_changed",
+            BodyError::TargetChangedSinceApproval { .. } => "target_changed_since_approval",
             BodyError::StaleObservation { .. } => "stale_observation",
             BodyError::QueueFull { .. } => "body_queue_full",
             BodyError::QueueExpired { .. } => "queue_sla_expired",
@@ -200,6 +211,14 @@ impl BodyError {
             BodyError::TargetChanged { reason } => {
                 format!(
                     "target changed since approval, refusing to act on a stale approval: {reason}"
+                )
+            }
+            BodyError::TargetChangedSinceApproval {
+                snapshot_seq,
+                current_seq,
+            } => {
+                format!(
+                    "target changed since approval: another action ran after the approval (mutation {snapshot_seq} -> {current_seq}); re-approval is required"
                 )
             }
             BodyError::StaleObservation { age_secs, max_secs } => {
