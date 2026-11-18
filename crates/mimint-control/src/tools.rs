@@ -24,13 +24,38 @@
 //! latch, per-action timeout) lives in the [`GuardedBody`]
 //! inside the actor and in the actor itself. Tools never
 //! touch a body directly.
+//!
+//! Two pre-execution checks live here, because only this layer
+//! sees both the observation store and the approval snapshot:
+//! - **Observation TTL (F4-08):** an input action planned from
+//!   a frame older than [`DEFAULT_MAX_OBSERVATION_AGE`] is
+//!   refused with `stale_observation` until a fresh screenshot
+//!   is taken. The default is 300s: local 3B model calls were
+//!   measured at 175–500s under load, so a shorter default
+//!   would refuse nearly every slow-model turn. The TTL is a
+//!   backstop, layered with the re-verify check and the
+//!   approval card's age warning — not the only freshness
+//!   signal. No stored frame at all means no refusal (explicit
+//!   coordinates, first action).
+//! - **Re-verify (F4-07):** when the approver stored a target
+//!   snapshot for this action's point, the tool takes a fresh
+//!   snapshot through the actor and compares: a changed window
+//!   or changed pixels refuse with `target_changed`, and the
+//!   user must re-approve against the current screen.
 
 use crate::actor::BodyActor;
 use crate::frames::{FrameMeta, FrameStore};
-use mimint_body::{action_specs, ActOutcome, Action, ActionSpec, BodyError, Key};
+use mimint_body::{
+    action_specs, ActOutcome, Action, ActionSpec, BodyError, Key, TargetSnapshotSlot,
+};
 use mimint_core::{MimintError, Risk, Tool};
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+/// Default maximum age of the observation an input action may
+/// be planned from (F4-08). See the module docs for why 300s.
+pub const DEFAULT_MAX_OBSERVATION_AGE: Duration = Duration::from_secs(300);
 
 /// Shared Privacy Mode state: the screenshot tool reads it at
 /// capture time to taint the stored frame. The worker owns the
@@ -63,20 +88,28 @@ pub struct BodyTool {
     actor: BodyActor,
     frames: Arc<FrameStore>,
     privacy: PrivacyFlag,
+    /// Approval-time snapshot slot, shared with the approver.
+    snapshot_slot: Arc<TargetSnapshotSlot>,
+    /// Maximum observation age for input actions (F4-08).
+    max_observation_age: Duration,
 }
 
 impl BodyTool {
-    fn new(
+    fn with_config(
         spec: &'static ActionSpec,
         actor: BodyActor,
         frames: Arc<FrameStore>,
         privacy: PrivacyFlag,
+        snapshot_slot: Arc<TargetSnapshotSlot>,
+        max_observation_age: Duration,
     ) -> BodyTool {
         BodyTool {
             spec,
             actor,
             frames,
             privacy,
+            snapshot_slot,
+            max_observation_age,
         }
     }
 
@@ -105,6 +138,10 @@ impl BodyTool {
 
     fn execute(&self, args: &Value) -> Result<Value, MimintError> {
         let action = parse_action(self.spec.name, args)?;
+        if !matches!(action, Action::Screenshot) {
+            self.check_observation_fresh()?;
+            self.reverify_target(&action)?;
+        }
         match self.actor.act(action) {
             Ok(ActOutcome::Frame(frame)) => {
                 let meta = self.frames.store(frame, self.privacy.is_on());
@@ -113,6 +150,67 @@ impl BodyTool {
             Ok(ActOutcome::Done) => Ok(json!({"ok": true})),
             Err(err) => Err(body_err_to_tool(err)),
         }
+    }
+
+    /// Refuse input actions planned from a stale observation
+    /// (F4-08). Screenshots are exempt (they refresh the
+    /// observation); an empty store is exempt (nothing stale).
+    fn check_observation_fresh(&self) -> Result<(), MimintError> {
+        if self.frames.observation_stale(self.max_observation_age) {
+            let age_secs = self
+                .frames
+                .latest_age()
+                .map(|age| age.as_secs())
+                .unwrap_or(0);
+            return Err(body_err_to_tool(BodyError::StaleObservation {
+                age_secs,
+                max_secs: self.max_observation_age.as_secs(),
+            }));
+        }
+        Ok(())
+    }
+
+    /// Re-verify the target against the approval-time snapshot
+    /// (F4-07). Only coordinate actions carry a snapshot, and
+    /// only when the approver stored one for this exact point:
+    /// no snapshot means no re-verification (gates, bodies
+    /// without snapshot support), never a refusal. A fresh
+    /// snapshot the body cannot produce (`None`) also proceeds.
+    /// A mismatch refuses with `target_changed` and the action
+    /// never runs.
+    fn reverify_target(&self, action: &Action) -> Result<(), MimintError> {
+        let Some((x, y)) = action_point(action) else {
+            return Ok(());
+        };
+        let Some(expected) = self.snapshot_slot.take_for(x, y) else {
+            return Ok(());
+        };
+        let fresh = match self.actor.probe_target(x, y) {
+            Ok(probe) => probe.snapshot,
+            Err(err) => return Err(body_err_to_tool(err)),
+        };
+        if let Some(fresh) = fresh {
+            if let Some(reason) = expected.mismatch_reason(&fresh) {
+                return Err(body_err_to_tool(BodyError::TargetChanged { reason }));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The approval point of a coordinate action: the point the
+/// approver snapshots, and the point re-verified at execution.
+/// Drags snapshot their FROM point (where the press lands).
+/// Non-coordinate actions have no point.
+fn action_point(action: &Action) -> Option<(i32, i32)> {
+    match action {
+        Action::Click { x, y }
+        | Action::Move { x, y }
+        | Action::Scroll { x, y, .. }
+        | Action::DoubleClick { x, y }
+        | Action::RightClick { x, y } => Some((*x, *y)),
+        Action::Drag { from_x, from_y, .. } => Some((*from_x, *from_y)),
+        _ => None,
     }
 }
 
@@ -171,19 +269,49 @@ fn tool_names() -> &'static [&'static str] {
 
 /// Register all body tools into a registry, in spec order.
 /// The specs are leaked once (see [`action_specs_static`]) so
-/// tools can hold `&'static ActionSpec`.
+/// tools can hold `&'static ActionSpec`. Uses a fresh snapshot
+/// slot and the default observation age: gates and tests that
+/// do not wire an approver get no re-verification and the
+/// default TTL.
 pub fn register_body_tools(
     registry: &mut mimint_core::Registry,
     actor: BodyActor,
     frames: Arc<FrameStore>,
     privacy: PrivacyFlag,
 ) {
+    register_body_tools_configured(
+        registry,
+        actor,
+        frames,
+        privacy,
+        Arc::new(TargetSnapshotSlot::new()),
+        DEFAULT_MAX_OBSERVATION_AGE,
+    );
+}
+
+/// Register all body tools with the approver-shared snapshot
+/// slot and a configured observation age (the worker path).
+pub fn register_body_tools_configured(
+    registry: &mut mimint_core::Registry,
+    actor: BodyActor,
+    frames: Arc<FrameStore>,
+    privacy: PrivacyFlag,
+    snapshot_slot: Arc<TargetSnapshotSlot>,
+    max_observation_age: Duration,
+) {
     let specs = action_specs_static();
     let names = tool_names();
     for (spec, name) in specs.iter().zip(names.iter()) {
         registry.register(Box::new(NamedBodyTool::new(
             name,
-            BodyTool::new(spec, actor.clone(), Arc::clone(&frames), privacy.clone()),
+            BodyTool::with_config(
+                spec,
+                actor.clone(),
+                Arc::clone(&frames),
+                privacy.clone(),
+                Arc::clone(&snapshot_slot),
+                max_observation_age,
+            ),
         )));
     }
 }
@@ -394,5 +522,110 @@ mod tests {
             .unwrap();
         assert_eq!(out["privacy_on_at_capture"], true);
         assert_eq!(frames.purge_tainted(), 1);
+    }
+
+    #[test]
+    fn stale_observation_refuses_input_but_not_screenshots() {
+        use mimint_body::Framebuffer;
+        use std::time::Instant;
+        let actor = BodyActor::spawn(Box::new(MockBody::new()), StopFlag::new());
+        let frames = Arc::new(FrameStore::new());
+        // A frame captured 400s ago, with a 300s TTL.
+        let old = Framebuffer::new(4, 4, vec![0u8; 64])
+            .unwrap()
+            .with_captured_at(Instant::now() - Duration::from_secs(400));
+        frames.store(old, false);
+        let mut registry = mimint_core::Registry::new();
+        register_body_tools(
+            &mut registry,
+            actor,
+            Arc::clone(&frames),
+            PrivacyFlag::new(false),
+        );
+        let err = registry
+            .get("body_click")
+            .unwrap()
+            .execute(&json!({"x": 10, "y": 10}))
+            .unwrap_err();
+        assert!(err.to_string().contains("stale_observation"), "{err}");
+        // A fresh screenshot clears the staleness: the
+        // screenshot tool itself is never refused.
+        let out = registry
+            .get("body_screenshot")
+            .unwrap()
+            .execute(&json!({}))
+            .unwrap();
+        assert!(out.get("frame_id").is_some());
+        assert!(registry
+            .get("body_click")
+            .unwrap()
+            .execute(&json!({"x": 10, "y": 10}))
+            .is_ok());
+    }
+
+    #[test]
+    fn reverify_refuses_a_changed_target_and_allows_an_unchanged_one() {
+        use mimint_body::{MockWindow, ScreenRect};
+        let body = MockBody::new();
+        body.set_windows(vec![MockWindow::new(
+            1,
+            ScreenRect::new(100, 100, 300, 300),
+        )
+        .with_class("editor")
+        .with_fill((200, 40, 40))]);
+        // The oracle shares the body's state: it can swap the
+        // window underneath the actor-owned body (TOCTOU).
+        let oracle = body.oracle();
+        let actor = BodyActor::spawn(Box::new(body), StopFlag::new());
+        let frames = Arc::new(FrameStore::new());
+        let slot = Arc::new(TargetSnapshotSlot::new());
+        let mut registry = mimint_core::Registry::new();
+        register_body_tools_configured(
+            &mut registry,
+            actor.clone(),
+            Arc::clone(&frames),
+            PrivacyFlag::new(false),
+            Arc::clone(&slot),
+            DEFAULT_MAX_OBSERVATION_AGE,
+        );
+        // Approval-time snapshot, as the approver would take it.
+        let probe = actor.probe_target(200, 200).unwrap();
+        slot.set(200, 200, probe.snapshot.unwrap());
+        // Unchanged target: the click runs.
+        assert!(registry
+            .get("body_click")
+            .unwrap()
+            .execute(&json!({"x": 200, "y": 200}))
+            .is_ok());
+        // A new snapshot, then the world changes underneath:
+        // a different window with different content moves in.
+        let probe = actor.probe_target(200, 200).unwrap();
+        slot.set(200, 200, probe.snapshot.unwrap());
+        oracle.set_windows(vec![MockWindow::new(
+            2,
+            ScreenRect::new(100, 100, 300, 300),
+        )
+        .with_class("browser")
+        .with_fill((40, 40, 200))]);
+        let err = registry
+            .get("body_click")
+            .unwrap()
+            .execute(&json!({"x": 200, "y": 200}))
+            .unwrap_err();
+        assert!(err.to_string().contains("target_changed"), "{err}");
+        // A snapshot for another point never applies.
+        oracle.set_windows(vec![MockWindow::new(
+            2,
+            ScreenRect::new(100, 100, 300, 300),
+        )
+        .with_class("browser")
+        .with_fill((40, 40, 200))]);
+        let probe = actor.probe_target(200, 200).unwrap();
+        slot.set(201, 201, probe.snapshot.unwrap());
+        assert!(registry
+            .get("body_click")
+            .unwrap()
+            .execute(&json!({"x": 200, "y": 200}))
+            .is_ok());
     }
 }

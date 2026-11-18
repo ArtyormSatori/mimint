@@ -577,9 +577,10 @@ fn io_err(err: std::io::Error) -> BodyError {
 
 /// The body side: a [`Body`] implemented over protocol v2. The
 /// connection is lazy (first action connects) and is re-made
-/// once after a transport failure; a second consecutive failure
-/// is terminal for that call. State that belongs to the body
-/// contract (exclusion zones, capture cap) is enforced here,
+/// once after a transport failure on an idempotent read only;
+/// input calls never retry after a transport failure (see
+/// `call`). State that belongs to the body contract (exclusion
+/// zones, capture cap) is enforced here,
 /// not trusted to the shell.
 pub struct AndroidBody {
     config: AndroidConfig,
@@ -620,17 +621,21 @@ impl AndroidBody {
         Ok(self.client.as_mut().unwrap())
     }
 
-    /// Run one request, reconnecting once on a transport-level
-    /// failure. Server-meaningful errors (typed refusals) are
-    /// returned as-is, never retried: a refusal is an answer.
+    /// Run one request. On a transport-level failure the client
+    /// is dropped (the connection state is unknown) and:
     ///
-    /// At-most-once is NOT guaranteed across the retry: if the
-    /// request reached the server but the response was lost,
-    /// the retry executes the action a second time. The window
-    /// is small (loopback, one retry) and the alternative —
-    /// failing a turn on every transient drop — is worse for a
-    /// body that must keep working; callers that need
-    /// exactly-once semantics must not rely on this retry.
+    /// * idempotent reads (`display_size`, `screenshot`,
+    ///   `permissions`, `focused_window`) reconnect once and
+    ///   re-issue the request — re-reading cannot
+    ///   double-execute anything;
+    /// * input methods are NEVER retried: the request may have
+    ///   reached the server, so the outcome is unknown. The
+    ///   caller gets `UnknownOutcome` and must NOT retry
+    ///   either — the verifier layer reports UNKNOWN and
+    ///   waits for the human, per the unknown-outcome rule.
+    ///
+    /// Server-meaningful errors (typed refusals) are returned
+    /// as-is, never retried: a refusal is an answer.
     fn call(&mut self, method: &str, params: Value) -> Result<(Value, Vec<u8>), BodyError> {
         let first = self.ensure_client()?.request(method, params.clone());
         match first {
@@ -638,7 +643,16 @@ impl AndroidBody {
             Err(err) => {
                 if is_transport_error(&err) {
                     self.client = None;
-                    self.ensure_client()?.request(method, params)
+                    if is_idempotent_read(method) {
+                        self.ensure_client()?.request(method, params)
+                    } else {
+                        Err(BodyError::UnknownOutcome {
+                            reason: format!(
+                                "transport failure during {method}; the action may or may not \
+                                 have executed, and was not retried: {err}"
+                            ),
+                        })
+                    }
                 } else {
                     Err(err)
                 }
@@ -705,6 +719,16 @@ fn is_transport_error(err: &BodyError) -> bool {
         }
         _ => false,
     }
+}
+
+/// Methods whose retry is safe: pure reads with no side
+/// effects. Every other method (all input, `kill`) must never
+/// be re-issued after a transport failure — see `call`.
+fn is_idempotent_read(method: &str) -> bool {
+    matches!(
+        method,
+        "display_size" | "screenshot" | "permissions" | "focused_window"
+    )
 }
 
 impl Body for AndroidBody {
@@ -910,6 +934,12 @@ pub struct FakeState {
     killed: bool,
     /// Connections served (for the reconnect test).
     connections: u64,
+    /// When set, the next dispatched request is executed but
+    /// its reply is never written: the connection is dropped
+    /// instead, modelling "the request reached the server and
+    /// the response was lost". Consumed by the first dispatch
+    /// after it is set. Test hook for the retry rules.
+    drop_response_once: bool,
     /// (window id, class, title) of the focused window, or None
     /// when the shell cannot determine it.
     focused: Option<(u64, String, String)>,
@@ -931,6 +961,7 @@ impl FakeState {
             audit: Vec::new(),
             killed: false,
             connections: 0,
+            drop_response_once: false,
             focused: Some((
                 0xA11CE,
                 "com.example.app/.MainActivity".to_string(),
@@ -1032,6 +1063,18 @@ impl FakeAndroidServer {
 
     pub fn state(&self) -> Arc<Mutex<FakeState>> {
         Arc::clone(&self.state)
+    }
+
+    /// Connections served so far (for the retry tests).
+    pub fn connections_served(&self) -> u64 {
+        lock_fake(&self.state).connections
+    }
+
+    /// Arm the drop hook: the next request is executed, but
+    /// its reply is never written and the connection is
+    /// dropped. Models a lost response after execution.
+    pub fn drop_next_response(&self) {
+        lock_fake(&self.state).drop_response_once = true;
     }
 
     /// The oracle sharing this server's state.
@@ -1209,6 +1252,12 @@ fn serve_connection(
             transport.read_exact(&mut sink)?;
         }
         let (reply, payload) = dispatch(&state, &request, &token);
+        // Test hook for the retry rules: the request was
+        // executed, but the reply is dropped — the client
+        // sees a bare transport failure.
+        if std::mem::replace(&mut lock_fake(&state).drop_response_once, false) {
+            return Ok(());
+        }
         let reply_bytes = serde_json::to_vec(&reply).unwrap();
         let len = u32::try_from(reply_bytes.len()).unwrap_or(u32::MAX);
         transport.write_all(&len.to_be_bytes())?;
@@ -1711,6 +1760,48 @@ mod tests {
         assert!(body.display_size().is_ok());
         body.kill();
         assert!(lock_fake(&state).killed);
+        server.stop();
+    }
+
+    #[test]
+    fn read_retries_once_after_a_lost_response() {
+        let server = FakeAndroidServer::start(FakeServerConfig {
+            token: "tok".to_string(),
+            tls_identity: None,
+        })
+        .unwrap();
+        let mut body = AndroidBody::new(test_config(server.addr(), "tok"));
+        assert!(body.display_size().is_ok());
+        assert_eq!(server.connections_served(), 1);
+        // The next reply is lost: screenshot is a read, so
+        // the client reconnects once and the call succeeds.
+        server.drop_next_response();
+        assert!(body.screenshot().is_ok());
+        assert_eq!(server.connections_served(), 2);
+        server.stop();
+    }
+
+    #[test]
+    fn input_is_never_retried_after_a_lost_response() {
+        let server = FakeAndroidServer::start(FakeServerConfig {
+            token: "tok".to_string(),
+            tls_identity: None,
+        })
+        .unwrap();
+        let mut body = AndroidBody::new(test_config(server.addr(), "tok"));
+        assert!(body.display_size().is_ok());
+        assert_eq!(server.connections_served(), 1);
+        // The click executes on the server, but the reply is
+        // lost. The client must NOT retry: the outcome is
+        // unknown, exactly one click was recorded, and no
+        // second connection was opened for a retry.
+        server.drop_next_response();
+        let err = body.click(10, 10).unwrap_err();
+        assert_eq!(err.code(), "unknown_outcome");
+        assert!(err.message().contains("not retried"), "{}", err.message());
+        assert_eq!(server.connections_served(), 1);
+        let mut oracle = server.oracle();
+        assert_eq!(oracle.received_clicks(), vec![(10, 10)]);
         server.stop();
     }
 

@@ -405,6 +405,17 @@ impl TargetSnapshot {
     }
 }
 
+/// What the approver learns about the target before showing
+/// the card (F4-05/F4-07): the window identity for display, and
+/// the re-verify snapshot for the execution-time comparison.
+/// Both are taken in one serialized actor request, so they
+/// cannot disagree about which window was under the point.
+#[derive(Debug, Clone, Default)]
+pub struct TargetProbe {
+    pub identity: Option<WindowIdentity>,
+    pub snapshot: Option<TargetSnapshot>,
+}
+
 /// A slot holding the approval-time snapshot for the action
 /// currently awaiting a decision. Shared between the approver
 /// (which fills it when the card is created) and the body tool

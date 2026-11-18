@@ -22,5 +22,8 @@ pub mod verify;
 
 pub use actor::{bridge, BodyActor, DEFAULT_ACTION_TIMEOUT};
 pub use frames::{encode_png, hex_encode, sha256_hex, FrameMeta, FrameStore};
-pub use tools::{register_body_tools, BodyTool, NamedBodyTool, PrivacyFlag};
+pub use tools::{
+    register_body_tools, register_body_tools_configured, BodyTool, NamedBodyTool, PrivacyFlag,
+    DEFAULT_MAX_OBSERVATION_AGE,
+};
 pub use verify::BodyStepVerifier;

@@ -12,7 +12,7 @@
 //!
 //! | Platform | Status |
 //! |----------|--------|
-//! | X11 | Implemented: `XGrabKey` on the root window, own X connection, own thread. Verified live under Xvfb (ignored test in this module). |
+//! | X11 | Implemented: `XGrabKey` on the root window, own X connection, own thread — PLUS a second channel that polls the server keymap (`XQueryKeymap`) for the chord, so the stop still lands when another client holds a conflicting grab. A dead connection latches the stop fail-closed and marks the listener dead (see [`HotkeyHealth`]). Verified live under Xvfb (ignored tests in this module). |
 //! | macOS | Design only: a `CGEventTap` at `kCGHIDEventTap` watching for the chord, posting to the same `StopFlag`. Requires Accessibility permission; unimplemented, no Mac run available. |
 //! | Windows | Design only: `RegisterHotKey` with `MOD_CONTROL | MOD_ALT | MOD_SHIFT` + `VK_ESCAPE` on a message-only window in its own thread. Unimplemented, no Windows run available. |
 //! | Android | Design only: no global hotkey exists; the equivalent is a persistent overlay button (the kill switch in `docs/android-body.md`). Unimplemented, no device available. |
@@ -72,10 +72,36 @@ pub fn chord_matches(state: u16, keycode: u8, escape_keycode: u8) -> bool {
     keycode == escape_keycode && state & CHORD_MODIFIERS == CHORD_MODIFIERS
 }
 
+/// Keycodes of the four chord keys, resolved from the server
+/// keymap. The keymap-poll channel (second channel) needs the
+/// physical keycodes; the grab channel needs only Escape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChordKeycodes {
+    pub escape: u8,
+    pub ctrl: u8,
+    pub alt: u8,
+    pub shift: u8,
+}
+
+/// Pure keymap-chord match (second channel): all four chord
+/// keys are down in the 32-byte server keymap (`XQueryKeymap`
+/// format: bit `keycode` of the 256-bit map). Lock keys are
+/// separate keycodes, so they are ignored naturally. A chord
+/// held for a human-scale press (100ms+) is always observed
+/// by a 20ms poll; a sub-poll press is the grab channel's job.
+pub fn keymap_chord_pressed(keymap: &[u8; 32], keys: &ChordKeycodes) -> bool {
+    let down = |keycode: u8| -> bool {
+        let byte = keymap[(keycode / 8) as usize];
+        byte & (1u8 << (keycode % 8)) != 0
+    };
+    down(keys.escape) && down(keys.ctrl) && down(keys.alt) && down(keys.shift)
+}
+
 #[cfg(target_os = "linux")]
 mod linux_impl {
     use super::*;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
     use x11rb::connection::Connection;
     use x11rb::protocol::xproto::*;
     #[cfg(test)]
@@ -84,6 +110,53 @@ mod linux_impl {
     use x11rb::rust_connection::RustConnection;
 
     const SYM_ESCAPE: u32 = 0xff1b;
+    const SYM_CTRL_L: u32 = 0xffe3;
+    const SYM_ALT_L: u32 = 0xffe9;
+    const SYM_SHIFT_L: u32 = 0xffe1;
+
+    /// Liveness of a running [`HotkeyListener`]: a heartbeat
+    /// the listener thread refreshes every loop iteration, and
+    /// a dead flag set only when the thread exits unexpectedly
+    /// (lost X connection). A clean [`HotkeyListener::stop`]
+    /// does NOT set the dead flag — but the heartbeat then
+    /// goes stale, so `is_healthy` is false for a stopped
+    /// listener too. The fail-closed signal is `is_dead`:
+    /// when it is set, the stop flag has already been
+    /// tripped by the dying thread.
+    #[derive(Debug, Clone)]
+    pub struct HotkeyHealth {
+        last_beat: Arc<Mutex<Instant>>,
+        dead: Arc<AtomicBool>,
+        /// False when the modifier keycodes could not be
+        /// resolved: the keymap-poll channel is unavailable
+        /// and only the grab channel guards the stop.
+        poll_channel: bool,
+    }
+
+    impl HotkeyHealth {
+        /// True when the thread is alive and beating (a beat
+        /// within the last second) and not dead.
+        pub fn is_healthy(&self) -> bool {
+            !self.dead.load(Ordering::SeqCst)
+                && self
+                    .last_beat
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .elapsed()
+                    < Duration::from_secs(1)
+        }
+
+        /// True when the listener thread died unexpectedly
+        /// (lost X connection). The stop flag is tripped.
+        pub fn is_dead(&self) -> bool {
+            self.dead.load(Ordering::SeqCst)
+        }
+
+        /// True when the keymap-poll second channel is active.
+        pub fn poll_channel_active(&self) -> bool {
+            self.poll_channel
+        }
+    }
 
     /// A running global-hotkey listener. Owns a thread with its own
     /// X connection; dropping it (or calling [`stop`]) ungrabs the
@@ -94,6 +167,7 @@ mod linux_impl {
     pub struct HotkeyListener {
         shutdown: Arc<AtomicBool>,
         thread: Option<std::thread::JoinHandle<()>>,
+        health: HotkeyHealth,
     }
 
     impl HotkeyListener {
@@ -103,7 +177,17 @@ mod linux_impl {
         /// the stop unreliable in exactly the cases the user cannot
         /// predict.
         pub fn start(stop_flag: Arc<StopFlag>) -> Result<HotkeyListener, BodyError> {
-            let (conn, screen_num) = x11rb::connect(None).map_err(|err| {
+            Self::start_on_display(None, stop_flag)
+        }
+
+        /// Like [`HotkeyListener::start`], on an explicit display
+        /// (`None` means `$DISPLAY`). The dead-path live test
+        /// starts a listener on a private Xvfb through this.
+        pub fn start_on_display(
+            display: Option<&str>,
+            stop_flag: Arc<StopFlag>,
+        ) -> Result<HotkeyListener, BodyError> {
+            let (conn, screen_num) = x11rb::connect(display).map_err(|err| {
                 BodyError::Backend(format!("hotkey listener cannot connect to X: {err}"))
             })?;
             let root = conn.setup().roots[screen_num].root;
@@ -133,15 +217,53 @@ mod linux_impl {
             conn.flush().map_err(|err| {
                 BodyError::Backend(format!("hotkey listener flush failed: {err}"))
             })?;
+            // Second channel: resolve all four chord keycodes
+            // for the keymap poll. Missing modifier keycodes
+            // disable the poll channel but NOT the start: the
+            // grab channel still guards the stop, and the
+            // health handle reports the degradation honestly.
+            let chord_keys = match (
+                find_keysym_keycode(&conn, SYM_CTRL_L),
+                find_keysym_keycode(&conn, SYM_ALT_L),
+                find_keysym_keycode(&conn, SYM_SHIFT_L),
+            ) {
+                (Some(ctrl), Some(alt), Some(shift)) => Some(ChordKeycodes {
+                    escape: escape_keycode,
+                    ctrl,
+                    alt,
+                    shift,
+                }),
+                _ => None,
+            };
+            let health = HotkeyHealth {
+                last_beat: Arc::new(Mutex::new(Instant::now())),
+                dead: Arc::new(AtomicBool::new(false)),
+                poll_channel: chord_keys.is_some(),
+            };
             let shutdown = Arc::new(AtomicBool::new(false));
             let shutdown_clone = Arc::clone(&shutdown);
+            let health_clone = health.clone();
             let thread = std::thread::spawn(move || {
-                listen_loop(conn, root, escape_keycode, stop_flag, shutdown_clone);
+                listen_loop(
+                    conn,
+                    root,
+                    escape_keycode,
+                    chord_keys,
+                    stop_flag,
+                    shutdown_clone,
+                    health_clone,
+                );
             });
             Ok(HotkeyListener {
                 shutdown,
                 thread: Some(thread),
+                health,
             })
+        }
+
+        /// Liveness handle for the listener thread.
+        pub fn health(&self) -> HotkeyHealth {
+            self.health.clone()
         }
 
         /// Stop listening: ungrab and join the thread.
@@ -166,27 +288,74 @@ mod linux_impl {
         conn: RustConnection,
         root: Window,
         escape_keycode: u8,
+        chord_keys: Option<ChordKeycodes>,
         stop_flag: Arc<StopFlag>,
         shutdown: Arc<AtomicBool>,
+        health: HotkeyHealth,
     ) {
+        // True when the loop ends for a reason OTHER than a
+        // clean shutdown or a chord trip: the connection died,
+        // and the stop must latch fail-closed.
+        let mut died = false;
         loop {
             if shutdown.load(Ordering::SeqCst) || stop_flag.is_tripped() {
                 break;
             }
+            *health.last_beat.lock().unwrap_or_else(|p| p.into_inner()) = Instant::now();
+            // Grab channel: the chord delivered as a KeyPress.
             match conn.poll_for_event() {
                 Ok(Some(event)) => {
                     if let Event::KeyPress(ev) = event {
                         if chord_matches(u16::from(ev.state), ev.detail, escape_keycode) {
-                            stop_flag.trip();
+                            stop_flag.trip_with(
+                                "hotkey",
+                                "global STOP hotkey pressed (Ctrl+Alt+Shift+Escape)",
+                            );
                             break;
                         }
                     }
                 }
-                Ok(None) => {
-                    std::thread::sleep(std::time::Duration::from_millis(20));
+                Ok(None) => {}
+                Err(_) => {
+                    // Connection lost: nothing left to listen
+                    // on, and the stop must latch fail-closed.
+                    died = true;
+                    break;
                 }
-                Err(_) => break, // Connection lost: nothing left to listen on.
             }
+            // Second channel, every iteration: the server
+            // keymap shows the chord even when another client
+            // holds a conflicting grab that starves ours.
+            // Any failure to read the keymap means the
+            // connection is dead: latch fail-closed.
+            if let Some(keys) = chord_keys {
+                let keymap = query_keymap(&conn)
+                    .ok()
+                    .and_then(|cookie| cookie.reply().ok());
+                match keymap {
+                    Some(reply) => {
+                        if keymap_chord_pressed(&reply.keys, &keys) {
+                            stop_flag.trip_with(
+                                "hotkey",
+                                "global STOP hotkey pressed (Ctrl+Alt+Shift+Escape)",
+                            );
+                            break;
+                        }
+                    }
+                    None => {
+                        died = true;
+                        break;
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        if died {
+            health.dead.store(true, Ordering::SeqCst);
+            stop_flag.trip_with(
+                "hotkey",
+                "hotkey listener lost its X connection; emergency stop latched fail-closed",
+            );
         }
         // Best-effort ungrab; errors here are harmless (the
         // connection closes with the thread).
@@ -216,6 +385,14 @@ mod linux_impl {
     /// XTest so the live test can prove the listener trips.
     #[cfg(test)]
     pub(crate) fn synthesize_chord(chord: bool) -> Result<(), BodyError> {
+        synthesize_chord_held(chord, 0)
+    }
+
+    /// Test-only helper: synthesize the chord (or a plain key)
+    /// and HOLD it for `hold_ms` before releasing, so the
+    /// keymap-poll channel (20ms) is guaranteed to observe it.
+    #[cfg(test)]
+    pub(crate) fn synthesize_chord_held(chord: bool, hold_ms: u64) -> Result<(), BodyError> {
         let (conn, _) = x11rb::connect(None)
             .map_err(|err| BodyError::Backend(format!("synth connect failed: {err}")))?;
         let keycode = |sym| {
@@ -233,6 +410,11 @@ mod linux_impl {
             }
         }
         press(&conn, esc)?;
+        conn.flush()
+            .map_err(|err| BodyError::Backend(format!("synth flush failed: {err}")))?;
+        if hold_ms > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(hold_ms));
+        }
         release(&conn, esc)?;
         for code in pressed.into_iter().rev() {
             release(&conn, code)?;
@@ -260,7 +442,7 @@ mod linux_impl {
 }
 
 #[cfg(target_os = "linux")]
-pub use linux_impl::HotkeyListener;
+pub use linux_impl::{HotkeyHealth, HotkeyListener};
 
 #[cfg(test)]
 mod tests {
@@ -309,6 +491,34 @@ mod tests {
         assert!(!chord_matches(0, esc, esc), "no modifiers");
     }
 
+    #[test]
+    fn keymap_chord_needs_all_four_keys_down() {
+        let keys = ChordKeycodes {
+            escape: 9,
+            ctrl: 37,
+            alt: 64,
+            shift: 50,
+        };
+        let mut keymap = [0u8; 32];
+        let set = |keymap: &mut [u8; 32], keycode: u8| {
+            keymap[(keycode / 8) as usize] |= 1u8 << (keycode % 8);
+        };
+        assert!(!keymap_chord_pressed(&keymap, &keys), "nothing down");
+        set(&mut keymap, 9);
+        set(&mut keymap, 37);
+        set(&mut keymap, 64);
+        assert!(!keymap_chord_pressed(&keymap, &keys), "no shift");
+        set(&mut keymap, 50);
+        assert!(keymap_chord_pressed(&keymap, &keys), "all four down");
+        // Extra keys (Caps Lock, others) do not disturb it.
+        set(&mut keymap, 66);
+        set(&mut keymap, 100);
+        assert!(keymap_chord_pressed(&keymap, &keys));
+        // Releasing one key breaks the chord.
+        keymap[(37 / 8) as usize] &= !(1u8 << (37 % 8));
+        assert!(!keymap_chord_pressed(&keymap, &keys), "ctrl released");
+    }
+
     /// Live proof: the listener trips on the real chord and ignores
     /// a plain Escape. Needs an X server; ignored by default.
     #[cfg(target_os = "linux")]
@@ -328,6 +538,145 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         assert!(flag.is_tripped(), "chord must trip the flag within 3s");
+        // The trip carries its source + reason (F4-16).
+        let info = flag.trip_info().expect("trip info recorded");
+        assert_eq!(info.source, "hotkey");
+        listener.stop();
+    }
+
+    /// Live proof of the second channel: another client grabs
+    /// the chord AFTER the listener starts (starving the grab
+    /// channel — the latest passive grab wins delivery), and a
+    /// HELD chord must still trip the flag via the keymap poll.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore]
+    fn live_hotkey_second_channel_trips_under_grab() {
+        use x11rb::connection::Connection;
+        // Explicit names, not a glob: `xproto::*` would shadow
+        // `std::sync::Arc` with the xproto `Arc` struct.
+        use x11rb::protocol::xproto::{get_keyboard_mapping, grab_key, GrabMode};
+        let flag = StopFlag::new();
+        let listener = HotkeyListener::start(Arc::clone(&flag)).expect("start hotkey listener");
+        assert!(
+            listener.health().poll_channel_active(),
+            "the poll channel must be active on this server"
+        );
+        // A competing grab on the same chord, from a second
+        // connection: it steals delivery from the listener's
+        // grab. Dropping the connection releases it again.
+        let (conn, screen_num) = x11rb::connect(None).expect("second connection");
+        let root = conn.setup().roots[screen_num].root;
+        let setup = conn.setup();
+        let (min, max) = (setup.min_keycode, setup.max_keycode);
+        let reply = get_keyboard_mapping(&conn, min, max - min + 1)
+            .unwrap()
+            .reply()
+            .unwrap();
+        let per = usize::from(reply.keysyms_per_keycode);
+        let esc = reply
+            .keysyms
+            .chunks(per)
+            .position(|chunk| chunk.contains(&0xff1bu32))
+            .map(|i| min + i as u8)
+            .expect("Escape keycode");
+        for modifiers in grab_modifier_combinations() {
+            grab_key(
+                &conn,
+                false,
+                root,
+                modifiers.into(),
+                esc,
+                GrabMode::ASYNC,
+                GrabMode::ASYNC,
+            )
+            .unwrap()
+            .check()
+            .unwrap();
+        }
+        conn.flush().unwrap();
+        // Held chord: the grab channel is starved, so only the
+        // keymap poll can see it.
+        linux_impl::synthesize_chord_held(true, 400).expect("synthesize held chord");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !flag.is_tripped() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            flag.is_tripped(),
+            "held chord must trip via the second channel while a competing grab starves the first"
+        );
+        drop(conn);
+        listener.stop();
+    }
+
+    /// Live proof of the fail-closed death: the listener runs
+    /// against a PRIVATE Xvfb that is then killed. The flag
+    /// must trip and the health must report dead — a dead
+    /// hotkey must latch the stop, never silently stop
+    /// guarding. Display :89 is outside the shared :90-:99
+    /// range; the test refuses to run if :89 is already taken
+    /// (it never kills anything it did not start).
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore]
+    fn live_hotkey_death_latches_the_stop() {
+        use std::process::{Child, Command};
+        let socket = std::path::Path::new("/tmp/.X11-unix/X89");
+        assert!(
+            !socket.exists(),
+            "display :89 is already in use; refusing to disturb it"
+        );
+        struct XvfbGuard(Option<Child>);
+        impl Drop for XvfbGuard {
+            fn drop(&mut self) {
+                if let Some(mut child) = self.0.take() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            }
+        }
+        let mut xvfb = XvfbGuard(Some(
+            Command::new("Xvfb")
+                .args([":89", "-screen", "0", "1024x768x24"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn Xvfb :89"),
+        ));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !socket.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(socket.exists(), "Xvfb :89 did not come up in 10s");
+        let flag = StopFlag::new();
+        let listener =
+            HotkeyListener::start_on_display(Some(":89"), Arc::clone(&flag)).expect("start");
+        // Let the thread beat at least once before killing.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(listener.health().is_healthy(), "listener must beat");
+        assert!(!flag.is_tripped());
+        // Kill the server out from under the listener.
+        if let Some(mut child) = xvfb.0.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !flag.is_tripped() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            flag.is_tripped(),
+            "a dead hotkey connection must latch the stop within 3s"
+        );
+        assert!(listener.health().is_dead(), "health must report dead");
+        let info = flag.trip_info().expect("trip info recorded");
+        assert_eq!(info.source, "hotkey");
+        assert!(
+            info.reason.contains("lost its X connection"),
+            "{}",
+            info.reason
+        );
         listener.stop();
     }
 }

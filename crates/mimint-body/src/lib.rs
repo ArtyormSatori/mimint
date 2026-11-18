@@ -44,7 +44,7 @@ pub use android::{
 };
 pub use body::{
     write_ppm, ActOutcome, Body, Framebuffer, FramebufferPool, PermissionState, Permissions,
-    PoolStats, ScreenRect, TargetSnapshot, TargetSnapshotSlot, WindowIdentity,
+    PoolStats, ScreenRect, TargetProbe, TargetSnapshot, TargetSnapshotSlot, WindowIdentity,
     REVERIFY_GRID_MAX_MEAN_DIFF,
 };
 pub use captures::{
@@ -61,9 +61,9 @@ pub use forbidden::{
     WindowSignals,
 };
 pub use guarded::{GuardedBody, RateLimits, StopFlag, TripInfo};
-#[cfg(target_os = "linux")]
-pub use hotkey::HotkeyListener;
 pub use hotkey::{chord_matches, grab_modifier_combinations, CHORD_MODIFIERS};
+#[cfg(target_os = "linux")]
+pub use hotkey::{HotkeyHealth, HotkeyListener};
 #[cfg(target_os = "macos")]
 pub use macos::MacOsBody;
 pub use mock::{Fault, MockBody, MockEvent, MockOracle, MockWindow};

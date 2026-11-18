@@ -18,11 +18,25 @@
 //! terminal for the actor: the caller builds a fresh actor
 //! for a fresh body.
 //!
+//! Unknown outcomes (F4-14): a timeout, a dead thread, or a
+//! panicking body reports [`BodyError::UnknownOutcome`], never
+//! a generic backend error — the action may or may not have
+//! executed, and the caller must not retry automatically. A
+//! panicking body ALSO breaks the actor and ends the loop: the
+//! body's state after a panic is unknown, and serving more
+//! requests against it would be guessing.
+//!
 //! Stop integration: the actor checks the shared [`StopFlag`]
 //! before executing each action. A tripped flag refuses the
 //! action with a typed error and never touches the body.
+//!
+//! Target probes (F4-07): [`BodyActor::probe_target`] asks the
+//! body, through the same serialized channel, for the window
+//! identity and re-verify snapshot under a point — so the
+//! approver's snapshot and the action's execution can never
+//! interleave with another action.
 
-use mimint_body::{ActOutcome, Action, Body, BodyError, StopFlag};
+use mimint_body::{ActOutcome, Action, Body, BodyError, StopFlag, TargetProbe};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -31,18 +45,32 @@ use std::time::Duration;
 /// bounded. A body that cannot answer in 30s is wedged.
 pub const DEFAULT_ACTION_TIMEOUT: Duration = Duration::from_secs(30);
 
-type Reply = Result<ActOutcome, BodyError>;
+/// What the actor thread can be asked to do. Actions and probes
+/// share one channel, so a probe can never run concurrently
+/// with an action against the same body.
+enum RequestKind {
+    Act(Action),
+    ProbeTarget { x: i32, y: i32 },
+}
+
+/// A reply from the actor thread, matching the request kind.
+enum RequestReply {
+    Action(Result<ActOutcome, BodyError>),
+    ProbeTarget(Result<TargetProbe, BodyError>),
+}
 
 struct Request {
-    action: Action,
-    reply: Sender<Reply>,
+    kind: RequestKind,
+    reply: Sender<RequestReply>,
 }
 
 struct ActorInner {
     tx: Sender<Request>,
-    /// Set once a request times out (or the thread dies): all
-    /// later requests fail fast without touching the channel.
-    broken: Mutex<bool>,
+    /// Set once a request times out, the thread dies, or the
+    /// body panics: all later requests fail fast without
+    /// touching the channel. Shared with the loop thread so a
+    /// panic inside the loop breaks the actor too.
+    broken: Arc<Mutex<bool>>,
 }
 
 /// A body behind a dedicated thread, with a per-action timeout.
@@ -67,13 +95,12 @@ impl BodyActor {
         timeout: Duration,
     ) -> BodyActor {
         let (tx, rx) = channel::<Request>();
+        let broken = Arc::new(Mutex::new(false));
         let thread_stop = Arc::clone(&stop);
-        std::thread::spawn(move || actor_loop(body, rx, thread_stop));
+        let thread_broken = Arc::clone(&broken);
+        std::thread::spawn(move || actor_loop(body, rx, thread_stop, thread_broken));
         BodyActor {
-            inner: Arc::new(ActorInner {
-                tx,
-                broken: Mutex::new(false),
-            }),
+            inner: Arc::new(ActorInner { tx, broken }),
             stop,
             timeout,
         }
@@ -81,23 +108,102 @@ impl BodyActor {
 
     /// Execute one action, bounded by the per-action timeout.
     /// A tripped stop flag refuses before the body is touched.
+    /// A timeout or a dead thread reports `UnknownOutcome`:
+    /// the action may have executed, and must not be retried.
     pub fn act(&self, action: Action) -> Result<ActOutcome, BodyError> {
         if self.stop.is_tripped() {
             return Err(BodyError::Backend(
                 "emergency stop is latched; the body refuses all actions".to_string(),
             ));
         }
-        if *self.inner.broken.lock().unwrap_or_else(|p| p.into_inner()) {
+        if self.is_broken() {
             return Err(BodyError::Backend(
                 "body actor is broken (a previous action timed out); rebuild the actor".to_string(),
             ));
         }
-        let (reply_tx, reply_rx) = channel::<Reply>();
+        let (reply_tx, reply_rx) = channel::<RequestReply>();
         if self
             .inner
             .tx
             .send(Request {
-                action,
+                kind: RequestKind::Act(action),
+                reply: reply_tx,
+            })
+            .is_err()
+        {
+            // The thread is gone BEFORE receiving: the action
+            // never started, so this is a known non-execution,
+            // not an unknown outcome.
+            self.mark_broken();
+            return Err(BodyError::Backend("body actor thread is gone".to_string()));
+        }
+        match reply_rx.recv_timeout(self.timeout) {
+            Ok(RequestReply::Action(outcome)) => outcome,
+            Ok(RequestReply::ProbeTarget(_)) => {
+                self.mark_broken();
+                Err(BodyError::Backend(
+                    "body actor replied with the wrong kind; actor marked broken".to_string(),
+                ))
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                self.mark_broken();
+                Err(BodyError::UnknownOutcome {
+                    reason: format!(
+                        "body action timed out after {:?}; it may or may not have executed, and the actor is marked broken",
+                        self.timeout
+                    ),
+                })
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                self.mark_broken();
+                Err(BodyError::UnknownOutcome {
+                    reason: "body actor thread died while executing; the action may or may not have executed".to_string(),
+                })
+            }
+        }
+    }
+
+    /// Probe the target at (`x`, `y`): the window identity and
+    /// re-verify snapshot, taken in the actor's serialized
+    /// order. A tripped stop or a broken actor fails with a
+    /// backend error (a probe is a read: nothing may have
+    /// executed, so no `UnknownOutcome`).
+    ///
+    /// A probe TIMEOUT does NOT break the actor, unlike an
+    /// action timeout: a probe changes no state, so the late
+    /// reply is dropped harmlessly and the loop keeps serving
+    /// (the next action gets its own verdict). Only a dead
+    /// thread breaks the actor on the probe path.
+    pub fn probe_target(&self, x: i32, y: i32) -> Result<TargetProbe, BodyError> {
+        self.probe_target_with_timeout(x, y, self.timeout)
+    }
+
+    /// Like [`BodyActor::probe_target`], with an explicit wait
+    /// bound. The approval card uses a short bound (a snapshot
+    /// must never delay the card): on timeout the caller simply
+    /// proceeds without a snapshot.
+    pub fn probe_target_with_timeout(
+        &self,
+        x: i32,
+        y: i32,
+        timeout: Duration,
+    ) -> Result<TargetProbe, BodyError> {
+        if self.stop.is_tripped() {
+            return Err(BodyError::Backend(
+                "emergency stop is latched; the body refuses all actions".to_string(),
+            ));
+        }
+        if self.is_broken() {
+            return Err(BodyError::Backend(
+                "body actor is broken (a previous action timed out); rebuild the actor".to_string(),
+            ));
+        }
+        let (reply_tx, reply_rx) = channel::<RequestReply>();
+        if self
+            .inner
+            .tx
+            .send(Request {
+                kind: RequestKind::ProbeTarget { x, y },
                 reply: reply_tx,
             })
             .is_err()
@@ -105,19 +211,26 @@ impl BodyActor {
             self.mark_broken();
             return Err(BodyError::Backend("body actor thread is gone".to_string()));
         }
-        match reply_rx.recv_timeout(self.timeout) {
-            Ok(outcome) => outcome,
-            Err(RecvTimeoutError::Timeout) => {
+        match reply_rx.recv_timeout(timeout) {
+            Ok(RequestReply::ProbeTarget(result)) => result,
+            Ok(RequestReply::Action(_)) => {
                 self.mark_broken();
+                Err(BodyError::Backend(
+                    "body actor replied with the wrong kind; actor marked broken".to_string(),
+                ))
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                // No mark_broken: the probe is a read, the
+                // late reply is dropped, the loop keeps
+                // serving. See `probe_target`.
                 Err(BodyError::Backend(format!(
-                    "body action timed out after {:?}; actor marked broken",
-                    self.timeout
+                    "body target probe timed out after {timeout:?}; no snapshot taken"
                 )))
             }
             Err(RecvTimeoutError::Disconnected) => {
                 self.mark_broken();
                 Err(BodyError::Backend(
-                    "body actor thread died while executing".to_string(),
+                    "body actor thread died while probing".to_string(),
                 ))
             }
         }
@@ -148,33 +261,67 @@ impl Clone for BodyActor {
     }
 }
 
-fn actor_loop(mut body: Box<dyn Body>, rx: Receiver<Request>, stop: Arc<StopFlag>) {
+fn actor_loop(
+    mut body: Box<dyn Body>,
+    rx: Receiver<Request>,
+    stop: Arc<StopFlag>,
+    broken: Arc<Mutex<bool>>,
+) {
     for request in rx {
         if stop.is_tripped() {
-            let _ = request.reply.send(Err(BodyError::Backend(
-                "emergency stop is latched; the body refuses all actions".to_string(),
-            )));
+            let reply = match request.kind {
+                RequestKind::Act(_) => RequestReply::Action(Err(BodyError::Backend(
+                    "emergency stop is latched; the body refuses all actions".to_string(),
+                ))),
+                RequestKind::ProbeTarget { .. } => {
+                    RequestReply::ProbeTarget(Err(BodyError::Backend(
+                        "emergency stop is latched; the body refuses all actions".to_string(),
+                    )))
+                }
+            };
+            let _ = request.reply.send(reply);
             continue;
         }
-        // A panicking body must not kill the loop silently: catch
-        // the panic, report it as a backend error, and keep the
-        // thread alive for the next request. (A body that panics
-        // repeatedly is the caller's problem to notice via the
-        // errors; the actor does not guess at body state.)
+        // A panicking body must not kill the loop silently — and
+        // must not keep serving either: the body's state after a
+        // panic is unknown. Catch the panic, report it as
+        // `UnknownOutcome` (the action may have partially
+        // executed), mark the actor broken, and end the loop.
         let outcome =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body.act(&request.action)));
-        let reply = match outcome {
-            Ok(result) => result,
-            Err(_) => Err(BodyError::Backend(
-                "body panicked while executing the action".to_string(),
-            )),
-        };
-        if request.reply.send(reply).is_err() {
-            // The requester went away (timed out): the loop keeps
-            // running — the NEXT request will still be served if
-            // the caller builds a fresh actor... but this actor
-            // is marked broken on the caller side, so in practice
-            // the loop idles until the channel closes.
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match request.kind {
+                RequestKind::Act(ref action) => RequestReply::Action(body.act(action)),
+                RequestKind::ProbeTarget { x, y } => {
+                    let identity = body.window_at(x, y);
+                    let snapshot = body.snapshot_target(x, y);
+                    RequestReply::ProbeTarget(Ok(TargetProbe { identity, snapshot }))
+                }
+            }));
+        match outcome {
+            Ok(reply) => {
+                if request.reply.send(reply).is_err() {
+                    // The requester went away (timed out): the
+                    // loop keeps running — the NEXT request will
+                    // still be served if the caller builds a
+                    // fresh actor... but this actor is marked
+                    // broken on the caller side, so in practice
+                    // the loop idles until the channel closes.
+                }
+            }
+            Err(_) => {
+                *broken.lock().unwrap_or_else(|p| p.into_inner()) = true;
+                let reply = match request.kind {
+                    RequestKind::Act(_) => RequestReply::Action(Err(BodyError::UnknownOutcome {
+                        reason: "body panicked while executing the action; the action may have partially executed".to_string(),
+                    })),
+                    RequestKind::ProbeTarget { .. } => {
+                        RequestReply::ProbeTarget(Err(BodyError::Backend(
+                            "body panicked while probing the target".to_string(),
+                        )))
+                    }
+                };
+                let _ = request.reply.send(reply);
+                break;
+            }
         }
     }
 }
@@ -328,6 +475,7 @@ mod tests {
             Duration::from_millis(100),
         );
         let err = actor.act(Action::Screenshot).unwrap_err();
+        assert_eq!(err.code(), "unknown_outcome");
         assert!(err.message().contains("timed out"), "{}", err.message());
         assert!(actor.is_broken());
         // Fail-fast: the second call returns immediately.
@@ -335,6 +483,161 @@ mod tests {
         let err = actor.act(Action::Click { x: 1, y: 1 }).unwrap_err();
         assert!(start.elapsed() < Duration::from_secs(1));
         assert!(err.message().contains("broken"));
+    }
+
+    #[test]
+    fn hanging_body_reports_unknown_outcome_and_breaks_the_actor() {
+        use mimint_body::Fault;
+        let body = MockBody::with_fault(Fault::Hang);
+        let actor = BodyActor::spawn_with_timeout(
+            Box::new(body),
+            StopFlag::new(),
+            Duration::from_millis(100),
+        );
+        let err = actor.act(Action::Click { x: 10, y: 10 }).unwrap_err();
+        assert_eq!(err.code(), "unknown_outcome");
+        assert!(actor.is_broken());
+    }
+
+    #[test]
+    fn panicking_body_reports_unknown_outcome_and_breaks_the_actor() {
+        struct PanicBody;
+        impl Body for PanicBody {
+            fn name(&self) -> &'static str {
+                "panic"
+            }
+            fn display_size(&mut self) -> Result<(u32, u32), BodyError> {
+                Ok((800, 600))
+            }
+            fn screenshot(&mut self) -> Result<mimint_body::Framebuffer, BodyError> {
+                Ok(mimint_body::Framebuffer::new(2, 2, vec![0u8; 16]).unwrap())
+            }
+            fn click(&mut self, _x: i32, _y: i32) -> Result<(), BodyError> {
+                panic!("injected body panic");
+            }
+            fn mouse_move(&mut self, _x: i32, _y: i32) -> Result<(), BodyError> {
+                Ok(())
+            }
+            fn type_text(&mut self, _text: &str) -> Result<(), BodyError> {
+                Ok(())
+            }
+            fn key(&mut self, _key: mimint_body::Key) -> Result<(), BodyError> {
+                Ok(())
+            }
+            fn permissions(&mut self) -> mimint_body::Permissions {
+                mimint_body::Permissions {
+                    screen_capture: mimint_body::PermissionState::Granted,
+                    input_control: mimint_body::PermissionState::Granted,
+                }
+            }
+        }
+        let actor = BodyActor::spawn(Box::new(PanicBody), StopFlag::new());
+        let err = actor.act(Action::Click { x: 10, y: 10 }).unwrap_err();
+        assert_eq!(err.code(), "unknown_outcome");
+        assert!(err.message().contains("panicked"), "{}", err.message());
+        assert!(actor.is_broken(), "a panic breaks the actor");
+        // Fail-fast afterwards: the loop ended, no more work.
+        let err = actor.act(Action::Click { x: 10, y: 10 }).unwrap_err();
+        assert!(err.message().contains("broken"));
+    }
+
+    #[test]
+    fn probe_target_returns_identity_and_snapshot_from_the_mock() {
+        use mimint_body::{MockWindow, ScreenRect};
+        let body = MockBody::new();
+        body.set_windows(vec![MockWindow::new(
+            7,
+            ScreenRect::new(100, 100, 200, 200),
+        )
+        .with_class("editor")
+        .with_fill((200, 40, 40))]);
+        let actor = BodyActor::spawn(Box::new(body), StopFlag::new());
+        let probe = actor.probe_target(150, 150).unwrap();
+        let identity = probe.identity.unwrap();
+        assert_eq!(identity.window_id, Some(7));
+        assert_eq!(identity.class.as_deref(), Some("editor"));
+        let snapshot = probe.snapshot.unwrap();
+        assert_eq!(snapshot.window_id, Some(7));
+        // Outside every window: no identity, but the snapshot
+        // still describes the pixels under the point.
+        let probe = actor.probe_target(10, 10).unwrap();
+        assert!(probe.identity.is_none());
+        assert!(probe.snapshot.is_some());
+    }
+
+    #[test]
+    fn probe_target_on_a_body_without_windows_reports_none() {
+        let actor = actor_with_mock();
+        let probe = actor.probe_target(10, 10).unwrap();
+        assert!(probe.identity.is_none(), "no windows scripted");
+        assert!(probe.snapshot.is_some(), "the mock always snapshots");
+    }
+
+    #[test]
+    fn probe_timeout_does_not_break_the_actor() {
+        use mimint_body::{Framebuffer, Key, Permissions};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        /// Body whose first `window_at` sleeps, then answers.
+        struct SlowProbeBody {
+            slept: AtomicBool,
+        }
+        impl mimint_body::Body for SlowProbeBody {
+            fn name(&self) -> &'static str {
+                "slow-probe"
+            }
+            fn display_size(&mut self) -> Result<(u32, u32), mimint_body::BodyError> {
+                Ok((800, 600))
+            }
+            fn screenshot(&mut self) -> Result<Framebuffer, mimint_body::BodyError> {
+                Framebuffer::new(800, 600, vec![0u8; 800 * 600 * 4])
+            }
+            fn click(&mut self, _x: i32, _y: i32) -> Result<(), mimint_body::BodyError> {
+                Ok(())
+            }
+            fn mouse_move(&mut self, _x: i32, _y: i32) -> Result<(), mimint_body::BodyError> {
+                Ok(())
+            }
+            fn type_text(&mut self, _text: &str) -> Result<(), mimint_body::BodyError> {
+                Ok(())
+            }
+            fn key(&mut self, _key: Key) -> Result<(), mimint_body::BodyError> {
+                Ok(())
+            }
+            fn permissions(&mut self) -> Permissions {
+                Permissions {
+                    screen_capture: mimint_body::PermissionState::Granted,
+                    input_control: mimint_body::PermissionState::Granted,
+                }
+            }
+            fn window_at(&mut self, _x: i32, _y: i32) -> Option<mimint_body::WindowIdentity> {
+                if !self.slept.swap(true, Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(300));
+                }
+                None
+            }
+        }
+        let actor = BodyActor::spawn(
+            Box::new(SlowProbeBody {
+                slept: AtomicBool::new(false),
+            }),
+            StopFlag::new(),
+        );
+        // The first probe times out on the short bound...
+        let err = actor
+            .probe_target_with_timeout(10, 10, Duration::from_millis(50))
+            .unwrap_err();
+        assert_eq!(err.code(), "backend");
+        assert!(err.message().contains("timed out"), "{}", err.message());
+        assert!(
+            !actor.is_broken(),
+            "a probe timeout must not break the actor"
+        );
+        // ...and the actor keeps serving: the next probe,
+        // with a patient bound, succeeds.
+        let probe = actor
+            .probe_target_with_timeout(10, 10, Duration::from_secs(5))
+            .unwrap();
+        assert!(probe.identity.is_none());
     }
 
     #[test]

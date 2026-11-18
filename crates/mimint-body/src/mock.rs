@@ -810,6 +810,16 @@ impl Body for MockBody {
     }
 }
 
+impl MockOracle {
+    /// Script the windows on the shared mock display (same
+    /// stacking order as [`MockBody::set_windows`]). Lets a
+    /// test change the world underneath a body that is owned
+    /// by an actor thread — the TOCTOU simulation.
+    pub fn set_windows(&self, windows: Vec<MockWindow>) {
+        lock_state(&self.state).windows = windows;
+    }
+}
+
 impl TargetOracle for MockOracle {
     fn received_clicks(&mut self) -> Vec<(i32, i32)> {
         self.state

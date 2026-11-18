@@ -103,6 +103,34 @@ impl FrameStore {
             .map(|stored| stored.meta.clone())
     }
 
+    /// Id of the newest stored frame, or `None` when the store
+    /// is empty. Purged ids never resurface: the max is taken
+    /// over frames actually present.
+    pub fn latest_id(&self) -> Option<u64> {
+        self.frames
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .keys()
+            .max()
+            .copied()
+    }
+
+    /// Age of the newest stored frame, or `None` when the store
+    /// is empty. The observation age the approval card warns
+    /// about and the TTL rule refuses on.
+    pub fn latest_age(&self) -> Option<std::time::Duration> {
+        let id = self.latest_id()?;
+        self.with_frame(id, |frame| frame.age())
+    }
+
+    /// True when the newest observation is older than
+    /// `max_age`. An empty store is NOT stale: with no
+    /// observation at all (explicit coordinates, first action),
+    /// there is nothing stale to refuse on.
+    pub fn observation_stale(&self, max_age: std::time::Duration) -> bool {
+        self.latest_age().is_some_and(|age| age > max_age)
+    }
+
     /// Number of frames currently stored.
     pub fn len(&self) -> usize {
         self.frames.lock().unwrap_or_else(|p| p.into_inner()).len()
@@ -227,6 +255,25 @@ mod tests {
         store.store(test_frame(), false);
         assert_eq!(store.purge_all(), 2);
         assert!(store.is_empty());
+    }
+
+    #[test]
+    fn latest_age_and_staleness_follow_the_newest_frame() {
+        use std::time::{Duration, Instant};
+        let store = FrameStore::new();
+        assert!(store.latest_id().is_none());
+        assert!(store.latest_age().is_none());
+        assert!(!store.observation_stale(Duration::from_secs(300)));
+        let old = test_frame().with_captured_at(Instant::now() - Duration::from_secs(400));
+        store.store(old, false);
+        assert_eq!(store.latest_id(), Some(1));
+        assert!(store.latest_age().unwrap() >= Duration::from_secs(400));
+        assert!(store.observation_stale(Duration::from_secs(300)));
+        assert!(!store.observation_stale(Duration::from_secs(500)));
+        // A fresh frame replaces the stale observation.
+        store.store(test_frame(), false);
+        assert_eq!(store.latest_id(), Some(2));
+        assert!(!store.observation_stale(Duration::from_secs(300)));
     }
 
     #[test]
