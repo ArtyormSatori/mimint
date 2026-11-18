@@ -290,15 +290,11 @@ impl MacOsBody {
     /// assumption until the Mac package verifies it empirically
     /// (CHECKLIST.md): no Mac run has confirmed it yet.
     fn post_scroll(&self, dx: i32, dy: i32) -> Result<(), BodyError> {
-        let event = CGEvent::new_scroll_event(
-            Self::event_source()?,
-            ScrollEventUnit::LINE,
-            2,
-            -dy,
-            -dx,
-            0,
-        )
-        .map_err(|_| BodyError::Backend("CGEventCreateScrollWheelEvent failed".to_string()))?;
+        let event =
+            CGEvent::new_scroll_event(Self::event_source()?, ScrollEventUnit::LINE, 2, -dy, -dx, 0)
+                .map_err(|_| {
+                    BodyError::Backend("CGEventCreateScrollWheelEvent failed".to_string())
+                })?;
         event.post(CGEventTapLocation::HID);
         Ok(())
     }
