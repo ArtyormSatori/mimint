@@ -10,9 +10,12 @@
 //!   written to any log or file. Logs record only key presence.
 //! - No default model: the caller must always supply one.
 
+use crate::agents::AGENT_DEFAULT;
 use crate::audit::AuditLog;
+use crate::cancel::CancelToken;
 use crate::egress::{url_is_loopback, GuardedHttpClient};
 use crate::error::MimintError;
+use crate::ledger::{CostLedger, TokenUsage, DEFAULT_MAX_TOKENS};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::future::Future;
@@ -36,17 +39,18 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// - `deadline`: an outer wall-clock bound the caller may set. The
 ///   fallback chain honors the earlier of this deadline and its own
 ///   per-call `max_elapsed` budget. `None` means "no outer bound".
-///
-/// Cancellation (turn cancel / emergency stop) is NOT plumbed
-/// through providers: there is no cancel token in this struct on
-/// purpose, rather than a fake one. Tokens live in the brain loop
-/// and the guard executor ([`CancelToken`]), which check them
-/// between steps and immediately before a tool executes. An HTTP
-/// request already in flight is NOT interrupted; it is bounded by
-/// the per-request timeout baked into each provider's guarded HTTP
-/// client. See `docs/stop-and-approval.md`.
-///
-/// [`CancelToken`]: crate::cancel::CancelToken
+/// - `agent_id`: the agent making the call (Phase 6, §1.3); audit
+///   and ledger records are attributed to it.
+/// - `ledger`: the token cost ledger (Phase 6, §3.3). When attached,
+///   the fallback chain reserves before each attempt and settles
+///   after it. `None` means "no ledgering" (legacy callers).
+/// - `max_tokens`: the reserve basis for one attempt (default 4096).
+/// - `cancel_tokens`: checked by the fallback chain between attempts
+///   and during backoff sleeps (Phase 6, §10). An HTTP request
+///   already in flight is NOT interrupted by these tokens; it is
+///   interrupted by dropping the chat future (the brain races the
+///   call against a cancel waiter in a `select!`). See
+///   `docs/stop-and-approval.md`.
 ///
 /// No `Debug`: `AuditLog` deliberately has none (its path could leak
 /// into debug output), and a context carrying it must not either.
@@ -58,6 +62,14 @@ pub struct CallContext<'a> {
     /// Active profile name (Phase 5, P5.5), tagged onto the
     /// fallback chain's audit records. `None` means untagged.
     pub profile: Option<&'a str>,
+    /// The agent making the call. Defaults to the default agent.
+    pub agent_id: &'a str,
+    /// Token cost ledger, when attached.
+    pub ledger: Option<&'a CostLedger>,
+    /// Reserve basis for one attempt, in tokens.
+    pub max_tokens: u32,
+    /// Cancel tokens checked between attempts and in backoff.
+    pub cancel_tokens: &'a [CancelToken],
 }
 
 impl<'a> CallContext<'a> {
@@ -69,6 +81,10 @@ impl<'a> CallContext<'a> {
             audit,
             deadline: None,
             profile: None,
+            agent_id: AGENT_DEFAULT,
+            ledger: None,
+            max_tokens: DEFAULT_MAX_TOKENS,
+            cancel_tokens: &[],
         }
     }
 
@@ -80,6 +96,10 @@ impl<'a> CallContext<'a> {
             audit,
             deadline: Some(deadline),
             profile: None,
+            agent_id: AGENT_DEFAULT,
+            ledger: None,
+            max_tokens: DEFAULT_MAX_TOKENS,
+            cancel_tokens: &[],
         }
     }
 
@@ -87,6 +107,35 @@ impl<'a> CallContext<'a> {
     pub fn with_profile(mut self, profile: &'a str) -> Self {
         self.profile = Some(profile);
         self
+    }
+
+    /// Context attributed to one agent.
+    pub fn with_agent_id(mut self, agent_id: &'a str) -> Self {
+        self.agent_id = agent_id;
+        self
+    }
+
+    /// Context with a token cost ledger attached.
+    pub fn with_ledger(mut self, ledger: &'a CostLedger) -> Self {
+        self.ledger = Some(ledger);
+        self
+    }
+
+    /// Context with a reserve basis for each attempt.
+    pub fn with_max_tokens(mut self, max_tokens: u32) -> Self {
+        self.max_tokens = max_tokens;
+        self
+    }
+
+    /// Context with cancel tokens for between-attempt checks.
+    pub fn with_cancel_tokens(mut self, tokens: &'a [CancelToken]) -> Self {
+        self.cancel_tokens = tokens;
+        self
+    }
+
+    /// True when any attached cancel token is cancelled.
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel_tokens.iter().any(|t| t.is_cancelled())
     }
 }
 
@@ -103,6 +152,13 @@ pub struct ChatMessage {
     pub tool_calls: Option<Vec<ToolCall>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// Token usage parsed from the provider response (Phase 6,
+    /// §3.3). `None` for request messages and for responses that
+    /// carried no usable usage block. Never serialized into a
+    /// request: providers strip it at the boundary by
+    /// construction (it is skipped when serializing).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<TokenUsage>,
 }
 
 impl ChatMessage {
@@ -113,6 +169,7 @@ impl ChatMessage {
             content: Some(content.into()),
             tool_calls: None,
             tool_call_id: None,
+            usage: None,
         }
     }
 
@@ -123,6 +180,7 @@ impl ChatMessage {
             content: Some(content.into()),
             tool_calls: None,
             tool_call_id: None,
+            usage: None,
         }
     }
 
@@ -133,6 +191,7 @@ impl ChatMessage {
             content: Some(content.into()),
             tool_calls: None,
             tool_call_id: Some(tool_call_id.into()),
+            usage: None,
         }
     }
 }
@@ -317,6 +376,28 @@ pub(crate) fn extract_error_message(body: &str) -> String {
 #[derive(Debug, Deserialize)]
 struct ChatCompletionResponse {
     choices: Vec<Choice>,
+    /// OpenAI-style usage block, when the provider sends one.
+    /// Both fields must be present for the usage to count.
+    #[serde(default)]
+    usage: Option<OpenAiUsage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiUsage {
+    prompt_tokens: Option<u64>,
+    completion_tokens: Option<u64>,
+}
+
+impl OpenAiUsage {
+    fn to_token_usage(&self) -> Option<TokenUsage> {
+        match (self.prompt_tokens, self.completion_tokens) {
+            (Some(prompt_tokens), Some(completion_tokens)) => Some(TokenUsage {
+                prompt_tokens,
+                completion_tokens,
+            }),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -483,6 +564,11 @@ impl ProviderClient {
             .next()
             .map(|choice| choice.message)
             .ok_or_else(|| MimintError::Provider("provider returned no choices".to_string()))?;
+        // Token usage (§3.3): attached to the message so the
+        // fallback chain can settle the attempt's reserve with
+        // measured usage. Absent or partial usage stays `None` —
+        // the chain then settles the reserve as an estimate.
+        message.usage = parsed.usage.and_then(|usage| usage.to_token_usage());
         // Normalize tool-call arguments at intake so the history never
         // carries a value that breaks a later provider (see
         // `normalize_tool_call_args`).

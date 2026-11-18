@@ -134,6 +134,7 @@ mod gate {
                     },
                 }]),
                 tool_call_id: None,
+                usage: None,
             };
             let click = ChatMessage {
                 role: "assistant".to_string(),
@@ -147,12 +148,14 @@ mod gate {
                     },
                 }]),
                 tool_call_id: None,
+                usage: None,
             };
             let done = ChatMessage {
                 role: "assistant".to_string(),
                 content: Some("Clicked.".to_string()),
                 tool_calls: None,
                 tool_call_id: None,
+                usage: None,
             };
             StubProvider {
                 replies: Mutex::new(VecDeque::from([screenshot, click, done])),
@@ -193,6 +196,7 @@ mod gate {
                     content: Some("Done.".to_string()),
                     tool_calls: None,
                     tool_call_id: None,
+                    usage: None,
                 });
             Box::pin(async move { Ok(message) })
         }
@@ -387,8 +391,10 @@ mod gate {
             Notebook::open(args.workdir.join("golden.db"))
                 .map_err(|err| format!("cannot open notebook: {err}"))?,
         );
-        let audit = AuditLog::open(args.workdir.join("golden-audit.jsonl"))
-            .map_err(|err| format!("cannot open audit: {err}"))?;
+        let audit = Arc::new(
+            AuditLog::open(args.workdir.join("golden-audit.jsonl"))
+                .map_err(|err| format!("cannot open audit: {err}"))?,
+        );
 
         let mut log_file = std::fs::File::create(&args.log_path)
             .map_err(|err| format!("cannot create log: {err}"))?;
@@ -405,15 +411,15 @@ mod gate {
                 return Err(format!("unknown task: {task_id}"));
             };
             let point = box_center(task.box_);
-            let provider = StubProvider::for_task(point);
+            let provider = Arc::new(StubProvider::for_task(point));
             let record = run_one_task(
                 task,
                 "stub",
-                &provider,
+                provider,
                 &actor,
                 &frames,
                 &notebook,
-                &audit,
+                Arc::clone(&audit),
                 &mut oracle,
                 &canvas_version,
                 &font,
@@ -440,17 +446,19 @@ mod gate {
                 Duration::from_secs(args.ollama_timeout_secs),
             )
             .map_err(|err| format!("cannot build HTTP client: {err}"))?;
-            let provider = ProviderClient::new(&args.base_url, &args.model, None, http)
-                .map_err(|err| format!("cannot build Ollama provider: {err}"))?;
+            let provider = Arc::new(
+                ProviderClient::new(&args.base_url, &args.model, None, http)
+                    .map_err(|err| format!("cannot build Ollama provider: {err}"))?,
+            );
             let prompt = ollama_prompt(task);
             let mut record = run_one_task(
                 task,
                 &format!("ollama:{}", args.model),
-                &provider,
+                provider,
                 &actor,
                 &frames,
                 &notebook,
-                &audit,
+                Arc::clone(&audit),
                 &mut oracle,
                 &canvas_version,
                 &font,
@@ -496,11 +504,11 @@ mod gate {
     async fn run_one_task(
         task: &GoldenTask,
         provider_name: &str,
-        provider: &dyn Provider,
+        provider: Arc<dyn Provider>,
         actor: &BodyActor,
         frames: &Arc<FrameStore>,
         notebook: &Arc<Notebook>,
-        audit: &AuditLog,
+        audit: Arc<AuditLog>,
         oracle: &mut FileOracle,
         canvas_version: &str,
         font: &str,
@@ -516,14 +524,16 @@ mod gate {
             Arc::clone(frames),
             PrivacyFlag::new(false),
         );
-        let approver = AutoAllow;
+        let approver = Arc::new(AutoAllow);
+        let registry = Arc::new(registry);
         let mut brain = match Brain::new(
             provider,
-            &registry,
-            Some(&approver),
-            audit,
+            registry,
+            Some(approver),
+            Arc::clone(&audit),
             Arc::clone(notebook),
             format!("golden-{}", task.id),
+            "agent-001",
             6,
         ) {
             Ok(brain) => brain,

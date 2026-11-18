@@ -759,23 +759,24 @@ pub struct TaskRun {
 /// can give each (variant, task) pair its own notebook: sharing
 /// one would let one variant's notes satisfy another's checkers.
 pub async fn run_one_task_detailed(
-    provider: &dyn Provider,
+    provider: Arc<dyn Provider>,
     system_prompt: &str,
     task: &ValidationTask,
     notebook: Arc<Notebook>,
-    audit: &AuditLog,
+    audit: Arc<AuditLog>,
     turn_id: &str,
     max_steps: usize,
 ) -> Result<TaskRun, MimintError> {
-    let registry = crate::tools::default_registry(Arc::clone(&notebook));
-    let approver = ValidationApprover;
+    let registry = Arc::new(crate::tools::default_registry(Arc::clone(&notebook)));
+    let approver = Arc::new(ValidationApprover);
     let mut brain = Brain::new(
         provider,
-        &registry,
-        Some(&approver),
-        audit,
+        registry,
+        Some(approver),
+        Arc::clone(&audit),
         Arc::clone(&notebook),
         turn_id.to_string(),
+        "agent-001",
         max_steps,
     )?;
     brain.set_system_prompt(system_prompt.to_string());
@@ -821,11 +822,11 @@ pub async fn run_one_task_detailed(
 /// checker, returning only the verdict. See
 /// [`run_one_task_detailed`] for the full run.
 pub async fn run_one_task(
-    provider: &dyn Provider,
+    provider: Arc<dyn Provider>,
     system_prompt: &str,
     task: &ValidationTask,
     notebook: Arc<Notebook>,
-    audit: &AuditLog,
+    audit: Arc<AuditLog>,
     turn_id: &str,
     max_steps: usize,
 ) -> Result<TaskResult, MimintError> {
@@ -859,11 +860,11 @@ pub async fn run_one_task(
 /// and callers must not record a run from them.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_validation_tasks(
-    provider: &dyn Provider,
+    provider: Arc<dyn Provider>,
     system_prompt: &str,
     tasks: &[ValidationTask],
     notebook: Arc<Notebook>,
-    audit: &AuditLog,
+    audit: Arc<AuditLog>,
     turn_prefix: &str,
     max_steps: usize,
     deadline: Option<std::time::Instant>,
@@ -881,11 +882,11 @@ pub async fn run_validation_tasks(
         let turn_id = format!("{turn_prefix}-{}", task.id);
         results.push(
             run_one_task(
-                provider,
+                Arc::clone(&provider),
                 system_prompt,
                 task,
                 Arc::clone(&notebook),
-                audit,
+                Arc::clone(&audit),
                 &turn_id,
                 max_steps,
             )
@@ -918,10 +919,10 @@ pub async fn run_validation_tasks(
 #[allow(clippy::too_many_arguments)]
 pub async fn validate_skill(
     store: &SkillStore,
-    provider: &dyn Provider,
+    provider: Arc<dyn Provider>,
     name: &str,
     notebook: Arc<Notebook>,
-    audit: &AuditLog,
+    audit: Arc<AuditLog>,
     turn_prefix: &str,
     max_steps: usize,
     time_budget: Option<std::time::Duration>,
@@ -989,7 +990,7 @@ pub async fn validate_skill(
         &system_prompt,
         &def.validation_tasks,
         notebook,
-        audit,
+        Arc::clone(&audit),
         turn_prefix,
         max_steps,
         deadline,
@@ -1668,6 +1669,7 @@ mod tests {
                     content: Some("Done.".to_string()),
                     tool_calls: None,
                     tool_call_id: None,
+                    usage: None,
                 });
             Box::pin(async move { Ok(message) })
         }
@@ -1686,6 +1688,7 @@ mod tests {
                 },
             }]),
             tool_call_id: None,
+            usage: None,
         }
     }
 
@@ -1695,6 +1698,7 @@ mod tests {
             content: Some(text.to_string()),
             tool_calls: None,
             tool_call_id: None,
+            usage: None,
         }
     }
 
@@ -1712,12 +1716,14 @@ mod tests {
                 text_message("Saved."),
             ])),
         };
+        let provider = Arc::new(provider);
+        let audit = Arc::new(audit);
         let def = validate_skill(
             &store,
-            &provider,
+            Arc::clone(&provider) as Arc<dyn Provider>,
             "notes",
             Arc::clone(&notebook),
-            &audit,
+            Arc::clone(&audit),
             "val-1",
             3,
             None,
@@ -1742,12 +1748,14 @@ mod tests {
                 "I will not call tools.",
             )])),
         };
+        let provider = Arc::new(provider);
+        let audit = Arc::new(audit);
         let def = validate_skill(
             &store,
-            &provider,
+            Arc::clone(&provider) as Arc<dyn Provider>,
             "failing",
             Arc::clone(&notebook),
-            &audit,
+            Arc::clone(&audit),
             "val-2",
             3,
             None,
@@ -1811,12 +1819,14 @@ mod tests {
         let provider = CountingProvider {
             calls: std::sync::Mutex::new(0),
         };
+        let provider = Arc::new(provider);
+        let audit = Arc::new(audit);
         let def = validate_skill(
             &store,
-            &provider,
+            Arc::clone(&provider) as Arc<dyn Provider>,
             "stale-needle",
             Arc::clone(&notebook),
-            &audit,
+            Arc::clone(&audit),
             "val-probe",
             3,
             None,
@@ -1854,12 +1864,14 @@ mod tests {
             ])),
         };
         // Passing validation keeps an unapproved import a draft.
+        let provider = Arc::new(provider);
+        let audit = Arc::new(audit);
         let def = validate_skill(
             &store,
-            &provider,
+            Arc::clone(&provider) as Arc<dyn Provider>,
             "imported",
             Arc::clone(&notebook),
-            &audit,
+            Arc::clone(&audit),
             "val-import",
             3,
             None,
@@ -1900,12 +1912,14 @@ mod tests {
                 text_message("Saved."),
             ])),
         };
+        let provider = Arc::new(provider);
+        let audit = Arc::new(audit);
         let def = validate_skill(
             &store,
-            &provider,
+            Arc::clone(&provider) as Arc<dyn Provider>,
             "notes",
             Arc::clone(&notebook),
-            &audit,
+            Arc::clone(&audit),
             "val-toctou",
             3,
             None,
@@ -1941,12 +1955,14 @@ mod tests {
                 text_message("Saved."),
             ])),
         };
+        let provider = Arc::new(provider);
+        let audit = Arc::new(audit);
         let err = validate_skill(
             &store,
-            &provider,
+            Arc::clone(&provider) as Arc<dyn Provider>,
             "notes",
             Arc::clone(&notebook),
-            &audit,
+            Arc::clone(&audit),
             "val-budget",
             3,
             Some(std::time::Duration::ZERO),
@@ -1980,12 +1996,14 @@ mod tests {
                 text_message("Saved."),
             ])),
         };
+        let provider = Arc::new(provider);
+        let audit = Arc::new(audit);
         validate_skill(
             &store,
-            &provider,
+            Arc::clone(&provider) as Arc<dyn Provider>,
             "notes",
             Arc::clone(&notebook),
-            &audit,
+            Arc::clone(&audit),
             "val-1",
             3,
             None,

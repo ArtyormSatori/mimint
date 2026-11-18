@@ -97,6 +97,12 @@ pub struct Trajectory {
     /// Quarantined trajectories are never retrieved. Always
     /// false for trajectories returned by `retrieve`.
     pub quarantined: bool,
+    /// The agent whose turn produced this trajectory (Phase 6,
+    /// §3, F6D-07). Only `agent-001` commits retrievable
+    /// trajectories; every other agent's trajectory is stored
+    /// quarantined and never retrieved. There is no release
+    /// path in Phase 6.
+    pub agent_id: String,
     /// Recording time, milliseconds since the Unix epoch.
     pub created_ms: i64,
 }
@@ -194,7 +200,8 @@ fn truncate(text: &str, max_chars: usize) -> String {
 
 /// One row of either trajectory table: id, prompt, tools JSON,
 /// reply, failure reason (always `None` for successes), checker
-/// JSON, checker hash, skills JSON, quarantined flag, created_ms.
+/// JSON, checker hash, skills JSON, quarantined flag, agent id,
+/// created_ms.
 type StoredRow = (
     i64,
     String,
@@ -205,6 +212,7 @@ type StoredRow = (
     String,
     String,
     bool,
+    String,
     i64,
 );
 
@@ -235,7 +243,8 @@ impl ExperienceStore {
                 checker_json TEXT NOT NULL DEFAULT '',
                 checker_hash TEXT NOT NULL DEFAULT '',
                 skills_json TEXT NOT NULL DEFAULT '[]',
-                quarantined INTEGER NOT NULL DEFAULT 0
+                quarantined INTEGER NOT NULL DEFAULT 0,
+                agent_id TEXT NOT NULL DEFAULT 'agent-001'
             )",
             [],
         )?;
@@ -250,7 +259,8 @@ impl ExperienceStore {
                 checker_json TEXT NOT NULL DEFAULT '',
                 checker_hash TEXT NOT NULL DEFAULT '',
                 skills_json TEXT NOT NULL DEFAULT '[]',
-                quarantined INTEGER NOT NULL DEFAULT 0
+                quarantined INTEGER NOT NULL DEFAULT 0,
+                agent_id TEXT NOT NULL DEFAULT 'agent-001'
             )",
             [],
         )?;
@@ -259,6 +269,12 @@ impl ExperienceStore {
             Self::ensure_column(&conn, table, "checker_hash", "TEXT NOT NULL DEFAULT ''")?;
             Self::ensure_column(&conn, table, "skills_json", "TEXT NOT NULL DEFAULT '[]'")?;
             Self::ensure_column(&conn, table, "quarantined", "INTEGER NOT NULL DEFAULT 0")?;
+            Self::ensure_column(
+                &conn,
+                table,
+                "agent_id",
+                "TEXT NOT NULL DEFAULT 'agent-001'",
+            )?;
         }
         Ok(Self {
             conn: Mutex::new(conn),
@@ -293,6 +309,8 @@ impl ExperienceStore {
     /// See the module docs for the exact rules. `checker` is the
     /// binary checker for this turn, when the caller attached
     /// one; `notebook` is needed by checkers that inspect notes.
+    /// Records as the default agent; multi-agent callers use
+    /// [`Self::record_turn_for`].
     pub fn record_turn(
         &self,
         prompt: &str,
@@ -300,8 +318,33 @@ impl ExperienceStore {
         checker: Option<&Checker>,
         notebook: &Notebook,
     ) -> Result<RecordDecision, MimintError> {
+        self.record_turn_for(
+            crate::agents::AGENT_DEFAULT,
+            prompt,
+            outcome,
+            checker,
+            notebook,
+        )
+    }
+
+    /// Record a finished turn as `agent_id` (Phase 6, §3,
+    /// F6D-07). Only `agent-001` commits retrievable
+    /// trajectories: any other agent's trajectory is stored
+    /// quarantined and never retrieved, in both tables. There
+    /// is no release path in Phase 6.
+    pub fn record_turn_for(
+        &self,
+        agent_id: &str,
+        prompt: &str,
+        outcome: &TurnOutcome,
+        checker: Option<&Checker>,
+        notebook: &Notebook,
+    ) -> Result<RecordDecision, MimintError> {
+        let quarantined = agent_id != crate::agents::AGENT_DEFAULT;
         if outcome.partial {
-            return self.record_failure(
+            return self.record_failure_for(
+                agent_id,
+                quarantined,
                 prompt,
                 outcome,
                 checker,
@@ -309,7 +352,9 @@ impl ExperienceStore {
             );
         }
         if !outcome.all_verified {
-            return self.record_failure(
+            return self.record_failure_for(
+                agent_id,
+                quarantined,
                 prompt,
                 outcome,
                 checker,
@@ -328,7 +373,7 @@ impl ExperienceStore {
                 MimintError::Notebook(format!("experience store lock poisoned: {err}"))
             })?;
             conn.execute(
-                "INSERT INTO success_trajectories (prompt, tools_json, reply, created_ms, checker_json, checker_hash, skills_json, quarantined) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0)",
+                "INSERT INTO success_trajectories (prompt, tools_json, reply, created_ms, checker_json, checker_hash, skills_json, quarantined, agent_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 params![
                     truncate(prompt, MAX_STORED_PROMPT),
                     serde_json::to_string(&outcome.tools_used)
@@ -339,11 +384,15 @@ impl ExperienceStore {
                     checker_hash,
                     serde_json::to_string(&outcome.skills_used)
                         .unwrap_or_else(|_| "[]".to_string()),
+                    quarantined as i64,
+                    agent_id,
                 ],
             )?;
             Ok(RecordDecision::RecordedSuccess)
         } else {
-            self.record_failure(
+            self.record_failure_for(
+                agent_id,
+                quarantined,
                 prompt,
                 outcome,
                 Some(checker),
@@ -352,8 +401,10 @@ impl ExperienceStore {
         }
     }
 
-    fn record_failure(
+    fn record_failure_for(
         &self,
+        agent_id: &str,
+        quarantined: bool,
         prompt: &str,
         outcome: &TurnOutcome,
         checker: Option<&Checker>,
@@ -364,7 +415,7 @@ impl ExperienceStore {
             MimintError::Notebook(format!("experience store lock poisoned: {err}"))
         })?;
         conn.execute(
-            "INSERT INTO failed_trajectories (prompt, tools_json, reply, reason, created_ms, checker_json, checker_hash, skills_json, quarantined) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0)",
+            "INSERT INTO failed_trajectories (prompt, tools_json, reply, reason, created_ms, checker_json, checker_hash, skills_json, quarantined, agent_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 truncate(prompt, MAX_STORED_PROMPT),
                 serde_json::to_string(&outcome.tools_used).unwrap_or_else(|_| "[]".to_string()),
@@ -375,6 +426,8 @@ impl ExperienceStore {
                 checker_hash,
                 serde_json::to_string(&outcome.skills_used)
                     .unwrap_or_else(|_| "[]".to_string()),
+                quarantined as i64,
+                agent_id,
             ],
         )?;
         Ok(RecordDecision::RecordedFailure {
@@ -385,18 +438,33 @@ impl ExperienceStore {
     /// Record a turn that errored (provider failure, cancellation
     /// that surfaced as an error, ...). No outcome exists, so the
     /// failure carries no tools or reply, and no provenance.
+    /// Records as the default agent; see [`Self::record_error_for`].
     pub fn record_error(&self, prompt: &str, error: &str) -> Result<(), MimintError> {
+        self.record_error_for(crate::agents::AGENT_DEFAULT, prompt, error)
+    }
+
+    /// Record a turn error as `agent_id`. Non-default agents'
+    /// error trajectories are stored quarantined (§3, F6D-07).
+    pub fn record_error_for(
+        &self,
+        agent_id: &str,
+        prompt: &str,
+        error: &str,
+    ) -> Result<(), MimintError> {
+        let quarantined = agent_id != crate::agents::AGENT_DEFAULT;
         let conn = self.conn.lock().map_err(|err| {
             MimintError::Notebook(format!("experience store lock poisoned: {err}"))
         })?;
         conn.execute(
-            "INSERT INTO failed_trajectories (prompt, tools_json, reply, reason, created_ms, checker_json, checker_hash, skills_json, quarantined) VALUES (?1, ?2, ?3, ?4, ?5, '', '', '[]', 0)",
+            "INSERT INTO failed_trajectories (prompt, tools_json, reply, reason, created_ms, checker_json, checker_hash, skills_json, quarantined, agent_id) VALUES (?1, ?2, ?3, ?4, ?5, '', '', '[]', ?6, ?7)",
             params![
                 truncate(prompt, MAX_STORED_PROMPT),
                 "[]",
                 "",
                 format!("turn error: {error}"),
                 now_ms() as i64,
+                quarantined as i64,
+                agent_id,
             ],
         )?;
         Ok(())
@@ -469,9 +537,9 @@ impl ExperienceStore {
         // Quarantined trajectories are excluded HERE, at the
         // query: no retrieval path can see them again.
         let query = if with_reason {
-            format!("SELECT id, prompt, tools_json, reply, reason, checker_json, checker_hash, skills_json, quarantined, created_ms FROM {table} WHERE quarantined = 0 ORDER BY id ASC")
+            format!("SELECT id, prompt, tools_json, reply, reason, checker_json, checker_hash, skills_json, quarantined, agent_id, created_ms FROM {table} WHERE quarantined = 0 ORDER BY id ASC")
         } else {
-            format!("SELECT id, prompt, tools_json, reply, NULL, checker_json, checker_hash, skills_json, quarantined, created_ms FROM {table} WHERE quarantined = 0 ORDER BY id ASC")
+            format!("SELECT id, prompt, tools_json, reply, NULL, checker_json, checker_hash, skills_json, quarantined, agent_id, created_ms FROM {table} WHERE quarantined = 0 ORDER BY id ASC")
         };
         let mut stmt = conn.prepare(&query)?;
         let rows = stmt.query_map([], |row| {
@@ -485,7 +553,8 @@ impl ExperienceStore {
                 row.get::<_, String>(6)?,
                 row.get::<_, String>(7)?,
                 row.get::<_, i64>(8)? != 0,
-                row.get::<_, i64>(9)?,
+                row.get::<_, String>(9)?,
+                row.get::<_, i64>(10)?,
             ))
         })?;
         let mut out = Vec::new();
@@ -511,6 +580,7 @@ impl ExperienceStore {
             checker_hash,
             skills_json,
             quarantined,
+            agent_id,
             created_ms,
         ) in rows
         {
@@ -532,6 +602,7 @@ impl ExperienceStore {
                 checker_hash,
                 skills,
                 quarantined,
+                agent_id,
                 created_ms,
             });
         }
@@ -623,6 +694,9 @@ mod tests {
             verified_steps: Vec::new(),
             all_verified,
             skills_used: Vec::new(),
+            agent_id: "agent-001".to_string(),
+            step_verifications: Vec::new(),
+            verification: None,
         }
     }
 
@@ -686,6 +760,52 @@ mod tests {
         assert!(matches!(decision, RecordDecision::NotRecorded { .. }));
         assert_eq!(store.success_count().unwrap(), 1);
         assert_eq!(store.failure_count().unwrap(), 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn experience_store_agent001_only_commit() {
+        let dir = temp_dir("agent-quarantine");
+        let store = ExperienceStore::open(dir.join("exp.db")).unwrap();
+        let notebook = Notebook::open(dir.join("n.db")).unwrap();
+        let checker = Checker::Contains {
+            needle: "sữa".to_string(),
+        };
+        // agent-002's passing turn is stored — but quarantined.
+        let decision = store
+            .record_turn_for(
+                "agent-002",
+                "mua sữa",
+                &outcome("Đã mua sữa", &["notebook_add"], false, true),
+                Some(&checker),
+                &notebook,
+            )
+            .unwrap();
+        assert_eq!(decision, RecordDecision::RecordedSuccess);
+        assert_eq!(store.success_count().unwrap(), 1);
+        assert_eq!(store.quarantined_count().unwrap(), 1);
+        // Retrieval never sees it.
+        let found = store.retrieve("mua sữa").unwrap();
+        assert!(found.successes.is_empty());
+        assert!(found.failures.is_empty());
+        // agent-001's identical turn is retrievable.
+        store
+            .record_turn_for(
+                "agent-001",
+                "mua sữa",
+                &outcome("Đã mua sữa", &["notebook_add"], false, true),
+                Some(&checker),
+                &notebook,
+            )
+            .unwrap();
+        let found = store.retrieve("mua sữa").unwrap();
+        assert_eq!(found.successes.len(), 1);
+        assert_eq!(found.successes[0].agent_id, "agent-001");
+        // Error trajectories follow the same rule.
+        store
+            .record_error_for("agent-003", "mua sữa", "boom")
+            .unwrap();
+        assert_eq!(store.quarantined_count().unwrap(), 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

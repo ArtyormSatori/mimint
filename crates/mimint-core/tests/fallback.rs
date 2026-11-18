@@ -3,7 +3,7 @@
 //! wall-clock budget bound. Every attempt must appear in the audit log.
 
 use mimint_core::{
-    AuditLog, CallContext, ChatMessage, EgressPolicy, FallbackChain, GuardedHttpClient,
+    AuditLog, CallContext, ChatMessage, CostLedger, EgressPolicy, FallbackChain, GuardedHttpClient,
     MimintError, Provider, ProviderClient, RetryPolicy,
 };
 use serde_json::{json, Value};
@@ -489,7 +489,7 @@ async fn progress_hook_reports_each_attempt_and_last_used_tracks_the_winner() {
     assert_eq!(chain.last_used_provider(), None);
     let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let seen_clone = Arc::clone(&seen);
-    chain.set_progress_hook(Arc::new(move |name| {
+    chain.set_progress_hook(Arc::new(move |name, _agent_id| {
         seen_clone.lock().unwrap().push(name.to_string());
     }));
     let ctx = CallContext::new("turn-progress", Some(audit.as_ref()));
@@ -505,5 +505,108 @@ async fn progress_hook_reports_each_attempt_and_last_used_tracks_the_winner() {
         "hook fires per attempt: {seen:?}"
     );
     assert_eq!(chain.last_used_provider().as_deref(), Some("second"));
+    let _ = std::fs::remove_file(&audit_path);
+}
+
+fn success_body_with_usage(text: &str, prompt: u64, completion: u64) -> String {
+    json!({
+        "id": "chatcmpl-stub",
+        "object": "chat.completion",
+        "created": 0,
+        "model": "stub",
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": prompt + completion},
+    })
+    .to_string()
+}
+
+#[tokio::test]
+async fn provider_attempt_records_carry_agent_tokens_and_kind() {
+    // G6-6 (audit half): every provider_attempt record carries
+    // the acting agent, the charged tokens, and the data kind
+    // (measured vs estimate), so cost attribution is exact.
+    let stub = start_stub(vec![
+        Behavior {
+            status: 200,
+            delay: Duration::ZERO,
+            body: success_body_with_usage("one", 100, 50),
+        },
+        Behavior {
+            status: 200,
+            delay: Duration::ZERO,
+            body: success_body_with_usage("two", 200, 25),
+        },
+        Behavior {
+            status: 200,
+            delay: Duration::ZERO,
+            body: success_body("no usage"),
+        },
+    ]);
+    let audit_path = format!("{}.jsonl", temp_stem("attempt-fields"));
+    let audit = Arc::new(AuditLog::open(&audit_path).expect("open audit"));
+    let ledger = CostLedger::unbounded();
+    let chain = FallbackChain::new(
+        vec![provider_for(
+            "only",
+            stub.port,
+            Duration::from_secs(5),
+            None,
+        )],
+        fast_retry(1),
+    )
+    .expect("chain");
+    let ctx1 = CallContext::new("turn-g66-a", Some(audit.as_ref()))
+        .with_agent_id("agent-001")
+        .with_ledger(&ledger)
+        .with_max_tokens(4096);
+    chain
+        .chat(&ctx1, &[ChatMessage::user("hi")], &[])
+        .await
+        .expect("first call");
+    let ctx2 = CallContext::new("turn-g66-b", Some(audit.as_ref()))
+        .with_agent_id("agent-002")
+        .with_ledger(&ledger)
+        .with_max_tokens(4096);
+    chain
+        .chat(&ctx2, &[ChatMessage::user("hi")], &[])
+        .await
+        .expect("second call");
+    let ctx3 = CallContext::new("turn-g66-c", Some(audit.as_ref()))
+        .with_agent_id("agent-002")
+        .with_ledger(&ledger)
+        .with_max_tokens(4096);
+    chain
+        .chat(&ctx3, &[ChatMessage::user("hi")], &[])
+        .await
+        .expect("third call");
+
+    let records = read_audit(&audit_path);
+    let tries = attempts(&records);
+    assert_eq!(tries.len(), 3, "every attempt must be audited");
+    assert_eq!(tries[0]["agent_id"], "agent-001");
+    assert_eq!(tries[0]["detail"]["charged_tokens"], 150);
+    assert_eq!(tries[0]["detail"]["charge_kind"], "measured");
+    assert_eq!(tries[0]["detail"]["usage_unmeasured"], false);
+    assert_eq!(tries[0]["detail"]["outcome_unknown"], false);
+    assert_eq!(tries[1]["agent_id"], "agent-002");
+    assert_eq!(tries[1]["detail"]["charged_tokens"], 225);
+    assert_eq!(tries[1]["detail"]["charge_kind"], "measured");
+    // No usage block: the full reserve is charged as an estimate.
+    assert_eq!(tries[2]["agent_id"], "agent-002");
+    assert_eq!(tries[2]["detail"]["charged_tokens"], 4096);
+    assert_eq!(tries[2]["detail"]["charge_kind"], "estimate");
+    assert_eq!(tries[2]["detail"]["usage_unmeasured"], true);
+    for record in &tries {
+        assert!(
+            record["detail"]["attempt_id"]
+                .as_str()
+                .is_some_and(|s| !s.is_empty()),
+            "attempt id present: {record}"
+        );
+        assert_eq!(record["decision"], "success");
+    }
+    assert_eq!(ledger.agent_charged("agent-001").measured_total(), 150);
+    assert_eq!(ledger.agent_charged("agent-002").measured_total(), 225);
+    assert_eq!(ledger.agent_charged("agent-002").estimate_tokens, 4096);
     let _ = std::fs::remove_file(&audit_path);
 }

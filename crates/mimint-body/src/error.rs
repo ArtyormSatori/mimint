@@ -97,6 +97,28 @@ pub enum BodyError {
     /// the screenshot the model saw. Nothing was executed; the
     /// caller must take a fresh screenshot first.
     StaleObservation { age_secs: u64, max_secs: u64 },
+    /// The actor's queue was full when this request reached
+    /// the front of the actor loop (Phase 6, §9): the action
+    /// was denied without executing, and the actor is NOT
+    /// broken. The caller may retry after the queue drains.
+    QueueFull {
+        agent_id: String,
+        queued: usize,
+        max: usize,
+    },
+    /// The request waited in the actor's queue past the queue
+    /// SLA (Phase 6, §9): it was denied without executing,
+    /// and the actor is NOT broken. Never runs late.
+    QueueExpired {
+        agent_id: String,
+        queued_ms: u64,
+        sla_secs: u64,
+    },
+    /// The owning agent was cancelled while the request was
+    /// queued or waiting for its reply (Phase 6, §10). The
+    /// action never started, or its outcome was discarded;
+    /// the actor is NOT broken.
+    Cancelled { agent_id: String },
 }
 
 impl BodyError {
@@ -120,6 +142,9 @@ impl BodyError {
             BodyError::UnknownOutcome { .. } => "unknown_outcome",
             BodyError::TargetChanged { .. } => "target_changed",
             BodyError::StaleObservation { .. } => "stale_observation",
+            BodyError::QueueFull { .. } => "body_queue_full",
+            BodyError::QueueExpired { .. } => "queue_sla_expired",
+            BodyError::Cancelled { .. } => "cancelled",
         }
     }
 
@@ -179,6 +204,23 @@ impl BodyError {
             }
             BodyError::StaleObservation { age_secs, max_secs } => {
                 format!("observation is {age_secs}s old (limit {max_secs}s): take a fresh screenshot first")
+            }
+            BodyError::QueueFull {
+                agent_id,
+                queued,
+                max,
+            } => {
+                format!("body queue is full for {agent_id} ({queued} queued, max {max}): the action was denied without executing")
+            }
+            BodyError::QueueExpired {
+                agent_id,
+                queued_ms,
+                sla_secs,
+            } => {
+                format!("body request for {agent_id} waited {queued_ms}ms in the queue (SLA {sla_secs}s): denied without executing, never runs late")
+            }
+            BodyError::Cancelled { agent_id } => {
+                format!("body request for {agent_id} was cancelled before it completed")
             }
         }
     }

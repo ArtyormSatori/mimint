@@ -26,7 +26,7 @@
 #[cfg(target_os = "linux")]
 use crate::error::BodyError;
 #[cfg(target_os = "linux")]
-use crate::guarded::StopFlag;
+use crate::guarded::{StopFlag, StopFlagCell};
 #[cfg(target_os = "linux")]
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -187,6 +187,17 @@ mod linux_impl {
             display: Option<&str>,
             stop_flag: Arc<StopFlag>,
         ) -> Result<HotkeyListener, BodyError> {
+            Self::start_on_cell(display, StopFlagCell::new(stop_flag))
+        }
+
+        /// Like [`HotkeyListener::start_on_display`], but the
+        /// listener reads the CURRENT flag from `cell` on every
+        /// iteration (Phase 6, §4.1): a body rebuild swaps in a
+        /// fresh flag, and the chord must trip the live one.
+        pub fn start_on_cell(
+            display: Option<&str>,
+            stop_cell: Arc<StopFlagCell>,
+        ) -> Result<HotkeyListener, BodyError> {
             let (conn, screen_num) = x11rb::connect(display).map_err(|err| {
                 BodyError::Backend(format!("hotkey listener cannot connect to X: {err}"))
             })?;
@@ -249,7 +260,7 @@ mod linux_impl {
                     root,
                     escape_keycode,
                     chord_keys,
-                    stop_flag,
+                    stop_cell,
                     shutdown_clone,
                     health_clone,
                 );
@@ -289,7 +300,7 @@ mod linux_impl {
         root: Window,
         escape_keycode: u8,
         chord_keys: Option<ChordKeycodes>,
-        stop_flag: Arc<StopFlag>,
+        stop_cell: Arc<StopFlagCell>,
         shutdown: Arc<AtomicBool>,
         health: HotkeyHealth,
     ) {
@@ -298,7 +309,7 @@ mod linux_impl {
         // and the stop must latch fail-closed.
         let mut died = false;
         loop {
-            if shutdown.load(Ordering::SeqCst) || stop_flag.is_tripped() {
+            if shutdown.load(Ordering::SeqCst) || stop_cell.is_tripped() {
                 break;
             }
             *health.last_beat.lock().unwrap_or_else(|p| p.into_inner()) = Instant::now();
@@ -307,7 +318,7 @@ mod linux_impl {
                 Ok(Some(event)) => {
                     if let Event::KeyPress(ev) = event {
                         if chord_matches(u16::from(ev.state), ev.detail, escape_keycode) {
-                            stop_flag.trip_with(
+                            stop_cell.get().trip_with(
                                 "hotkey",
                                 "global STOP hotkey pressed (Ctrl+Alt+Shift+Escape)",
                             );
@@ -335,7 +346,7 @@ mod linux_impl {
                 match keymap {
                     Some(reply) => {
                         if keymap_chord_pressed(&reply.keys, &keys) {
-                            stop_flag.trip_with(
+                            stop_cell.get().trip_with(
                                 "hotkey",
                                 "global STOP hotkey pressed (Ctrl+Alt+Shift+Escape)",
                             );
@@ -352,7 +363,7 @@ mod linux_impl {
         }
         if died {
             health.dead.store(true, Ordering::SeqCst);
-            stop_flag.trip_with(
+            stop_cell.get().trip_with(
                 "hotkey",
                 "hotkey listener lost its X connection; emergency stop latched fail-closed",
             );

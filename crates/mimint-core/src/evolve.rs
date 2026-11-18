@@ -275,12 +275,12 @@ fn decide(
 /// The `base` variant must be present in `variants`: without the
 /// reference, "improvement" is undefined.
 pub async fn evolve_skill(
-    provider: &dyn Provider,
+    provider: Arc<dyn Provider>,
     skill: &SkillDef,
     variants: &[SkillVariant],
     tasks: &[ValidationTask],
     notebook_for: &dyn Fn(&str) -> Result<Arc<Notebook>, MimintError>,
-    audit: &AuditLog,
+    audit: Arc<AuditLog>,
     config: &EvolveConfig,
 ) -> Result<EvolveReport, MimintError> {
     if variants.is_empty() {
@@ -321,11 +321,11 @@ pub async fn evolve_skill(
             let turn_id = format!("{}-{}-{}", config.turn_prefix, variant.id, task.id);
             let task_started = Instant::now();
             let run = run_one_task_detailed(
-                provider,
+                Arc::clone(&provider),
                 &system_prompt,
                 task,
                 notebook,
-                audit,
+                Arc::clone(&audit),
                 &turn_id,
                 config.max_steps,
             )
@@ -511,6 +511,7 @@ mod tests {
                     content: Some("Saved.".to_string()),
                     tool_calls: None,
                     tool_call_id: None,
+                    usage: None,
                 }
             } else if mandated {
                 ChatMessage {
@@ -525,6 +526,7 @@ mod tests {
                         },
                     }]),
                     tool_call_id: None,
+                    usage: None,
                 }
             } else {
                 ChatMessage {
@@ -532,6 +534,7 @@ mod tests {
                     content: Some("I will remember that.".to_string()),
                     tool_calls: None,
                     tool_call_id: None,
+                    usage: None,
                 }
             };
             Box::pin(async move { Ok(reply) })
@@ -550,13 +553,14 @@ mod tests {
                 Notebook::open(dir.join(format!("{key}.db"))).unwrap(),
             ))
         };
+        let audit = Arc::new(audit);
         let report = evolve_skill(
-            &MarkerProvider,
+            Arc::new(MarkerProvider),
             &skill,
             &variants,
             &heldout_tasks(),
             &factory,
-            &audit,
+            Arc::clone(&audit),
             &EvolveConfig {
                 turn_prefix: "evolve-1".to_string(),
                 max_steps: 3,
@@ -621,13 +625,14 @@ mod tests {
                 Notebook::open(dir.join(format!("{key}.db"))).unwrap(),
             ))
         };
+        let audit = Arc::new(audit);
         let report = evolve_skill(
-            &MarkerProvider,
+            Arc::new(MarkerProvider),
             &skill,
             &variants,
             &heldout_tasks(),
             &factory,
-            &audit,
+            Arc::clone(&audit),
             &EvolveConfig {
                 turn_prefix: "evolve-2".to_string(),
                 max_steps: 3,
@@ -673,13 +678,14 @@ mod tests {
                 Notebook::open(dir.join(format!("{key}.db"))).unwrap(),
             ))
         };
+        let audit = Arc::new(audit);
         let report = evolve_skill(
-            &MarkerProvider,
+            Arc::new(MarkerProvider),
             &skill,
             &variants,
             &heldout_tasks(),
             &factory,
-            &audit,
+            Arc::clone(&audit),
             &EvolveConfig {
                 turn_prefix: "evolve-3".to_string(),
                 max_steps: 3,
@@ -799,13 +805,14 @@ mod tests {
                 Notebook::open(dir.join(format!("{key}.db"))).unwrap(),
             ))
         };
+        let audit = Arc::new(audit);
         let report = evolve_skill(
-            &MarkerProvider,
+            Arc::new(MarkerProvider),
             &skill,
             &variants,
             &heldout_tasks(),
             &factory,
-            &audit,
+            Arc::clone(&audit),
             &EvolveConfig {
                 turn_prefix: "evolve-budget".to_string(),
                 max_steps: 3,
@@ -906,13 +913,14 @@ mod tests {
                 Notebook::open(dir.join(format!("{key}.db"))).unwrap(),
             ))
         };
+        let audit = Arc::new(audit);
         evolve_skill(
-            &MarkerProvider,
+            Arc::new(MarkerProvider),
             &skill,
             &variants,
             &tasks,
             &factory,
-            &audit,
+            Arc::clone(&audit),
             &EvolveConfig {
                 turn_prefix: "evolve-heldout".to_string(),
                 max_steps: 3,

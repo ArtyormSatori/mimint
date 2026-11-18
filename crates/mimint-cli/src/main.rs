@@ -25,7 +25,7 @@ use mimint_core::{
     build_chain, build_system_prompt, default_config_path, default_data_dir, default_vault,
     evaluate_finetune, load_config_file, probe_finetune, probe_local_backends, soul_may_be_sent,
     suggestion_text, url_is_loopback, Approver, AuditLog, BackendKind, BackendSpec, Brain, CostCap,
-    EgressPolicy, ExperienceStore, FallbackChain, MimintError, Notebook, ResolvedConfig,
+    EgressPolicy, ExperienceStore, FallbackChain, MimintError, Notebook, Provider, ResolvedConfig,
     SkillStore, SoulStore, DEFAULT_TIMEOUT_SECS,
 };
 use serde_json::{json, Value};
@@ -654,22 +654,23 @@ async fn run() -> Result<(), MimintError> {
         );
     }
 
-    let registry = mimint_core::default_registry(Arc::clone(&notebook));
-    let chain = FallbackChain::new(providers, resolved.retry)?;
+    let registry = Arc::new(mimint_core::default_registry(Arc::clone(&notebook)));
+    let chain = Arc::new(FallbackChain::new(providers, resolved.retry)?);
     let stdin_approver = StdinApprover::new();
     let auto_approver = AutoApprover;
-    let approver: &dyn Approver = if args.auto_approve {
-        &auto_approver
+    let approver: Arc<dyn Approver> = if args.auto_approve {
+        Arc::new(auto_approver)
     } else {
-        &stdin_approver
+        Arc::new(stdin_approver)
     };
     let mut brain = Brain::new(
-        &chain,
-        &registry,
+        Arc::clone(&chain) as Arc<dyn Provider>,
+        registry,
         Some(approver),
-        &audit,
+        Arc::clone(&audit),
         Arc::clone(&notebook),
         turn_id,
+        "agent-001",
         args.max_steps,
     )?;
     brain.set_profile(profile.name.clone());

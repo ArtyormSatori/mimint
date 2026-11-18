@@ -71,6 +71,7 @@ mod gate {
                 },
             }]),
             tool_call_id: None,
+            usage: None,
         }
     }
 
@@ -80,6 +81,7 @@ mod gate {
             content: Some(text.to_string()),
             tool_calls: None,
             tool_call_id: None,
+            usage: None,
         }
     }
 
@@ -289,8 +291,8 @@ mod gate {
     /// the outcome, the oracle clicks, and the audit text.
     #[allow(clippy::too_many_arguments)]
     async fn drive_turn<B: Body + 'static>(
-        provider: &dyn Provider,
-        approver: &dyn Approver,
+        provider: Arc<dyn Provider>,
+        approver: Arc<dyn Approver>,
         body: B,
         stop: Arc<StopFlag>,
         oracle: &mut FileOracle,
@@ -312,14 +314,16 @@ mod gate {
             PrivacyFlag::new(false),
         );
         let notebook = Arc::new(Notebook::open(dir.join("case.db")).expect("case notebook"));
-        let audit = AuditLog::open(dir.join("audit.jsonl")).expect("case audit");
+        let audit = Arc::new(AuditLog::open(dir.join("audit.jsonl")).expect("case audit"));
+        let registry = Arc::new(registry);
         let mut brain = match Brain::new(
             provider,
-            &registry,
+            registry,
             Some(approver),
-            &audit,
+            Arc::clone(&audit),
             Arc::clone(&notebook),
             turn_id.to_string(),
+            "agent-001",
             max_steps,
         ) {
             Ok(brain) => brain,
@@ -350,8 +354,8 @@ mod gate {
         let body = X11Body::connect().expect("x11 body");
         let stop = StopFlag::new();
         let (outcome, clicks, audit) = drive_turn(
-            &provider,
-            &approver,
+            Arc::new(provider),
+            Arc::new(approver),
             body,
             stop,
             oracle,
@@ -386,8 +390,8 @@ mod gate {
         let body = X11Body::connect().expect("x11 body");
         let stop = StopFlag::new();
         let (outcome, clicks, audit) = drive_turn(
-            &provider,
-            &approver,
+            Arc::new(provider),
+            Arc::new(approver),
             body,
             stop,
             oracle,
@@ -422,8 +426,8 @@ mod gate {
         let approver = AutoAllow;
         let body = X11Body::connect().expect("x11 body");
         let (outcome, clicks, audit) = drive_turn(
-            &provider,
-            &approver,
+            Arc::new(provider),
+            Arc::new(approver),
             body,
             Arc::clone(&stop),
             oracle,
@@ -468,8 +472,8 @@ mod gate {
         let body = X11Body::connect().expect("x11 body");
         let stop = StopFlag::new();
         let (outcome, clicks, _audit) = drive_turn(
-            &provider,
-            &approver,
+            Arc::new(provider),
+            Arc::new(approver),
             body,
             stop,
             oracle,
@@ -501,8 +505,8 @@ mod gate {
         let body = FailingBody { inner };
         let stop = StopFlag::new();
         let (outcome, clicks, audit) = drive_turn(
-            &provider,
-            &approver,
+            Arc::new(provider),
+            Arc::new(approver),
             body,
             stop,
             oracle,
@@ -535,8 +539,8 @@ mod gate {
         let body = X11Body::connect().expect("x11 body");
         let stop = StopFlag::new();
         let (outcome, clicks, audit) = drive_turn(
-            &provider,
-            &approver,
+            Arc::new(provider),
+            Arc::new(approver),
             body,
             stop,
             oracle,
@@ -570,8 +574,8 @@ mod gate {
         let body = X11Body::connect().expect("x11 body");
         let stop = StopFlag::new();
         let (outcome, clicks, _audit) = drive_turn(
-            &provider,
-            &approver,
+            Arc::new(provider),
+            Arc::new(approver),
             body,
             stop,
             oracle,
@@ -607,8 +611,8 @@ mod gate {
         let body = X11Body::connect().expect("x11 body");
         let stop = StopFlag::new();
         let (outcome, clicks, audit) = drive_turn(
-            &provider,
-            &approver,
+            Arc::new(provider),
+            Arc::new(approver),
             body,
             stop,
             oracle,

@@ -60,7 +60,7 @@ pub use forbidden::{
     check_forbidden_signals, check_forbidden_window, is_forbidden_signals, is_forbidden_window,
     WindowSignals,
 };
-pub use guarded::{GuardedBody, RateLimits, StopFlag, TripInfo};
+pub use guarded::{GuardedBody, RateLimits, StopFlag, StopFlagCell, TripInfo};
 pub use hotkey::{chord_matches, grab_modifier_combinations, CHORD_MODIFIERS};
 #[cfg(target_os = "linux")]
 pub use hotkey::{HotkeyHealth, HotkeyListener};

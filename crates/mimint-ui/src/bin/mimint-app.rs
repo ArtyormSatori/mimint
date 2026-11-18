@@ -38,16 +38,16 @@
 //!   screenshots at 125%/150%).
 
 use mimint_body::ScreenRect;
-use mimint_control::DEFAULT_MAX_OBSERVATION_AGE;
+use mimint_control::{ActorConfig, DEFAULT_MAX_OBSERVATION_AGE};
 use mimint_core::{
-    build_chain, default_config_path, default_data_dir, default_vault, egress::url_is_loopback,
-    evaluate_finetune, load_config_file, probe_finetune, probe_local_backends, suggestion_text,
-    AuditLog, EgressPolicy, ExperienceStore, FileConfig, MimintError, Notebook, ResolvedConfig,
-    SkillStore, SoulStore,
+    build_chain, config_path_outside_workdirs, default_config_path, default_data_dir,
+    default_vault, egress::url_is_loopback, evaluate_finetune, load_config_file, probe_finetune,
+    probe_local_backends, suggestion_text, AuditLog, EgressPolicy, ExperienceStore, FileConfig,
+    MimintError, Notebook, ResolvedConfig, SkillStore, SoulStore,
 };
 use mimint_ui::app::{AppOptions, BackendInfo};
 use mimint_ui::approver::{approval_channel, RepaintSignal, TokenSlot, DEFAULT_APPROVAL_TIMEOUT};
-use mimint_ui::worker::{BodyStack, RebuildConfig, WorkerDeps};
+use mimint_ui::worker::{BodyFactory, BodyStack, RebuildConfig, WorkerDeps};
 use mimint_ui::MimintApp;
 use serde_json::json;
 use std::env;
@@ -132,32 +132,61 @@ type BodyShares = (BodyStack, Arc<RwLock<Vec<ScreenRect>>>, Arc<AtomicBool>);
 /// Build the body stack for `--body` mode (Linux/X11 only): the
 /// X11 body behind the guards, sharing the stop flag, the
 /// approval-pending flag, and the live exclusion list with the
-/// UI. Returns the stack plus the two shares the app/worker need.
+/// UI. Returns the stack plus the two shares the app/worker need,
+/// the stop-flag cell the hotkey listener and the worker read
+/// the CURRENT flag from, and the factory the worker rebuilds
+/// the body stack from after a fault (§4.1). The factory builds
+/// a FRESH body and a FRESH stop flag on every call; only the
+/// pending flag and the exclusion list are shared across
+/// rebuilds.
 #[cfg(target_os = "linux")]
-fn build_body_stack(privacy_on: bool) -> Result<BodyShares, MimintError> {
-    use mimint_body::{GuardedBody, RateLimits, StopFlag, X11Body};
+fn build_body_stack(
+    privacy_on: bool,
+    actor_config: ActorConfig,
+    audit: Arc<AuditLog>,
+) -> Result<(BodyShares, Arc<mimint_body::StopFlagCell>, BodyFactory), MimintError> {
+    use mimint_body::{Body, GuardedBody, RateLimits, StopFlag, StopFlagCell, X11Body};
     use mimint_control::{BodyActor, FrameStore, PrivacyFlag};
-    let stop_flag = StopFlag::new();
     let pending = Arc::new(AtomicBool::new(false));
     let shared = Arc::new(RwLock::new(Vec::new()));
-    let body = X11Body::connect()
-        .map_err(|err| MimintError::Config(format!("cannot connect the X11 body: {err}")))?;
-    let guarded = GuardedBody::new(body, RateLimits::default())
-        .with_stop_flag(Arc::clone(&stop_flag))
-        .with_approval_pending(Arc::clone(&pending))
-        .with_shared_exclusion(Arc::clone(&shared));
-    let actor = BodyActor::spawn(Box::new(guarded), Arc::clone(&stop_flag));
+    let factory_pending = Arc::clone(&pending);
+    let factory_shared = Arc::clone(&shared);
+    let factory: BodyFactory = Arc::new(move || {
+        let stop_flag = StopFlag::new();
+        let body = X11Body::connect()
+            .map_err(|err| MimintError::Config(format!("cannot connect the X11 body: {err}")))?;
+        let guarded = GuardedBody::new(body, RateLimits::default())
+            .with_stop_flag(Arc::clone(&stop_flag))
+            .with_approval_pending(Arc::clone(&factory_pending))
+            .with_shared_exclusion(Arc::clone(&factory_shared));
+        let boxed: Box<dyn Body> = Box::new(guarded);
+        Ok((boxed, stop_flag))
+    });
+    // The initial stack is built by the same factory, so the
+    // first body and every rebuilt body are built identically.
+    let (body, stop_flag) = factory()?;
+    let actor = BodyActor::spawn_with_config_and_audit(
+        body,
+        Arc::clone(&stop_flag),
+        actor_config,
+        Some(Arc::clone(&audit)),
+    );
+    let cell = StopFlagCell::new(Arc::clone(&stop_flag));
     let stack = BodyStack {
         actor,
         frames: Arc::new(FrameStore::new()),
         privacy: PrivacyFlag::new(privacy_on),
         stop_flag,
     };
-    Ok((stack, shared, pending))
+    Ok(((stack, shared, pending), cell, factory))
 }
 
 #[cfg(not(target_os = "linux"))]
-fn build_body_stack(_privacy_on: bool) -> Result<BodyShares, MimintError> {
+fn build_body_stack(
+    _privacy_on: bool,
+    _actor_config: ActorConfig,
+    _audit: Arc<AuditLog>,
+) -> Result<(BodyShares, Arc<mimint_body::StopFlagCell>, BodyFactory), MimintError> {
     Err(MimintError::Config(
         "--body is only available on Linux (X11) in this build: no real body exists for this platform yet".to_string(),
     ))
@@ -184,6 +213,44 @@ fn run() -> Result<(), MimintError> {
         .as_ref()
         .map(|path| path.display().to_string())
         .unwrap_or_else(|| "(no config file: home directory not found)".to_string());
+
+    // Phase 6 (§6.3): a config file that names MCP servers must
+    // live outside every directory tools can write (code-run
+    // workdirs, MCP workdirs, the temp directory). A server
+    // entry in a tool-writable file would let a tool rewrite
+    // its own allow-list. Fail closed: no home directory, or
+    // no config path, means no start with [[mcp-server]].
+    if !resolved.mcp_servers.is_empty() {
+        let Some(home) = std::env::home_dir() else {
+            return Err(MimintError::Config(
+                "cannot determine the home directory: refusing to start with [[mcp-server]] entries"
+                    .to_string(),
+            ));
+        };
+        if home.as_os_str().is_empty() {
+            return Err(MimintError::Config(
+                "cannot determine the home directory: refusing to start with [[mcp-server]] entries"
+                    .to_string(),
+            ));
+        }
+        let config_ok = config_path
+            .as_ref()
+            .is_some_and(|path| config_path_outside_workdirs(path, &home));
+        if !config_ok {
+            return Err(MimintError::Config(
+                "the config file names MCP servers but lives inside a tool-writable directory: move it outside tool reach before starting".to_string(),
+            ));
+        }
+    }
+    // Phase 6 display facts, captured before `resolved` moves.
+    let parallelism_enabled = resolved.agents.parallelism_enabled;
+    let max_agents = resolved.agents.max_agents;
+    let actor_config = ActorConfig {
+        action_timeout: Duration::from_secs(resolved.agents.action_timeout_secs),
+        queue_sla: Duration::from_secs(resolved.agents.queue_sla_secs),
+        max_queued_total: resolved.agents.max_queued_total,
+        max_queued_per_agent: resolved.agents.max_queued_per_agent,
+    };
 
     // Active profile (Phase 5): the profile's Privacy Mode,
     // chain, and cost cap drive the whole run. An unknown
@@ -257,19 +324,33 @@ fn run() -> Result<(), MimintError> {
     // `--body`: build the real body stack before the worker
     // starts, so the worker registers the body tools and the app
     // shares the exclusion list + pending flag with the guard.
-    let (body_stack, shared_exclusion, approval_pending) = if args.body {
-        let (stack, shared, pending) = build_body_stack(privacy_on)?;
-        (Some(stack), Some(shared), Some(pending))
-    } else {
-        (None, None, None)
-    };
+    // The stop-flag cell and the rebuild factory travel with the
+    // stack: the hotkey listener reads the current flag through
+    // the cell, and the worker rebuilds through the factory.
+    let (body_stack, shared_exclusion, approval_pending, stop_flag_cell, body_factory) =
+        if args.body {
+            let (shares, cell, factory) =
+                build_body_stack(privacy_on, actor_config, Arc::clone(&audit))?;
+            (
+                Some(shares.0),
+                Some(shares.1),
+                Some(shares.2),
+                Some(cell),
+                Some(factory),
+            )
+        } else {
+            (None, None, None, None, None)
+        };
+    let can_rebuild_body = body_factory.is_some();
     // Global STOP hotkey (Linux/X11 only): kept alive for the
     // whole run; dropping it ungrabs the key and joins the
-    // listener thread.
+    // listener thread. It reads the CURRENT flag through the
+    // cell, so a body rebuild swaps in a fresh flag without
+    // restarting the listener (§4.1).
     #[cfg(target_os = "linux")]
-    let _hotkey_listener = match &body_stack {
-        Some(stack) => Some(
-            mimint_body::HotkeyListener::start(Arc::clone(&stack.stop_flag)).map_err(|err| {
+    let _hotkey_listener = match &stop_flag_cell {
+        Some(cell) => Some(
+            mimint_body::HotkeyListener::start_on_cell(None, Arc::clone(cell)).map_err(|err| {
                 MimintError::Config(format!("cannot start the STOP hotkey listener: {err}"))
             })?,
         ),
@@ -344,6 +425,17 @@ fn run() -> Result<(), MimintError> {
         soul_store: Some(soul_store),
         skill_store: Some(skill_store),
         experience: Some(experience),
+        // Phase 6: the validated multi-agent sections travel
+        // whole into the worker; the worker owns the
+        // coordinator, the sandbox, the MCP manager, and the
+        // body rebuild path.
+        agents: resolved.agents.clone(),
+        hierarchy: resolved.hierarchy.clone(),
+        sandbox: resolved.sandbox.clone(),
+        routing: resolved.routing.clone(),
+        mcp_servers: resolved.mcp_servers.clone(),
+        body_factory,
+        stop_flag_cell,
     };
     let worker = mimint_ui::worker::spawn_worker(deps);
 
@@ -370,6 +462,9 @@ fn run() -> Result<(), MimintError> {
         fallback_active,
         soul_path,
         data_dir: data_dir.clone(),
+        parallelism_enabled,
+        max_agents,
+        can_rebuild_body,
     };
     let app = MimintApp::new(worker, approval_rx, options);
     let pixels_per_point = env::var("MIMINT_UI_PIXELS_PER_POINT")

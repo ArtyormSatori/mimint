@@ -17,6 +17,7 @@
 
 use crate::egress::{split_endpoint, url_is_loopback, GuardedHttpClient};
 use crate::error::MimintError;
+use crate::ledger::TokenUsage;
 use crate::provider::{
     check_plaintext_auth, extract_error_message, http_status_error_with_retry_after,
     normalize_tool_call_args, parse_retry_after, tool_args_as_object, BoxFuture, CallContext,
@@ -417,6 +418,9 @@ fn from_anthropic_response(body: &Value) -> Result<ChatMessage, MimintError> {
             Some(tool_calls)
         },
         tool_call_id: None,
+        // Token usage (§3.3): Claude-style `input_tokens` /
+        // `output_tokens`. Absent or partial usage stays `None`.
+        usage: TokenUsage::from_claude(body),
     })
 }
 
@@ -549,6 +553,7 @@ mod tests {
                     },
                 }]),
                 tool_call_id: None,
+                usage: None,
             },
             ChatMessage::tool_result("toolu_1", r#"{"id":7}"#),
             ChatMessage::tool_result("toolu_2", r#"{"id":8}"#),
@@ -695,6 +700,7 @@ mod tests {
                     },
                 ]),
                 tool_call_id: None,
+                usage: None,
             },
         ];
         let body = to_anthropic_request("claude-test", 42, &messages, &[]).expect("translate");

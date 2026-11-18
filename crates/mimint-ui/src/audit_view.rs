@@ -22,6 +22,9 @@ use std::path::Path;
 pub struct AuditRow {
     pub ts_ms: u64,
     pub turn_id: String,
+    /// Phase 6 (D-DESIGN-7): the owning agent. Legacy records
+    /// without the field read as `agent-001`.
+    pub agent_id: String,
     pub kind: String,
     pub tool: Option<String>,
     pub decision: Option<String>,
@@ -75,6 +78,12 @@ impl AuditRow {
                     }
                     Some("approver_error") => {
                         format!("Thẻ phê duyệt {tool} gặp lỗi — đã từ chối cho an toàn.")
+                    }
+                    Some("queue_sla_expired") => {
+                        format!("{tool} chờ quá lâu trong hàng đợi nên hết hạn — không chạy.")
+                    }
+                    Some("body_queue_full") => {
+                        format!("Hàng đợi action đã đầy — {tool} bị từ chối ngay, không xếp hàng.")
                     }
                     _ => match self.decision.as_deref() {
                         Some("allow") => format!("Đã cho phép {tool}."),
@@ -130,6 +139,97 @@ impl AuditRow {
                 let tool = self.tool.as_deref().unwrap_or("bodyctl");
                 format!("Hành động {tool} (công cụ phát triển).")
             }
+            // ---- Phase 6 kinds ----
+            "code_execution" => self.code_execution_summary(),
+            "mcp_server_connected" => {
+                let server = self.detail_text("mcp_server").unwrap_or_default();
+                let version = self.detail_text("protocol_version").unwrap_or_default();
+                let tools = self.detail_count("tool_count").unwrap_or(0);
+                let sandboxed = self.detail_bool("sandboxed").unwrap_or(true);
+                format!(
+                    "Đã nối MCP server {server} (protocol {version}, {tools} công cụ){}.",
+                    if sandboxed { ", trong sandbox" } else { ", KHÔNG SANDBOX" }
+                )
+            }
+            "mcp_server_failed" => {
+                let server = self.detail_text("mcp_server").unwrap_or_default();
+                let error = self.detail_text("error").unwrap_or_default();
+                format!("MCP server {server} lỗi: {error}.")
+            }
+            "mcp_tool_rejected" => {
+                let server = self.detail_text("mcp_server").unwrap_or_default();
+                let reason = self.reason.clone().unwrap_or_default();
+                format!("Công cụ MCP của server {server} bị loại: {reason}.")
+            }
+            "mcp_unsandboxed_confirmed" => {
+                let server = self.detail_text("mcp_server").unwrap_or_default();
+                format!("Đã xác nhận chạy MCP server {server} KHÔNG sandbox.")
+            }
+            "mcp_privacy_warning" => {
+                "Cảnh báo: Chế độ riêng tư đang BẬT nhưng MCP server vẫn chạy — egress của server không bị chặn hoàn toàn."
+                    .to_string()
+            }
+            "sandbox_preflight" => match self.decision.as_deref() {
+                Some("ok") => "Kiểm tra sandbox lúc khởi động: đạt.".to_string(),
+                _ => "Kiểm tra sandbox lúc khởi động: KHÔNG ĐẠT — code sẽ không chạy ngoài sandbox."
+                    .to_string(),
+            },
+            "agent_failure_scope" => {
+                let scope = self.detail_text("scope").unwrap_or_default();
+                let cause = self.detail_text("cause").unwrap_or_default();
+                let failed = self.detail_text("failed_agent").unwrap_or_default();
+                let verified = self.detail_bool("end_verified").unwrap_or(false);
+                format!(
+                    "Lỗi phạm vi {scope} từ {failed}: {cause}. Kết thúc đã xác minh: {}.",
+                    if verified { "đúng" } else { "KHÔNG" }
+                )
+            }
+            "body_rebuilt" => {
+                let generation = self.detail_count("generation").unwrap_or(0);
+                format!("Body đã rebuild (generation {generation}). Lượt sau sẽ chụp màn hình mới trước khi hành động.")
+            }
+            "task_end_unverified" => {
+                let source = self.source.clone().unwrap_or_default();
+                format!(
+                    "Không xác minh được agent đã dừng hẳn sau khi hủy (nguồn: {source}). Coordinator ở trạng thái Degraded tới khi khởi động lại."
+                )
+            }
+            "delegate_clamped" => {
+                let requested = self.detail_count("requested_tokens").unwrap_or(0);
+                let clamped = self.detail_count("clamped_tokens").unwrap_or(0);
+                format!(
+                    "Ngân sách token của sub-agent bị giới hạn từ {requested} xuống {clamped} (không vượt ngân sách còn lại của agent cha)."
+                )
+            }
+            "routing" => {
+                let rule = self.detail_text("rule").unwrap_or_default();
+                match rule.as_str() {
+                    "r6_gui_batch_loop" => {
+                        "Lượt dừng vì lặp action GUI giống nhau quá ngưỡng — gợi ý dùng code thay cho thao tác GUI hàng loạt."
+                            .to_string()
+                    }
+                    _ => format!("Định tuyến: {rule}."),
+                }
+            }
+            "provider_attempt" => match self.decision.as_deref() {
+                Some("budget_exhausted") => {
+                    let scope = self.detail_text("scope").unwrap_or_default();
+                    format!("Hết ngân sách token ({scope}) trước khi gọi provider.")
+                }
+                _ => {
+                    let charged = self.detail_count("charged_tokens").unwrap_or(0);
+                    let kind = self.detail_text("charge_kind").unwrap_or_default();
+                    let unmeasured = self.detail_bool("usage_unmeasured").unwrap_or(false);
+                    format!(
+                        "Lần gọi provider: {charged} token đã tính ({kind}){}.",
+                        if unmeasured {
+                            " — ƯỚC TÍNH, chưa đo được"
+                        } else {
+                            ""
+                        }
+                    )
+                }
+            },
             _ => {
                 let tool = self.tool.as_deref().unwrap_or("-");
                 let decision = self.decision.as_deref().unwrap_or("");
@@ -138,6 +238,66 @@ impl AuditRow {
                     .to_string()
             }
         }
+    }
+
+    /// The `code_execution` summary (§15.2, post-run half): the
+    /// executed hash is compared against the approved hash and
+    /// the verdict is stated plainly. A record with no executed
+    /// hash (denied/failed runs) makes no mismatch claim — the
+    /// code never ran, so there is nothing to compare.
+    fn code_execution_summary(&self) -> String {
+        let language = self.detail_text("language").unwrap_or_default();
+        let verdict = self.detail_text("sandbox_verdict").unwrap_or_default();
+        let exit = self.detail_count("exit_code");
+        let mut summary = match self.decision.as_deref() {
+            Some("executed") => format!(
+                "Đã chạy code {language} trong sandbox (verdict: {verdict}, mã thoát: {}).",
+                exit.map_or("-".to_string(), |code| code.to_string())
+            ),
+            _ => format!("Chạy code {language} không thành (verdict: {verdict})."),
+        };
+        match self.detail_bool("code_hash_verified") {
+            Some(true) => {
+                summary.push_str(" Hash của code đã chạy khớp hash đã phê duyệt (đã kiểm chứng).");
+            }
+            Some(false) => {
+                // Only a mismatch claim when both hashes exist
+                // and differ; a missing executed hash means
+                // the run never produced one (error path).
+                let approved = self.detail_text("code_sha256");
+                let executed = self.detail_text("executed_code_sha256");
+                if let (Some(approved), Some(executed)) = (approved, executed) {
+                    if approved != executed {
+                        summary.push_str(
+                            " CẢNH BÁO: hash của code đã chạy KHÔNG khớp hash đã phê duyệt.",
+                        );
+                    }
+                }
+            }
+            None => {}
+        }
+        summary
+    }
+
+    /// One detail field from the full raw line (the 3-pair
+    /// summary truncates). `None` when the line does not parse
+    /// or the field is absent/not the right type.
+    fn detail_value(&self, key: &str) -> Option<Value> {
+        let value: Value = serde_json::from_str(&self.raw).ok()?;
+        value.get("detail")?.get(key).cloned()
+    }
+
+    fn detail_text(&self, key: &str) -> Option<String> {
+        self.detail_value(key)
+            .and_then(|v| v.as_str().map(str::to_string))
+    }
+
+    fn detail_count(&self, key: &str) -> Option<u64> {
+        self.detail_value(key).and_then(|v| v.as_u64())
+    }
+
+    fn detail_bool(&self, key: &str) -> Option<bool> {
+        self.detail_value(key).and_then(|v| v.as_bool())
     }
 
     /// Learning-journal line (F5-12): `Some` for records about
@@ -268,6 +428,13 @@ pub fn parse_audit_line(line: &str) -> Option<AuditRow> {
     let obj = value.as_object()?;
     let ts_ms = obj.get("ts_ms")?.as_u64()?;
     let turn_id = obj.get("turn_id")?.as_str()?.to_string();
+    // D-DESIGN-7: legacy records without `agent_id` read as the
+    // default agent; a non-string value is treated as missing.
+    let agent_id = obj
+        .get("agent_id")
+        .and_then(Value::as_str)
+        .unwrap_or("agent-001")
+        .to_string();
     let kind = obj.get("kind")?.as_str()?.to_string();
     let tool = obj.get("tool").and_then(Value::as_str).map(str::to_string);
     let decision = obj
@@ -303,6 +470,7 @@ pub fn parse_audit_line(line: &str) -> Option<AuditRow> {
     Some(AuditRow {
         ts_ms,
         turn_id,
+        agent_id,
         kind,
         tool,
         decision,
@@ -311,6 +479,15 @@ pub fn parse_audit_line(line: &str) -> Option<AuditRow> {
         source,
         raw: line.trim().to_string(),
     })
+}
+
+/// The distinct agent ids in a set of rows, sorted. The audit
+/// panel hides the agent column when this has one entry (§1.4).
+pub fn distinct_agents(rows: &[AuditRow]) -> Vec<String> {
+    let mut agents: Vec<String> = rows.iter().map(|row| row.agent_id.clone()).collect();
+    agents.sort();
+    agents.dedup();
+    agents
 }
 
 /// Read the last `max_lines` records from the audit file (oldest
@@ -603,5 +780,89 @@ mod tests {
         assert_eq!(format_time_ms(0), "00:00:00");
         assert_eq!(format_time_ms(3_661_000), "01:01:01");
         assert_eq!(format_time_ms(86_399_000), "23:59:59");
+    }
+
+    #[test]
+    fn legacy_records_without_agent_id_read_as_the_default_agent() {
+        let row = parse_audit_line(
+            r#"{"ts_ms":1,"turn_id":"t","kind":"decision","decision":"allow","detail":{}}"#,
+        )
+        .unwrap();
+        assert_eq!(row.agent_id, "agent-001");
+        let row = parse_audit_line(
+            r#"{"ts_ms":1,"turn_id":"t","agent_id":"agent-002","kind":"decision","decision":"allow","detail":{}}"#,
+        )
+        .unwrap();
+        assert_eq!(row.agent_id, "agent-002");
+    }
+
+    #[test]
+    fn distinct_agents_reports_the_sorted_set() {
+        let rows: Vec<AuditRow> = ["agent-002", "agent-001", "agent-002"]
+            .iter()
+            .map(|id| {
+                parse_audit_line(&format!(
+                    "{{\"ts_ms\":1,\"turn_id\":\"t\",\"agent_id\":\"{id}\",\"kind\":\"k\",\"detail\":{{}}}}"
+                ))
+                .unwrap()
+            })
+            .collect();
+        assert_eq!(distinct_agents(&rows), vec!["agent-001", "agent-002"]);
+        assert!(distinct_agents(&[]).is_empty());
+    }
+
+    #[test]
+    fn phase_6_summaries_name_the_hash_check_and_the_new_kinds() {
+        // Code execution with a verified hash: the summary says
+        // so, plainly (§15.2 post-run half).
+        let row = parse_audit_line(
+            r#"{"ts_ms":1,"turn_id":"t","agent_id":"agent-002","kind":"code_execution","tool":"execute_code","decision":"executed","detail":{"language":"python3","code_len":14,"code_sha256":"aaaa","executed_code_sha256":"aaaa","code_hash_verified":true,"sandbox_verdict":"bwrap","exit_code":0,"duration_ms":12,"truncated":false}}"#,
+        )
+        .unwrap();
+        let summary = row.friendly_summary();
+        assert!(summary.contains("python3"), "{summary}");
+        assert!(summary.contains("đã kiểm chứng"), "{summary}");
+        assert!(!summary.contains("KHÔNG khớp"), "{summary}");
+        // A real mismatch is a warning, never silent.
+        let row = parse_audit_line(
+            r#"{"ts_ms":1,"turn_id":"t","kind":"code_execution","tool":"execute_code","decision":"executed","detail":{"language":"sh","code_sha256":"aaaa","executed_code_sha256":"bbbb","code_hash_verified":false,"sandbox_verdict":"bwrap","exit_code":0}}"#,
+        )
+        .unwrap();
+        assert!(row.friendly_summary().contains("KHÔNG khớp"));
+        // A denied run has no executed hash: no mismatch claim.
+        let row = parse_audit_line(
+            r#"{"ts_ms":1,"turn_id":"t","kind":"code_execution","tool":"execute_code","decision":"error","detail":{"language":"python3","code_sha256":"aaaa","sandbox_verdict":"sandbox_unavailable"}}"#,
+        )
+        .unwrap();
+        let summary = row.friendly_summary();
+        assert!(summary.contains("không thành"), "{summary}");
+        assert!(!summary.contains("KHÔNG khớp"), "{summary}");
+        // MCP + scope + rebuild + routing summaries.
+        let row = parse_audit_line(
+            r#"{"ts_ms":1,"turn_id":"t","kind":"mcp_server_connected","detail":{"mcp_server":"notes","server_name":"n","server_version":"1","protocol_version":"2025-06-18","tool_count":3,"sandboxed":false}}"#,
+        )
+        .unwrap();
+        assert!(row.friendly_summary().contains("KHÔNG SANDBOX"));
+        let row = parse_audit_line(
+            r#"{"ts_ms":1,"turn_id":"t","kind":"agent_failure_scope","decision":"all","detail":{"scope":"all","cause":"unknown_outcome: x","failed_agent":"agent-002","stop_latched":false,"actor_broken":true,"end_verified":false,"end_verification":"mixed","agents":[]}}"#,
+        )
+        .unwrap();
+        assert!(row.friendly_summary().contains("agent-002"));
+        let row = parse_audit_line(
+            r#"{"ts_ms":1,"turn_id":"t","kind":"body_rebuilt","decision":"rebuilt","detail":{"reason":"fault","generation":2}}"#,
+        )
+        .unwrap();
+        assert!(row.friendly_summary().contains("generation 2"));
+        let row = parse_audit_line(
+            r#"{"ts_ms":1,"turn_id":"t","kind":"routing","decision":"deny","detail":{"rule":"r6_gui_batch_loop"}}"#,
+        )
+        .unwrap();
+        assert!(row.friendly_summary().contains("lặp action GUI"));
+        // Queue decisions name the cause.
+        let row = parse_audit_line(
+            r#"{"ts_ms":1,"turn_id":"t","kind":"decision","tool":"body_click","decision":"deny","detail":{"reason":"queue_sla_expired"}}"#,
+        )
+        .unwrap();
+        assert!(row.friendly_summary().contains("hết hạn"));
     }
 }

@@ -43,7 +43,16 @@
 //! whitespace-only query returns NO results. The old `LIKE '%%'`
 //! behavior (empty query returns everything) is gone on purpose:
 //! "search for nothing" must not dump the notebook.
+//!
+//! Phase 6 (§3.2): every note has an owner agent and a shared
+//! flag. A private note of another agent reads as if it did not
+//! exist; only the owner may update or delete a note (a
+//! non-owner update/delete is a `Notebook` error, never a
+//! silent no-op). Pre-Phase-6 rows migrate to owner `agent-001`,
+//! shared — the only agent that could have written them. New
+//! rows are private unless the writing tool says otherwise.
 
+use crate::agents::AGENT_DEFAULT;
 use crate::audit::now_ms;
 use crate::error::MimintError;
 use rusqlite::{params, Connection, OptionalExtension};
@@ -60,6 +69,10 @@ pub struct Note {
     pub body: String,
     pub created_ms: u64,
     pub updated_ms: u64,
+    /// The agent that created this note (Phase 6, §3.2).
+    pub owner_agent_id: String,
+    /// Whether agents other than the owner may read this note.
+    pub shared: bool,
 }
 
 /// SQLite-backed notebook, synchronized for sharing between tools.
@@ -83,7 +96,6 @@ struct SearchIndex {
     /// Per-doc token counts, for length normalization.
     doc_lens: Vec<usize>,
     postings: HashMap<String, Vec<usize>>,
-    total_len: usize,
 }
 
 impl SearchIndex {
@@ -91,11 +103,9 @@ impl SearchIndex {
         let mut term_freqs = Vec::with_capacity(notes.len());
         let mut doc_lens = Vec::with_capacity(notes.len());
         let mut postings: HashMap<String, Vec<usize>> = HashMap::new();
-        let mut total_len = 0;
         for (pos, note) in notes.iter().enumerate() {
             let mut tokens = tokenize_baseline(&note.title);
             tokens.extend(tokenize_baseline(&note.body));
-            total_len += tokens.len();
             doc_lens.push(tokens.len());
             let mut freq: HashMap<String, usize> = HashMap::new();
             for token in tokens {
@@ -111,7 +121,6 @@ impl SearchIndex {
             term_freqs,
             doc_lens,
             postings,
-            total_len,
         }
     }
 }
@@ -119,14 +128,20 @@ impl SearchIndex {
 fn note_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Note> {
     let created_ms: i64 = row.get(3)?;
     let updated_ms: i64 = row.get(4)?;
+    let shared: i64 = row.get(6)?;
     Ok(Note {
         id: row.get(0)?,
         title: row.get(1)?,
         body: row.get(2)?,
         created_ms: created_ms as u64,
         updated_ms: updated_ms as u64,
+        owner_agent_id: row.get(5)?,
+        shared: shared != 0,
     })
 }
+
+/// Columns selected by every note query, in `note_from_row` order.
+const NOTE_COLUMNS: &str = "id, title, body, created_ms, updated_ms, owner_agent_id, shared";
 
 /// Baseline tokenizer: NFC-normalize (Vietnamese-only, see
 /// [`normalize_nfc_vietnamese`]), Unicode-lowercase, then split on
@@ -349,11 +364,34 @@ fn bm25_score(
     score
 }
 
+/// Add a column when it does not exist yet (idempotent
+/// migration). Checks `PRAGMA table_info` first so opening an
+/// already-migrated database is a no-op.
+fn ensure_column(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    ddl: &str,
+) -> Result<(), MimintError> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name == column {
+            return Ok(());
+        }
+    }
+    conn.execute(ddl, [])?;
+    Ok(())
+}
+
 impl Notebook {
     /// Open (or create) the database file and ensure the schema exists.
-    /// The schema is unchanged since Phase 1: a database written by
-    /// an older build opens here with every note intact (see the
-    /// migration test).
+    /// The schema is unchanged since Phase 1 except for the Phase 6
+    /// owner/shared columns, added idempotently below: a database
+    /// written by an older build opens here with every note intact
+    /// (see the migration test), its rows owned by `agent-001` and
+    /// shared.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, MimintError> {
         let conn = Connection::open(path.as_ref())?;
         conn.execute(
@@ -365,6 +403,22 @@ impl Notebook {
                 updated_ms INTEGER NOT NULL
             )",
             [],
+        )?;
+        // Phase 6 migration (§3.2): owner + shared columns. The
+        // defaults describe pre-existing rows only: the only agent
+        // that could have written them is the default agent, and
+        // they were visible to everyone (there was no partition).
+        ensure_column(
+            &conn,
+            "notes",
+            "owner_agent_id",
+            "ALTER TABLE notes ADD COLUMN owner_agent_id TEXT NOT NULL DEFAULT 'agent-001'",
+        )?;
+        ensure_column(
+            &conn,
+            "notes",
+            "shared",
+            "ALTER TABLE notes ADD COLUMN shared INTEGER NOT NULL DEFAULT 1",
         )?;
         Ok(Self {
             conn: Mutex::new(conn),
@@ -414,14 +468,29 @@ impl Notebook {
         Ok(slot)
     }
 
-    /// Insert a note, returning its id.
+    /// Insert a note, returning its id. The legacy single-agent
+    /// path: owned by the default agent, private. Tools use
+    /// [`Self::add_for`] with the acting agent and an explicit
+    /// shared flag.
     pub fn add(&self, title: &str, body: &str) -> Result<i64, MimintError> {
+        self.add_for(AGENT_DEFAULT, title, body, false)
+    }
+
+    /// Insert a note owned by `agent_id`. New rows are private
+    /// unless `shared` is set (§3.2).
+    pub fn add_for(
+        &self,
+        agent_id: &str,
+        title: &str,
+        body: &str,
+        shared: bool,
+    ) -> Result<i64, MimintError> {
         let now = now_ms() as i64;
         let id = {
             let conn = self.connection();
             conn.execute(
-                "INSERT INTO notes (title, body, created_ms, updated_ms) VALUES (?1, ?2, ?3, ?3)",
-                params![title, body, now],
+                "INSERT INTO notes (title, body, created_ms, updated_ms, owner_agent_id, shared) VALUES (?1, ?2, ?3, ?3, ?4, ?5)",
+                params![title, body, now, agent_id, shared as i64],
             )?;
             conn.last_insert_rowid()
         };
@@ -429,43 +498,60 @@ impl Notebook {
         Ok(id)
     }
 
-    /// Read one note by id.
+    /// Read one note by id, as the default agent sees it.
     pub fn get(&self, id: i64) -> Result<Option<Note>, MimintError> {
+        self.get_for(AGENT_DEFAULT, id)
+    }
+
+    /// Read one note by id, as `agent_id` sees it. A private note
+    /// of another agent reads as if it did not exist (`None`) —
+    /// the caller cannot tell "absent" from "someone else's
+    /// private note" (§3.2; id enumeration remains a known,
+    /// accepted limit, F6D-07).
+    pub fn get_for(&self, agent_id: &str, id: i64) -> Result<Option<Note>, MimintError> {
         let conn = self.connection();
         let note = conn
             .query_row(
-                "SELECT id, title, body, created_ms, updated_ms FROM notes WHERE id = ?1",
+                &format!("SELECT {NOTE_COLUMNS} FROM notes WHERE id = ?1"),
                 params![id],
                 note_from_row,
             )
             .optional()?;
-        Ok(note)
+        Ok(note.filter(|note| note.owner_agent_id == agent_id || note.shared))
     }
 
     /// All notes in id order. Used by checkers and eval code that
-    /// must see the whole notebook, not a ranked slice.
+    /// must see the whole notebook, not a ranked slice. This is
+    /// the privileged whole-notebook view: tools must use the
+    /// `_for` methods, which enforce ownership.
     pub fn all_notes(&self) -> Result<Vec<Note>, MimintError> {
         let conn = self.connection();
-        let mut stmt = conn
-            .prepare("SELECT id, title, body, created_ms, updated_ms FROM notes ORDER BY id ASC")?;
+        let mut stmt =
+            conn.prepare(&format!("SELECT {NOTE_COLUMNS} FROM notes ORDER BY id ASC"))?;
         let notes = stmt
             .query_map([], note_from_row)?
             .collect::<Result<Vec<Note>, _>>()?;
         Ok(notes)
     }
 
-    /// BM25-ranked search over titles and bodies. Terms are OR-ed:
-    /// a note matches when it contains at least one query term.
-    /// Results are ordered by score (highest first), ties broken
-    /// by id (oldest first), so the order is deterministic.
-    /// An empty or whitespace-only query returns no results.
-    /// Scoring reads the cached inverted index: only docs
-    /// containing a query term are scored, which is identical
-    /// to scoring every doc — a doc with no query term scores
-    /// exactly 0.0 and is filtered out either way.
+    /// BM25-ranked search over titles and bodies, as the default
+    /// agent sees it. See [`Self::search_for`].
     pub fn search(&self, query: &str) -> Result<Vec<Note>, MimintError> {
+        self.search_for(AGENT_DEFAULT, query)
+    }
+
+    /// BM25-ranked search over titles and bodies, as `agent_id`
+    /// sees it. Terms are OR-ed: a note matches when it contains
+    /// at least one query term. Results are ordered by score
+    /// (highest first), ties broken by id (oldest first), so the
+    /// order is deterministic. An empty or whitespace-only query
+    /// returns no results. Ranking statistics (document
+    /// frequencies, average length) are computed over the
+    /// VISIBLE notes only, so a private note of another agent
+    /// cannot influence scores — it is as if it did not exist.
+    pub fn search_for(&self, agent_id: &str, query: &str) -> Result<Vec<Note>, MimintError> {
         Ok(self
-            .search_ranked(query)?
+            .search_ranked_for(agent_id, query)?
             .into_iter()
             .map(|(note, _)| note)
             .collect())
@@ -475,6 +561,15 @@ impl Notebook {
     /// for tests and eval reports. Scores are comparable within one
     /// query only.
     pub fn search_ranked(&self, query: &str) -> Result<Vec<(Note, f64)>, MimintError> {
+        self.search_ranked_for(AGENT_DEFAULT, query)
+    }
+
+    /// [`Self::search_for`] with the BM25 score attached.
+    pub fn search_ranked_for(
+        &self,
+        agent_id: &str,
+        query: &str,
+    ) -> Result<Vec<(Note, f64)>, MimintError> {
         let query_terms: HashSet<String> = tokenize_baseline(query).into_iter().collect();
         if query_terms.is_empty() {
             return Ok(Vec::new());
@@ -483,17 +578,37 @@ impl Notebook {
         let Some(index) = slot.as_ref() else {
             return Ok(Vec::new());
         };
-        let doc_count = index.notes.len();
+        // Visibility mask: the agent's own notes plus shared ones.
+        // The cached index carries owner/shared on every note, so
+        // filtering needs no extra query.
+        let visible: Vec<bool> = index
+            .notes
+            .iter()
+            .map(|note| note.owner_agent_id == agent_id || note.shared)
+            .collect();
+        let doc_count = visible.iter().filter(|v| **v).count();
         if doc_count == 0 {
             return Ok(Vec::new());
         }
-        let avg_len = index.total_len as f64 / doc_count as f64;
+        let visible_len: usize = index
+            .doc_lens
+            .iter()
+            .zip(&visible)
+            .filter(|(_, v)| **v)
+            .map(|(len, _)| *len)
+            .sum();
+        let avg_len = visible_len as f64 / doc_count as f64;
         let mut doc_freq: HashMap<String, usize> = HashMap::new();
         let mut candidates: HashSet<usize> = HashSet::new();
         for term in query_terms.iter() {
             if let Some(posting) = index.postings.get(term) {
-                doc_freq.insert(term.clone(), posting.len());
-                candidates.extend(posting.iter().copied());
+                let visible_posting: Vec<usize> = posting
+                    .iter()
+                    .copied()
+                    .filter(|pos| visible[*pos])
+                    .collect();
+                doc_freq.insert(term.clone(), visible_posting.len());
+                candidates.extend(visible_posting);
             }
         }
         let mut scored: Vec<(Note, f64)> = candidates
@@ -519,11 +634,42 @@ impl Notebook {
         Ok(scored)
     }
 
-    /// Replace a note's title and body. Returns false when the id is absent.
+    /// Replace a note's title and body, as the default agent.
+    /// Returns false when the id is absent.
     pub fn update(&self, id: i64, title: &str, body: &str) -> Result<bool, MimintError> {
-        let now = now_ms() as i64;
+        self.update_for(AGENT_DEFAULT, id, title, body)
+    }
+
+    /// Replace a note's title and body. Only the OWNER may update
+    /// (§3.2): updating another agent's note is a `Notebook`
+    /// error and performs no write. Returns false when the id is
+    /// absent. The single-writer mutex plus the owner-only rule
+    /// is the lost-update protection (F6D-10): no new lock.
+    pub fn update_for(
+        &self,
+        agent_id: &str,
+        id: i64,
+        title: &str,
+        body: &str,
+    ) -> Result<bool, MimintError> {
         let changed = {
             let conn = self.connection();
+            let owner: Option<String> = conn
+                .query_row(
+                    "SELECT owner_agent_id FROM notes WHERE id = ?1",
+                    params![id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(owner) = owner else {
+                return Ok(false);
+            };
+            if owner != agent_id {
+                return Err(MimintError::Notebook(format!(
+                    "note {id} belongs to {owner}: only the owner may update it"
+                )));
+            }
+            let now = now_ms() as i64;
             conn.execute(
                 "UPDATE notes SET title = ?2, body = ?3, updated_ms = ?4 WHERE id = ?1",
                 params![id, title, body, now],
@@ -533,10 +679,33 @@ impl Notebook {
         Ok(changed > 0)
     }
 
-    /// Delete a note. Returns false when the id is absent.
+    /// Delete a note, as the default agent. Returns false when
+    /// the id is absent.
     pub fn delete(&self, id: i64) -> Result<bool, MimintError> {
+        self.delete_for(AGENT_DEFAULT, id)
+    }
+
+    /// Delete a note. Only the OWNER may delete (§3.2): deleting
+    /// another agent's note is a `Notebook` error and performs
+    /// no write. Returns false when the id is absent.
+    pub fn delete_for(&self, agent_id: &str, id: i64) -> Result<bool, MimintError> {
         let changed = {
             let conn = self.connection();
+            let owner: Option<String> = conn
+                .query_row(
+                    "SELECT owner_agent_id FROM notes WHERE id = ?1",
+                    params![id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(owner) = owner else {
+                return Ok(false);
+            };
+            if owner != agent_id {
+                return Err(MimintError::Notebook(format!(
+                    "note {id} belongs to {owner}: only the owner may delete it"
+                )));
+            }
             conn.execute("DELETE FROM notes WHERE id = ?1", params![id])?
         };
         self.invalidate_index();
@@ -554,6 +723,7 @@ impl Notebook {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_db(tag: &str) -> std::path::PathBuf {
@@ -881,6 +1051,247 @@ mod tests {
         // the cache holds no state the database lacks.
         let reopened = Notebook::open(&path).expect("reopen notebook");
         assert_eq!(reopened.search_ranked("mưa").unwrap(), first);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn legacy_rows_migrate_to_default_owner_and_shared() {
+        let path = temp_db("legacy-owner");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute(
+                "CREATE TABLE notes (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    title TEXT NOT NULL,
+                    body TEXT NOT NULL,
+                    created_ms INTEGER NOT NULL,
+                    updated_ms INTEGER NOT NULL
+                )",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO notes (title, body, created_ms, updated_ms) VALUES ('Cũ', 'ghi chú cũ', 1000, 1000)",
+                [],
+            )
+            .unwrap();
+        }
+        let notebook = Notebook::open(&path).expect("open legacy database");
+        let note = notebook.get(1).unwrap().expect("legacy note");
+        assert_eq!(note.owner_agent_id, "agent-001");
+        assert!(note.shared);
+        // Shared: another agent reads it too.
+        assert!(notebook.get_for("agent-002", 1).unwrap().is_some());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn private_notes_are_invisible_to_other_agents() {
+        let path = temp_db("partition");
+        let notebook = Notebook::open(&path).expect("open notebook");
+        let private = notebook
+            .add_for("agent-002", "Riêng tư", "bí mật zebra", false)
+            .unwrap();
+        let shared = notebook
+            .add_for("agent-002", "Chung", "công khai zebra", true)
+            .unwrap();
+        // The owner sees both.
+        assert!(notebook.get_for("agent-002", private).unwrap().is_some());
+        assert!(notebook.get_for("agent-002", shared).unwrap().is_some());
+        // Another agent sees only the shared one; the private one
+        // reads as if it did not exist.
+        assert!(notebook.get_for("agent-001", private).unwrap().is_none());
+        assert!(notebook.get_for("agent-001", shared).unwrap().is_some());
+        assert_eq!(notebook.get_for("agent-001", 9999).unwrap(), None);
+        // Search respects the same partition.
+        let results = notebook.search_for("agent-001", "zebra").unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, shared);
+        let results = notebook.search_for("agent-002", "zebra").unwrap();
+        assert_eq!(results.len(), 2);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn only_the_owner_may_update_or_delete() {
+        let path = temp_db("owner-only");
+        let notebook = Notebook::open(&path).expect("open notebook");
+        let id = notebook
+            .add_for("agent-002", "Của tôi", "nội dung gốc", true)
+            .unwrap();
+        // A shared note is readable by others but still only
+        // writable by its owner.
+        let err = notebook
+            .update_for("agent-001", id, "Sửa trộm", "đổi")
+            .expect_err("non-owner update must fail");
+        assert!(matches!(err, MimintError::Notebook(_)), "{err}");
+        assert_eq!(
+            notebook.get_for("agent-002", id).unwrap().unwrap().title,
+            "Của tôi",
+            "failed update must not write"
+        );
+        let err = notebook
+            .delete_for("agent-001", id)
+            .expect_err("non-owner delete must fail");
+        assert!(matches!(err, MimintError::Notebook(_)), "{err}");
+        assert!(notebook.get_for("agent-002", id).unwrap().is_some());
+        // The owner can do both.
+        assert!(notebook
+            .update_for("agent-002", id, "Đã sửa", "mới")
+            .unwrap());
+        assert!(notebook.delete_for("agent-002", id).unwrap());
+        // Absent ids still return false, not an error.
+        assert!(!notebook.update_for("agent-002", 9999, "x", "y").unwrap());
+        assert!(!notebook.delete_for("agent-002", 9999).unwrap());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn g6_5_notebook_isolation() {
+        // Two agents write concurrently, as two simultaneous
+        // turns would: neither ever sees the other's private
+        // notes, neither can edit the other's rows, and shared
+        // rows stay readable by both. (Old-database migration
+        // is covered by legacy_rows_migrate_to_default_owner_and_shared.)
+        let path = temp_db("g6-5");
+        let notebook = Arc::new(Notebook::open(&path).expect("open notebook"));
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let work = |notebook: Arc<Notebook>, barrier: Arc<std::sync::Barrier>, agent: &str| {
+            let agent = agent.to_string();
+            std::thread::spawn(move || {
+                barrier.wait();
+                let mut private = Vec::new();
+                let mut shared = Vec::new();
+                for i in 0..10 {
+                    private.push(
+                        notebook
+                            .add_for(&agent, &format!("private-{agent}-{i}"), "secret", false)
+                            .unwrap(),
+                    );
+                }
+                for i in 0..5 {
+                    shared.push(
+                        notebook
+                            .add_for(&agent, &format!("shared-{agent}-{i}"), "open", true)
+                            .unwrap(),
+                    );
+                }
+                (private, shared)
+            })
+        };
+        let a = work(Arc::clone(&notebook), Arc::clone(&barrier), "agent-001");
+        let b = work(Arc::clone(&notebook), Arc::clone(&barrier), "agent-002");
+        let (a_private, a_shared) = a.join().unwrap();
+        let (b_private, b_shared) = b.join().unwrap();
+        // Cross-visibility: own private + everyone's shared,
+        // never the other agent's private.
+        for id in &a_private {
+            assert!(notebook.get_for("agent-001", *id).unwrap().is_some());
+            assert!(notebook.get_for("agent-002", *id).unwrap().is_none());
+        }
+        for id in &b_private {
+            assert!(notebook.get_for("agent-002", *id).unwrap().is_some());
+            assert!(notebook.get_for("agent-001", *id).unwrap().is_none());
+        }
+        for id in a_shared.iter().chain(b_shared.iter()) {
+            assert!(notebook.get_for("agent-001", *id).unwrap().is_some());
+            assert!(notebook.get_for("agent-002", *id).unwrap().is_some());
+        }
+        // No editing across the partition, even for shared rows.
+        let err = notebook
+            .update_for("agent-001", b_shared[0], "hijack", "hijack")
+            .expect_err("non-owner update must fail");
+        assert!(matches!(err, MimintError::Notebook(_)), "{err}");
+        let err = notebook
+            .delete_for("agent-002", a_shared[0])
+            .expect_err("non-owner delete must fail");
+        assert!(matches!(err, MimintError::Notebook(_)), "{err}");
+        // Search partitions too.
+        let results = notebook.search_for("agent-001", "secret").unwrap();
+        assert_eq!(results.len(), 10, "only own private notes match");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn notebook_concurrent_writes_no_lost_update() {
+        let path = temp_db("no-lost-update");
+        let notebook = Arc::new(Notebook::open(&path).expect("open notebook"));
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let work = |notebook: Arc<Notebook>, barrier: Arc<std::sync::Barrier>, agent: &str| {
+            let agent = agent.to_string();
+            std::thread::spawn(move || {
+                barrier.wait();
+                for i in 0..50 {
+                    notebook
+                        .add_for(
+                            &agent,
+                            &format!("{agent}-note-{i}"),
+                            &format!("body-{agent}-{i}"),
+                            i % 2 == 0,
+                        )
+                        .unwrap();
+                }
+            })
+        };
+        let a = work(Arc::clone(&notebook), Arc::clone(&barrier), "agent-001");
+        let b = work(Arc::clone(&notebook), Arc::clone(&barrier), "agent-002");
+        a.join().unwrap();
+        b.join().unwrap();
+        // Every successful write reads back intact: 100 rows,
+        // each title present exactly once, each body whole.
+        let all = notebook.all_notes().unwrap();
+        assert_eq!(all.len(), 100);
+        for agent in ["agent-001", "agent-002"] {
+            for i in 0..50 {
+                let title = format!("{agent}-note-{i}");
+                let matches: Vec<&Note> = all.iter().filter(|n| n.title == title).collect();
+                assert_eq!(matches.len(), 1, "{title} must appear exactly once");
+                assert_eq!(matches[0].body, format!("body-{agent}-{i}"));
+                assert_eq!(matches[0].owner_agent_id, agent);
+            }
+        }
+        // Editing another agent's shared row is refused and
+        // the original is untouched.
+        let shared_id = all
+            .iter()
+            .find(|n| n.owner_agent_id == "agent-002" && n.shared)
+            .unwrap()
+            .id;
+        let before = notebook.get_for("agent-002", shared_id).unwrap().unwrap();
+        let err = notebook
+            .update_for("agent-001", shared_id, "hijack", "hijack")
+            .expect_err("non-owner update must fail");
+        assert!(matches!(err, MimintError::Notebook(_)), "{err}");
+        let after = notebook.get_for("agent-002", shared_id).unwrap().unwrap();
+        assert_eq!(after.title, before.title);
+        assert_eq!(after.body, before.body);
+        // Concurrent updates to one owned row never corrupt
+        // it: the final row equals one of the written values,
+        // never a mixture.
+        let owned = notebook
+            .add_for("agent-001", "contended", "v0", false)
+            .unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let updater = |notebook: Arc<Notebook>, barrier: Arc<std::sync::Barrier>, value: &str| {
+            let value = value.to_string();
+            std::thread::spawn(move || {
+                barrier.wait();
+                for _ in 0..20 {
+                    notebook
+                        .update_for("agent-001", owned, "contended", &value)
+                        .unwrap();
+                }
+            })
+        };
+        let u1 = updater(Arc::clone(&notebook), Arc::clone(&barrier), "alpha");
+        let u2 = updater(Arc::clone(&notebook), Arc::clone(&barrier), "beta");
+        u1.join().unwrap();
+        u2.join().unwrap();
+        let final_body = notebook.get_for("agent-001", owned).unwrap().unwrap().body;
+        assert!(
+            final_body == "alpha" || final_body == "beta",
+            "final body must be one whole write: {final_body:?}"
+        );
         let _ = std::fs::remove_file(&path);
     }
 }

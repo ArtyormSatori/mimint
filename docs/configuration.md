@@ -125,6 +125,87 @@ fallback mode. The broken config file is never overwritten.
 See `docs/profiles.md` for switching semantics and the
 stored-not-executed limits.
 
+### Phase 6 sections: `[agents]`, `[hierarchy]`, `[sandbox]`, `[routing]`, `[[mcp-server]]`
+
+Defaults = today's behavior (everything off/locked). All new
+sections reject unknown fields, like everything else in this
+file. Validation fails closed: an out-of-range number, a
+relative MCP command, a duplicate server name, hierarchy
+without parallelism, or `unsandboxed = true` on Linux is a
+configuration error, and the run does not start.
+
+```toml
+[agents]
+parallelism_enabled = false # default: OFF. Parallel agents are opt-in.
+max_agents = 3              # 1..8. The default agent always counts as one.
+queue_sla_secs = 60         # 10..300. Max time an action WAITS in the queue.
+max_queued_total = 64       # 1..4096. Queue backstop, all agents.
+max_queued_per_agent = 16   # 1..1024, and no more than the total.
+action_timeout_secs = 30    # 1..600. Max time an action RUNS once started.
+
+[hierarchy]
+enabled = false             # default: OFF. Requires parallelism_enabled.
+max_children = 2            # 1..4, and no more than max_agents - 1.
+default_child_steps = 10    # 1..50.
+default_child_time_secs = 300  # 60..1800.
+
+[sandbox]
+execute_code_timeout_secs = 30  # 5..300.
+max_output_bytes = 1048576  # 1..1048576. Tighten-only: never above 1 MiB.
+rlimit_fsize_bytes = 67108864    # 64 MiB per run.
+rlimit_as_bytes = 1073741824     # 1 GiB per run.
+
+[routing]
+gui_batch_threshold = 5     # 2..50. Repeated identical GUI actions per turn.
+
+[[mcp-server]]
+name = "notes"              # [a-z0-9_], unique. At most 8 servers.
+command = "/usr/bin/notes-mcp"  # ABSOLUTE path. A relative command is an error.
+args = ["--stdio"]
+timeout_secs = 30           # 5..300.
+unsandboxed = false         # default false everywhere. On Linux, true is a
+                            # configuration error. On macOS/Windows it is a
+                            # per-server opt-in that also needs an explicit
+                            # confirmation at connect time.
+# env = { NOTES_DIR = "/home/user/notes" }  # explicit extra env for the server.
+```
+
+Safety ceilings are CONSTANTS in code, not configuration: the
+MCP frame cap (256 KiB), the stderr ring (16 KiB), the catalog
+cap (32 KiB/server), the description cap (512 bytes), the
+schema/args depth (8), and the code-output cap (1 MiB) cannot
+be loosened through the config file. `max_output_bytes` above
+can only tighten the output cap, never raise it.
+
+The config file that names `[[mcp-server]]` entries must live
+outside every directory tools can write (code-run workdirs,
+MCP workdirs, the temp directory). The app refuses to start
+otherwise: a server entry in a tool-writable file would let a
+tool rewrite its own allow-list.
+
+### Three presentation tiers (F6D-19)
+
+When the UI or documentation presents these settings, it uses
+three tiers, and the rules below are mandatory:
+
+- **Tier 1 — basic:** `parallelism_enabled`, `max_agents`,
+  `enabled` (hierarchy). Plain language, no jargon. The panel
+  states that adding agents does not guarantee speedup
+  (especially with a local CPU backend).
+- **Tier 2 — advanced:** queue SLA, queue caps, action timeout,
+  child limits, sandbox timeout/output caps, the R6 threshold.
+  Each value states what it bounds (a WAIT bound is never
+  presented as a run bound, and vice versa).
+- **Tier 3 — expert:** rlimits, MCP server entries, unsandboxed
+  mode. Unsandboxed mode is always presented with its warning
+  and its continuous indicator, never as a plain toggle.
+
+Presentation rules: a number that is an estimate is labeled
+"ƯỚC TÍNH, không phải hóa đơn"; USD appears only when measured
+(see `docs/privacy-and-cost.md`); no message ever suggests
+disabling the sandbox; a queue SLA is described as the maximum
+WAIT time, never as an execution time.
+
 ## Backend selection precedence
 
 First match wins:

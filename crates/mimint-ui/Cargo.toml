@@ -13,4 +13,6 @@ mimint-core = { path = "../mimint-core" }
 mimint-body = { path = "../mimint-body" }
 mimint-control = { path = "../mimint-control" }
 serde_json = "1"
-tokio = { version = "1", features = ["rt-multi-thread"] }
+# Phase 6: `time` for the coordinator's bounded join (same crate,
+# 0 new packages).
+tokio = { version = "1", features = ["rt-multi-thread", "time"] }

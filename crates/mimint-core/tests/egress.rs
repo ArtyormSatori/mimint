@@ -301,14 +301,18 @@ async fn privacy_on_turn_only_touches_the_loopback_stub() {
         guarded_on(Duration::from_secs(10)),
     )
     .expect("provider");
-    let approver = TestApprover;
+    let approver: Arc<dyn Approver> = Arc::new(TestApprover);
+    let provider: Arc<dyn Provider> = Arc::new(provider);
+    let registry = Arc::new(registry);
+    let audit = Arc::new(audit);
     let brain = Brain::new(
-        &provider,
-        &registry,
-        Some(&approver),
-        &audit,
+        Arc::clone(&provider),
+        Arc::clone(&registry),
+        Some(Arc::clone(&approver)),
+        Arc::clone(&audit),
         Arc::clone(&notebook),
         "turn-egress",
+        "agent-001",
         5,
     )
     .expect("brain");

@@ -16,11 +16,15 @@
 //! [`Approver`]: mimint_core::Approver
 //! [`Brain`]: mimint_core::Brain
 
+pub mod agent_state;
 pub mod app;
 pub mod approval_text;
 pub mod approver;
 pub mod audit_view;
 pub mod chat;
+pub mod coordinator;
+pub mod delegate;
+pub mod error_messages;
 pub mod face;
 pub mod motion;
 pub mod worker;

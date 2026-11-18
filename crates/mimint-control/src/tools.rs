@@ -45,11 +45,13 @@
 
 use crate::actor::BodyActor;
 use crate::frames::{FrameMeta, FrameStore};
+use crate::slots::AgentSnapshotSlots;
 use mimint_body::{
     action_specs, ActOutcome, Action, ActionSpec, BodyError, Key, TargetSnapshotSlot,
 };
-use mimint_core::{MimintError, Risk, Tool};
+use mimint_core::{MimintError, Risk, Tool, AGENT_DEFAULT};
 use serde_json::{json, Value};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -92,6 +94,14 @@ pub struct BodyTool {
     snapshot_slot: Arc<TargetSnapshotSlot>,
     /// Maximum observation age for input actions (F4-08).
     max_observation_age: Duration,
+    /// The agent this tool belongs to (Phase 6, §3): its
+    /// actions join its own actor queue, its snapshots live
+    /// in its own slot, and its frames carry its id.
+    agent_id: String,
+    /// Queue wait of the last `execute`, read from the actor
+    /// after every call (Ok and Err alike) for the
+    /// `queued_ms` audit field (§9).
+    queue_wait_ms: AtomicU64,
 }
 
 impl BodyTool {
@@ -102,6 +112,7 @@ impl BodyTool {
         privacy: PrivacyFlag,
         snapshot_slot: Arc<TargetSnapshotSlot>,
         max_observation_age: Duration,
+        agent_id: &str,
     ) -> BodyTool {
         BodyTool {
             spec,
@@ -110,12 +121,25 @@ impl BodyTool {
             privacy,
             snapshot_slot,
             max_observation_age,
+            agent_id: agent_id.to_string(),
+            queue_wait_ms: AtomicU64::new(0),
         }
     }
 
     /// The tool name: `body_<action>`.
     pub fn tool_name(action: &str) -> String {
         format!("body_{action}")
+    }
+
+    /// The agent this tool acts for.
+    pub fn agent_id(&self) -> &str {
+        &self.agent_id
+    }
+
+    /// Queue wait of the last `execute` call, in
+    /// milliseconds (0 when it ran at once).
+    pub fn last_queue_wait_ms(&self) -> u64 {
+        self.queue_wait_ms.load(Ordering::SeqCst)
     }
 }
 
@@ -142,9 +166,19 @@ impl BodyTool {
             self.check_observation_fresh()?;
             self.reverify_target(&action)?;
         }
-        match self.actor.act(action) {
+        let outcome = self.actor.act_for(&self.agent_id, action);
+        // Record the queue wait on BOTH paths: the guard
+        // executor reads it for the execution record even
+        // when the call failed (§9).
+        self.queue_wait_ms.store(
+            self.actor.last_queue_wait_ms_for(&self.agent_id),
+            Ordering::SeqCst,
+        );
+        match outcome {
             Ok(ActOutcome::Frame(frame)) => {
-                let meta = self.frames.store(frame, self.privacy.is_on());
+                let meta = self
+                    .frames
+                    .store_for(&self.agent_id, frame, self.privacy.is_on());
                 Ok(frame_meta_json(&meta))
             }
             Ok(ActOutcome::Done) => Ok(json!({"ok": true})),
@@ -153,13 +187,37 @@ impl BodyTool {
     }
 
     /// Refuse input actions planned from a stale observation
-    /// (F4-08). Screenshots are exempt (they refresh the
-    /// observation); an empty store is exempt (nothing stale).
+    /// (F4-08) or from before a body rebuild (Phase 6, §4.1).
+    /// Freshness is PER-AGENT (§3 row 8): the check reads the
+    /// acting agent's own newest frame — another agent's
+    /// fresh screenshot does not refresh this agent's
+    /// observation, and another agent's stale frame does not
+    /// block this agent. Screenshots are exempt (they refresh
+    /// the observation); an agent with no stored frame is
+    /// exempt (nothing stale) UNLESS a rebuild raised the
+    /// floor — after a rebuild the first input action MUST
+    /// follow a fresh screenshot by that same agent.
     fn check_observation_fresh(&self) -> Result<(), MimintError> {
-        if self.frames.observation_stale(self.max_observation_age) {
+        let floor = self.frames.floor();
+        if floor > 0 {
+            let fresh_enough = self
+                .frames
+                .latest_meta_for(&self.agent_id)
+                .is_some_and(|meta| meta.generation >= floor);
+            if !fresh_enough {
+                return Err(MimintError::Tool(
+                    "stale_observation: the body was rebuilt; take a fresh screenshot before acting"
+                        .to_string(),
+                ));
+            }
+        }
+        if self
+            .frames
+            .observation_stale_for(&self.agent_id, self.max_observation_age)
+        {
             let age_secs = self
                 .frames
-                .latest_age()
+                .latest_age_for(&self.agent_id)
                 .map(|age| age.as_secs())
                 .unwrap_or(0);
             return Err(body_err_to_tool(BodyError::StaleObservation {
@@ -185,7 +243,7 @@ impl BodyTool {
         let Some(expected) = self.snapshot_slot.take_for(x, y) else {
             return Ok(());
         };
-        let fresh = match self.actor.probe_target(x, y) {
+        let fresh = match self.actor.probe_target_for(&self.agent_id, x, y) {
             Ok(probe) => probe.snapshot,
             Err(err) => return Err(body_err_to_tool(err)),
         };
@@ -248,6 +306,10 @@ impl Tool for NamedBodyTool {
     fn execute(&self, args: &Value) -> Result<Value, MimintError> {
         self.inner.execute(args)
     }
+
+    fn last_queue_wait_ms(&self) -> Option<u64> {
+        Some(self.inner.last_queue_wait_ms())
+    }
 }
 
 /// Static `body_<action>` names, in spec order. Built once
@@ -291,6 +353,7 @@ pub fn register_body_tools(
 
 /// Register all body tools with the approver-shared snapshot
 /// slot and a configured observation age (the worker path).
+/// Single-agent entry: the tools act for the default agent.
 pub fn register_body_tools_configured(
     registry: &mut mimint_core::Registry,
     actor: BodyActor,
@@ -311,6 +374,40 @@ pub fn register_body_tools_configured(
                 privacy.clone(),
                 Arc::clone(&snapshot_slot),
                 max_observation_age,
+                AGENT_DEFAULT,
+            ),
+        )));
+    }
+}
+
+/// Register all body tools for one agent (Phase 6, §3): the
+/// tools join the agent's actor queue, share the agent's
+/// snapshot slot from `slots`, and attribute their frames to
+/// the agent. Each agent gets its own registry built by this
+/// function; the actor, store, and privacy flag stay shared.
+pub fn register_body_tools_for_agent(
+    registry: &mut mimint_core::Registry,
+    actor: BodyActor,
+    frames: Arc<FrameStore>,
+    privacy: PrivacyFlag,
+    slots: &AgentSnapshotSlots,
+    agent_id: &str,
+    max_observation_age: Duration,
+) {
+    let specs = action_specs_static();
+    let names = tool_names();
+    let slot = slots.slot_for(agent_id);
+    for (spec, name) in specs.iter().zip(names.iter()) {
+        registry.register(Box::new(NamedBodyTool::new(
+            name,
+            BodyTool::with_config(
+                spec,
+                actor.clone(),
+                Arc::clone(&frames),
+                privacy.clone(),
+                Arc::clone(&slot),
+                max_observation_age,
+                agent_id,
             ),
         )));
     }
@@ -340,6 +437,11 @@ fn frame_meta_json(meta: &FrameMeta) -> Value {
 }
 
 fn body_err_to_tool(err: BodyError) -> MimintError {
+    // A cancelled body request is a cancellation, not a
+    // tool failure: the brain ends the turn Cancelled (§10).
+    if let BodyError::Cancelled { .. } = err {
+        return MimintError::Cancelled(err.message());
+    }
     MimintError::Tool(format!("{}: {}", err.code(), err.message()))
 }
 
@@ -627,5 +729,248 @@ mod tests {
             .unwrap()
             .execute(&json!({"x": 200, "y": 200}))
             .is_ok());
+    }
+
+    #[test]
+    fn cancelled_agent_maps_to_cancelled_not_a_tool_error() {
+        let actor = BodyActor::spawn(Box::new(MockBody::new()), StopFlag::new());
+        actor.cancel_agent("agent-001");
+        let frames = Arc::new(FrameStore::new());
+        let mut registry = mimint_core::Registry::new();
+        register_body_tools(
+            &mut registry,
+            actor,
+            Arc::clone(&frames),
+            PrivacyFlag::new(false),
+        );
+        let err = registry
+            .get("body_click")
+            .unwrap()
+            .execute(&json!({"x": 10, "y": 10}))
+            .unwrap_err();
+        assert!(
+            matches!(err, mimint_core::MimintError::Cancelled(_)),
+            "expected Cancelled, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn queue_wait_is_reported_after_execute() {
+        let (registry, _) = harness();
+        let tool = registry.get("body_click").unwrap();
+        assert!(tool.execute(&json!({"x": 10, "y": 10})).is_ok());
+        // Ran at once: a queue wait is reported (usually 0,
+        // occasionally 1ms under load), never None — body
+        // tools have a queue, and the executor reads this
+        // after every call for the execution record.
+        let wait = tool.last_queue_wait_ms();
+        assert!(wait.is_some(), "queue wait must be reported");
+        assert!(wait.unwrap() < 1000, "wait = {wait:?}");
+    }
+
+    #[test]
+    fn floor_check_refuses_input_after_rebuild_until_a_fresh_screenshot() {
+        let actor = BodyActor::spawn(Box::new(MockBody::new()), StopFlag::new());
+        let frames = Arc::new(FrameStore::new());
+        let mut registry = mimint_core::Registry::new();
+        register_body_tools(
+            &mut registry,
+            actor,
+            Arc::clone(&frames),
+            PrivacyFlag::new(false),
+        );
+        // Before any rebuild the floor is 0: input runs.
+        assert!(registry
+            .get("body_click")
+            .unwrap()
+            .execute(&json!({"x": 10, "y": 10}))
+            .is_ok());
+        // A rebuild purges the store and raises the floor:
+        // input is refused until a fresh screenshot lands.
+        frames.rebuild_barrier();
+        let err = registry
+            .get("body_click")
+            .unwrap()
+            .execute(&json!({"x": 10, "y": 10}))
+            .unwrap_err();
+        assert!(err.to_string().contains("stale_observation"), "{err}");
+        assert!(registry
+            .get("body_screenshot")
+            .unwrap()
+            .execute(&json!({}))
+            .is_ok());
+        assert!(registry
+            .get("body_click")
+            .unwrap()
+            .execute(&json!({"x": 10, "y": 10}))
+            .is_ok());
+    }
+
+    #[test]
+    fn per_agent_slots_partition_reverification() {
+        use mimint_body::{MockWindow, ScreenRect};
+        let body = MockBody::new();
+        body.set_windows(vec![MockWindow::new(
+            1,
+            ScreenRect::new(100, 100, 300, 300),
+        )
+        .with_class("editor")
+        .with_fill((200, 40, 40))]);
+        let oracle = body.oracle();
+        let actor = BodyActor::spawn(Box::new(body), StopFlag::new());
+        let frames = Arc::new(FrameStore::new());
+        let slots = AgentSnapshotSlots::new();
+        let mut reg1 = mimint_core::Registry::new();
+        register_body_tools_for_agent(
+            &mut reg1,
+            actor.clone(),
+            Arc::clone(&frames),
+            PrivacyFlag::new(false),
+            &slots,
+            "agent-001",
+            DEFAULT_MAX_OBSERVATION_AGE,
+        );
+        let mut reg2 = mimint_core::Registry::new();
+        register_body_tools_for_agent(
+            &mut reg2,
+            actor.clone(),
+            Arc::clone(&frames),
+            PrivacyFlag::new(false),
+            &slots,
+            "agent-002",
+            DEFAULT_MAX_OBSERVATION_AGE,
+        );
+        // A snapshot in agent-001's slot only, then the
+        // world changes underneath.
+        let probe = actor.probe_target(200, 200).unwrap();
+        slots
+            .slot_for("agent-001")
+            .set(200, 200, probe.snapshot.unwrap());
+        oracle.set_windows(vec![MockWindow::new(
+            2,
+            ScreenRect::new(100, 100, 300, 300),
+        )
+        .with_class("browser")
+        .with_fill((40, 40, 200))]);
+        // agent-001 re-verifies against its snapshot: refused.
+        let err = reg1
+            .get("body_click")
+            .unwrap()
+            .execute(&json!({"x": 200, "y": 200}))
+            .unwrap_err();
+        assert!(err.to_string().contains("target_changed"), "{err}");
+        // agent-002 has no snapshot in its own slot: the
+        // same point proceeds (no re-verification).
+        assert!(reg2
+            .get("body_click")
+            .unwrap()
+            .execute(&json!({"x": 200, "y": 200}))
+            .is_ok());
+    }
+
+    #[test]
+    fn g6_7_cross_agent_snapshot_refused() {
+        use mimint_body::{Framebuffer, MockWindow, ScreenRect, TargetSnapshot};
+        use std::time::Instant;
+        // One window under the whole screen: the probe reports
+        // window 2 at every point.
+        let body = MockBody::new();
+        body.set_windows(vec![MockWindow::new(2, ScreenRect::new(0, 0, 800, 600))]);
+        let actor = BodyActor::spawn(Box::new(body), StopFlag::new());
+        let frames = Arc::new(FrameStore::new());
+        let slots = AgentSnapshotSlots::new();
+        let mut reg_a = mimint_core::Registry::new();
+        register_body_tools_for_agent(
+            &mut reg_a,
+            actor.clone(),
+            Arc::clone(&frames),
+            PrivacyFlag::new(false),
+            &slots,
+            "agent-001",
+            Duration::from_secs(300),
+        );
+        let mut reg_b = mimint_core::Registry::new();
+        register_body_tools_for_agent(
+            &mut reg_b,
+            actor.clone(),
+            Arc::clone(&frames),
+            PrivacyFlag::new(false),
+            &slots,
+            "agent-002",
+            Duration::from_secs(300),
+        );
+
+        // (1) Snapshot partition: A holds a stale snapshot for
+        // (10,10) — approval-time window 1, since replaced by
+        // window 2. B holds no snapshot at all.
+        slots.slot_for("agent-001").set(
+            10,
+            10,
+            TargetSnapshot {
+                window_id: Some(1),
+                grid: [0u8; 64],
+            },
+        );
+        // B clicks first: B never consults A's snapshot, so
+        // the click runs even though A's snapshot is stale.
+        assert!(reg_b
+            .get("body_click")
+            .unwrap()
+            .execute(&json!({"x": 10, "y": 10}))
+            .is_ok());
+        // A's own click consults A's stale snapshot: the
+        // target changed, and the action never runs.
+        let err = reg_a
+            .get("body_click")
+            .unwrap()
+            .execute(&json!({"x": 10, "y": 10}))
+            .unwrap_err();
+        assert!(err.to_string().contains("target_changed"), "{err}");
+
+        // (2) TTL is per-agent: A's frame is 400s old, B's is
+        // fresh. The frame store attributes each frame.
+        let old = Framebuffer::new(4, 4, vec![0u8; 64])
+            .unwrap()
+            .with_captured_at(Instant::now() - Duration::from_secs(400));
+        assert_eq!(
+            frames.store_for("agent-001", old, false).agent_id,
+            "agent-001"
+        );
+        let fresh = Framebuffer::new(4, 4, vec![0u8; 64]).unwrap();
+        assert_eq!(
+            frames.store_for("agent-002", fresh, false).agent_id,
+            "agent-002"
+        );
+        assert!(reg_b
+            .get("body_click")
+            .unwrap()
+            .execute(&json!({"x": 20, "y": 20}))
+            .is_ok());
+        let err = reg_a
+            .get("body_click")
+            .unwrap()
+            .execute(&json!({"x": 20, "y": 20}))
+            .unwrap_err();
+        assert!(err.to_string().contains("stale_observation"), "{err}");
+
+        // (3) The rebuild floor is per-agent too: after a
+        // rebuild, only the agent that screenshots anew may act.
+        frames.rebuild_barrier();
+        assert!(reg_b
+            .get("body_screenshot")
+            .unwrap()
+            .execute(&json!({}))
+            .is_ok());
+        assert!(reg_b
+            .get("body_click")
+            .unwrap()
+            .execute(&json!({"x": 20, "y": 20}))
+            .is_ok());
+        let err = reg_a
+            .get("body_click")
+            .unwrap()
+            .execute(&json!({"x": 20, "y": 20}))
+            .unwrap_err();
+        assert!(err.to_string().contains("stale_observation"), "{err}");
     }
 }

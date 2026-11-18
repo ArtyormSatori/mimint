@@ -811,6 +811,14 @@ impl Body for MockBody {
 }
 
 impl MockOracle {
+    /// All events observed so far, in order: the oracle's view
+    /// of the input stream, for serialization tests (the
+    /// stream must consist of whole actions, never interleaved
+    /// events from two agents).
+    pub fn events(&self) -> Vec<MockEvent> {
+        lock_state(&self.state).events.clone()
+    }
+
     /// Script the windows on the shared mock display (same
     /// stacking order as [`MockBody::set_windows`]). Lets a
     /// test change the world underneath a body that is owned

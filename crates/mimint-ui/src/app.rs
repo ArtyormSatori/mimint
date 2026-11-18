@@ -24,21 +24,31 @@
 //! - `MIMINT_UI_PIXELS_PER_POINT=<f>`: UI scale (demo gate
 //!   screenshots at 125%/150%; applied by `main`, not here).
 
-use crate::approval_text::{approval_detail, crop_preview, is_point_tool, target_row};
+use crate::agent_state::{
+    display_state, next_stop_phase, AgentView, BodyDisplayState, BodyNotReadyReason, FailAllRole,
+    StopEvent, StopPhase,
+};
+use crate::approval_text::{
+    approval_detail_with_context, crop_preview, execute_code_hash, impact_labels, is_point_tool,
+    short_hash, target_row,
+};
 use crate::approver::{approval_point, ApprovalJob, RepaintSignal};
-use crate::audit_view::{read_audit_tail, stop_banner, AuditRow};
+use crate::audit_view::{distinct_agents, read_audit_tail, stop_banner, AuditRow};
 use crate::chat::{friendly_tool_error, ChatRole, ChatState, ControlState, TurnStatus};
+use crate::error_messages::{error_message, situation_for_code, BudgetScope, ErrorSituation};
 use crate::face::{breath_scale, is_blinking, EyeShape, FaceMachine, FaceState, MouthShape};
 use crate::motion::{MotionController, MotionTier};
-use crate::worker::{FailureKind, WorkerEvent, WorkerHandle};
+use crate::worker::{FailureKind, FailureScope, McpServerStatus, WorkerEvent, WorkerHandle};
 use egui::{Color32, Pos2, Rect, Stroke, Vec2};
 use mimint_body::ScreenRect;
 use mimint_control::FrameStore;
 use mimint_core::{
-    evaluate_finetune, probe_finetune, ApprovalDecision, BrainProgress, FineTuneStatus, Profile,
-    ProfileSet, VerdictTracker,
+    evaluate_finetune, probe_finetune, ApprovalDecision, BrainProgress, CostDisplay,
+    FineTuneStatus, Profile, ProfileSet, VerdictTracker, VerificationStatus, AGENT_DEFAULT,
 };
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -112,6 +122,72 @@ pub struct AppOptions {
     /// User data directory, so the SOUL path can follow profile
     /// switches (the switch event carries the bare file name).
     pub data_dir: PathBuf,
+    /// Phase 6: parallelism enabled in the config. Shows the
+    /// agents panel and lets submits start new agents.
+    pub parallelism_enabled: bool,
+    /// Phase 6: configured agent cap, for the panel note.
+    pub max_agents: usize,
+    /// Phase 6: a body factory exists, so a body rebuild is
+    /// possible after a stop/fault (the header offers it).
+    pub can_rebuild_body: bool,
+}
+
+/// One row of the agents panel (§15.1): the agent's identity,
+/// its display-model facts, its turn phase, its stop-transition
+/// phase, and its fail-all role when one applies.
+struct AgentRow {
+    label: String,
+    parent: Option<String>,
+    view: AgentView,
+    /// Human phase line from the latest progress event.
+    phase: String,
+    stop_phase: StopPhase,
+    fail_role: Option<FailAllRole>,
+}
+
+impl AgentRow {
+    fn new(label: String, parent: Option<String>) -> Self {
+        Self {
+            label,
+            parent,
+            view: AgentView::default(),
+            phase: String::new(),
+            stop_phase: StopPhase::Idle,
+            fail_role: None,
+        }
+    }
+}
+
+/// Display name for an agent id: "Agent 1" for `agent-001`,
+/// "Agent 12" for `agent-012`; the raw id when it does not
+/// parse (never invent a number).
+fn agent_display_name(agent_id: &str) -> String {
+    agent_id
+        .strip_prefix("agent-")
+        .and_then(|num| num.parse::<u32>().ok())
+        .map(|num| format!("Agent {num}"))
+        .unwrap_or_else(|| agent_id.to_string())
+}
+
+/// The verification badge label for a turn outcome (§15.5), or
+/// `None` when the turn had no verification-relevant step (no
+/// badge at all — not even "unverified").
+fn verification_badge(verified: Option<VerificationStatus>) -> Option<&'static str> {
+    verified.map(|status| status.badge_label())
+}
+
+/// True when a verification outcome counts as "all verified"
+/// for the display model: verified outcomes and the no-badge
+/// case both count; unverified/failed/unavailable do not.
+fn outcome_all_verified(verified: Option<VerificationStatus>) -> bool {
+    !matches!(
+        verified,
+        Some(
+            VerificationStatus::Unverified
+                | VerificationStatus::Failed
+                | VerificationStatus::Unavailable
+        )
+    )
 }
 
 pub struct MimintApp {
@@ -157,13 +233,39 @@ pub struct MimintApp {
     last_exclusion: Option<ScreenRect>,
     /// Shared frame store for the approval-card crop preview.
     frame_store: Option<Arc<FrameStore>>,
-    /// Card crop texture, keyed by approval job id: `Some((id,
-    /// Some(texture)))` when the job has a crop, `Some((id,
-    /// None))` when the crop was computed and there is none
-    /// (no frame, no point), `None` when no card is showing.
-    /// Keyed so the preview freezes at card time instead of
-    /// tracking newer frames while the user decides.
-    approval_crop: Option<(u64, Option<egui::TextureHandle>)>,
+    /// Card crop texture, keyed by (agent_id, approval job
+    /// id): `Some((key, Some(texture)))` when the job has a
+    /// crop, `Some((key, None))` when the crop was computed
+    /// and there is none (no frame, no point), `None` when no
+    /// card is showing. Keyed so the preview freezes at card
+    /// time instead of tracking newer frames while the user
+    /// decides. The agent id is part of the key because
+    /// request ids restart at 1 per turn and collide across
+    /// agents.
+    approval_crop: Option<((String, u64), Option<egui::TextureHandle>)>,
+    /// Phase 6: per-agent panel rows, keyed by agent id.
+    agents: HashMap<String, AgentRow>,
+    /// Phase 6: agents with a turn currently running. Drives
+    /// `chat.busy` (busy while any agent runs).
+    running_agents: HashSet<String>,
+    /// Phase 6: the global body display state (§15.1).
+    body_state: BodyDisplayState,
+    /// Phase 6: coordinator degraded (a task end could not be
+    /// verified) — no new agents until restart.
+    degraded: bool,
+    degraded_reason: Option<String>,
+    /// Phase 6: the DỪNG TẤT CẢ scope warning is on screen.
+    pending_stop_all: bool,
+    /// Phase 6: last MCP server status from the worker.
+    mcp_servers: Vec<McpServerStatus>,
+    /// Phase 6: audit panel agent filter (None = all agents).
+    audit_agent_filter: Option<String>,
+    /// Phase 6: parallelism enabled (from AppOptions).
+    multi_agent: bool,
+    max_agents: usize,
+    /// Phase 6: a body factory exists, so a body rebuild is
+    /// possible after a stop/fault (the header offers it).
+    can_rebuild_body: bool,
     /// All resolved profiles (sidebar switcher).
     profiles: ProfileSet,
     /// Active profile name, updated only on
@@ -219,6 +321,7 @@ impl MimintApp {
             );
         }
         let finetune_tracker = VerdictTracker::new(options.finetune.available);
+        chat.multi_agent = options.parallelism_enabled;
         Self {
             chat,
             face: FaceMachine::new(now),
@@ -258,6 +361,17 @@ impl MimintApp {
             last_exclusion: None,
             frame_store: options.frame_store,
             approval_crop: None,
+            agents: HashMap::new(),
+            running_agents: HashSet::new(),
+            body_state: BodyDisplayState::Ready,
+            degraded: false,
+            degraded_reason: None,
+            pending_stop_all: false,
+            mcp_servers: Vec::new(),
+            audit_agent_filter: None,
+            multi_agent: options.parallelism_enabled,
+            max_agents: options.max_agents,
+            can_rebuild_body: options.can_rebuild_body,
             profiles: options.profiles,
             active_profile: options.active_profile,
             profile_warnings: options.profile_warnings,
@@ -323,76 +437,237 @@ impl MimintApp {
         while let Some(event) = self.worker.try_recv_event() {
             match event {
                 WorkerEvent::TurnDone {
+                    agent_id,
                     text,
                     tools_used,
                     partial,
                     backend,
+                    verified,
+                    delegate_failures,
                 } => {
+                    let is_default = agent_id == AGENT_DEFAULT;
+                    self.running_agents.remove(&agent_id);
+                    if let Some(row) = self.agents.get_mut(&agent_id) {
+                        row.view.turn_running = false;
+                        row.view.turn_ended = true;
+                        row.view.all_verified = outcome_all_verified(verified);
+                        row.view.partial = !delegate_failures.is_empty();
+                        row.view.pending_approval = false;
+                        row.phase.clear();
+                    }
                     let mut text = text;
                     if partial {
                         text.push_str("\n(câu trả lời chưa xong: hết ngân sách bước)");
                     }
+                    // The §15.5 verification badge rides with
+                    // the reply; no badge when the turn had no
+                    // verification-relevant step.
+                    if let Some(badge) = verification_badge(verified) {
+                        text.push_str(&format!("\n({badge})"));
+                    }
                     let had_tools = !tools_used.is_empty();
                     self.backend_in_use = backend;
-                    self.chat.on_reply(text, tools_used);
-                    if had_tools {
-                        // Action is not completion: the tools
-                        // ran, but only the user can tell
-                        // whether the job is actually done.
+                    if is_default {
+                        self.chat.on_reply(text, tools_used);
+                        match verified {
+                            // Unverified/failed/unavailable
+                            // badges never ride with the
+                            // generic "tools ran" notice (§15.5):
+                            // say plainly what was not checked.
+                            Some(VerificationStatus::Unverified) => {
+                                self.chat.add_system(
+                                    "Lượt này có bước chưa được xác minh — hãy kiểm tra màn hình xem việc đã xong chưa trước khi tin kết quả."
+                                        .to_string(),
+                                );
+                            }
+                            Some(VerificationStatus::Failed) => {
+                                self.chat.add_system(
+                                    "Xác minh thất bại: có bước không đạt kiểm tra trên màn hình — hãy kiểm tra lại trước khi tin kết quả."
+                                        .to_string(),
+                                );
+                            }
+                            Some(VerificationStatus::Unavailable) => {
+                                self.chat.add_system(
+                                    "Xác minh không khả dụng cho lượt này — kết quả chưa được kiểm tra trên màn hình hay artifact."
+                                        .to_string(),
+                                );
+                            }
+                            _ => {
+                                if had_tools {
+                                    // Action is not completion:
+                                    // the tools ran, but only
+                                    // the user can tell whether
+                                    // the job is actually done.
+                                    self.chat.add_system(
+                                        "Mimint đã chạy công cụ trong lượt này. Hãy kiểm tra màn hình xem việc đã xong chưa — Mimint không tự kết luận việc đã hoàn thành."
+                                            .to_string(),
+                                    );
+                                }
+                            }
+                        }
+                        self.face.on_turn_finished(now, had_tools);
+                        self.state_since = now;
+                        self.log_event("reply_displayed");
+                    } else {
+                        // Only the default agent talks to the
+                        // user (§8): other agents report as
+                        // system messages naming the agent.
+                        let name = agent_display_name(&agent_id);
+                        let mut msg = format!("{name}: {text}");
+                        if had_tools {
+                            msg.push_str(&format!("\nCông cụ đã dùng: {}", tools_used.join(", ")));
+                        }
+                        self.chat.add_system(msg);
+                    }
+                    self.clear_card_for_agent(&agent_id, now);
+                    // Partial results (§15.3): name what is
+                    // missing and that the parent went on
+                    // without it — never a bare "done".
+                    if !delegate_failures.is_empty() {
+                        self.chat.add_system(format!(
+                            "Kết quả một phần: {} sub-agent lỗi nên một phần việc còn thiếu ({}). Agent cha đã tiếp tục với phần còn lại — kiểm tra lại kết quả trước khi tin.",
+                            delegate_failures.len(),
+                            delegate_failures.join("; ")
+                        ));
+                    }
+                    self.sync_busy();
+                }
+                WorkerEvent::TurnFailed {
+                    agent_id,
+                    error,
+                    kind,
+                } => {
+                    let is_default = agent_id == AGENT_DEFAULT;
+                    self.running_agents.remove(&agent_id);
+                    let code = error.split(':').next().unwrap_or("");
+                    if let Some(row) = self.agents.get_mut(&agent_id) {
+                        row.view.turn_running = false;
+                        row.view.turn_ended = true;
+                        row.view.all_verified = false;
+                        row.view.pending_approval = false;
+                        row.view.budget_exhausted = code == "budget_exhausted";
+                        row.view.unknown_outcome = error.contains("unknown_outcome");
+                        row.phase.clear();
+                    }
+                    if is_default {
+                        self.chat.on_error(error.clone(), kind);
+                        self.face.on_error(now);
+                        self.state_since = now;
+                    } else {
+                        let name = agent_display_name(&agent_id);
+                        self.chat.add_system(format!(
+                            "{name} thất bại: {}",
+                            friendly_tool_error(&error)
+                        ));
+                    }
+                    // The §15.4 three-part message when the
+                    // error code is one of the five.
+                    self.report_error_message(&agent_id, &error);
+                    self.clear_card_for_agent(&agent_id, now);
+                    self.sync_busy();
+                }
+                WorkerEvent::TurnCancelled { agent_id } => {
+                    let is_default = agent_id == AGENT_DEFAULT;
+                    self.running_agents.remove(&agent_id);
+                    if let Some(row) = self.agents.get_mut(&agent_id) {
+                        row.view.turn_running = false;
+                        row.view.cancel_requested = false;
+                        // TurnCancelled only arrives after the
+                        // end was verified (§10): this is a
+                        // confirmed cancel, never "unknown".
+                        row.view.cancelled = true;
+                        row.view.end_verified = true;
+                        row.view.pending_approval = false;
+                        row.phase.clear();
+                        row.stop_phase = next_stop_phase(row.stop_phase, StopEvent::EndVerified);
+                    }
+                    if is_default {
+                        self.chat.on_cancelled();
                         self.chat.add_system(
-                            "Mimint đã chạy công cụ trong lượt này. Hãy kiểm tra màn hình xem việc đã xong chưa — Mimint không tự kết luận việc đã hoàn thành."
+                            "Đã hủy lượt. Câu hỏi của bạn vẫn còn — bấm Thử lại để hỏi tiếp."
                                 .to_string(),
                         );
+                        self.face.on_error(now);
+                        self.state_since = now;
+                    } else {
+                        let name = agent_display_name(&agent_id);
+                        self.chat
+                            .add_system(format!("{name} đã hủy (đã xác nhận dừng hẳn)."));
                     }
-                    self.face.on_turn_finished(now, had_tools);
-                    self.state_since = now;
-                    self.clear_stale_card(now);
-                    self.log_event("reply_displayed");
+                    self.clear_card_for_agent(&agent_id, now);
+                    self.sync_busy();
                 }
-                WorkerEvent::TurnFailed { error, kind } => {
-                    self.chat.on_error(error, kind);
-                    self.face.on_error(now);
-                    self.state_since = now;
-                    self.clear_stale_card(now);
-                }
-                WorkerEvent::TurnCancelled => {
-                    self.chat.on_cancelled();
-                    self.chat.add_system(
-                        "Đã hủy lượt. Câu hỏi của bạn vẫn còn — bấm Thử lại để hỏi tiếp."
-                            .to_string(),
-                    );
-                    self.face.on_error(now);
-                    self.state_since = now;
-                    self.clear_stale_card(now);
-                }
-                WorkerEvent::TryingBackend { name } => {
-                    self.backend_in_use = Some(name.clone());
-                    self.chat.status = TurnStatus::TryingBackend(name);
+                WorkerEvent::TryingBackend { agent_id, name } => {
+                    // The first progress of a turn registers
+                    // the agent as running: the worker decides
+                    // which agent runs, so the UI learns it
+                    // here, not at submit time.
+                    self.running_agents.insert(agent_id.clone());
+                    {
+                        let row = self.agent_row_mut(&agent_id);
+                        row.view.turn_running = true;
+                        row.phase = format!("Đang thử backend {name}");
+                    }
+                    if agent_id == AGENT_DEFAULT {
+                        self.backend_in_use = Some(name.clone());
+                        self.chat.status = TurnStatus::TryingBackend(name);
+                    }
+                    self.sync_busy();
                 }
                 WorkerEvent::TurnProgress { progress } => {
-                    // An emotion signal changes the face, not the
-                    // turn status; the other progress events
-                    // change the status, not the face.
-                    match progress {
-                        BrainProgress::Emotion { code } => {
-                            let state = FaceState::from_emotion(code);
-                            self.last_model_emotion = Some(state);
-                            self.face.on_emotion(state, now);
-                            self.state_since = now;
+                    let agent_id = progress.agent_id().to_string();
+                    self.running_agents.insert(agent_id.clone());
+                    let is_default = agent_id == AGENT_DEFAULT;
+                    // Per-agent phase line for the panel.
+                    let phase = match &progress {
+                        BrainProgress::Emotion { .. } => None,
+                        BrainProgress::Analyzing { .. } => Some("Mimint đang nghĩ…".to_string()),
+                        BrainProgress::Acting { tool, .. } => Some(format!("Đang chạy {tool}…")),
+                        BrainProgress::Verifying { .. } => {
+                            Some("Đang kiểm tra kết quả trên màn hình…".to_string())
                         }
-                        BrainProgress::Analyzing => {
-                            self.chat.status = TurnStatus::Analyzing;
-                        }
-                        BrainProgress::Acting { tool } => {
-                            self.chat.status = TurnStatus::Acting(tool);
-                        }
-                        BrainProgress::Verifying => {
-                            self.chat.status = TurnStatus::Verifying;
-                        }
-                        BrainProgress::ToolFailed { tool, error } => {
-                            self.chat.status = TurnStatus::ToolFailed { tool, error };
+                        BrainProgress::ToolFailed { tool, error, .. } => Some(format!(
+                            "Công cụ {tool} thất bại: {}",
+                            friendly_tool_error(error)
+                        )),
+                    };
+                    {
+                        let row = self.agent_row_mut(&agent_id);
+                        row.view.turn_running = true;
+                        if let Some(phase) = phase {
+                            row.phase = phase;
                         }
                     }
+                    // The face and the main status line follow
+                    // the default agent only; other agents
+                    // report their phase in the panel.
+                    if is_default {
+                        // An emotion signal changes the face,
+                        // not the turn status; the other
+                        // progress events change the status,
+                        // not the face.
+                        match progress {
+                            BrainProgress::Emotion { code, .. } => {
+                                let state = FaceState::from_emotion(code);
+                                self.last_model_emotion = Some(state);
+                                self.face.on_emotion(state, now);
+                                self.state_since = now;
+                            }
+                            BrainProgress::Analyzing { .. } => {
+                                self.chat.status = TurnStatus::Analyzing;
+                            }
+                            BrainProgress::Acting { tool, .. } => {
+                                self.chat.status = TurnStatus::Acting(tool);
+                            }
+                            BrainProgress::Verifying { .. } => {
+                                self.chat.status = TurnStatus::Verifying;
+                            }
+                            BrainProgress::ToolFailed { tool, error, .. } => {
+                                self.chat.status = TurnStatus::ToolFailed { tool, error };
+                            }
+                        }
+                    }
+                    self.sync_busy();
                 }
                 WorkerEvent::WorkerFault { error } => {
                     self.chat.control_error = true;
@@ -452,6 +727,7 @@ impl MimintApp {
                     // shows Stopped, turns block, and only a
                     // restart clears it. The running turn reports
                     // its own cancellation separately.
+                    self.pending_stop_all = false;
                     self.chat.request_body_stop();
                     self.chat.on_cancelled();
                     self.chat.add_system(format!(
@@ -472,8 +748,183 @@ impl MimintApp {
                     ));
                     self.log_event("soul_changed_externally");
                 }
+                WorkerEvent::AgentSpawned {
+                    agent_id,
+                    label,
+                    parent,
+                } => {
+                    // A spawn is always followed by a turn,
+                    // except the default agent's startup row.
+                    let mut row = AgentRow::new(label, parent);
+                    if agent_id != AGENT_DEFAULT {
+                        row.view.turn_running = true;
+                        self.running_agents.insert(agent_id.clone());
+                    }
+                    self.agents.insert(agent_id, row);
+                    self.sync_busy();
+                }
+                WorkerEvent::AgentEnded { agent_id } => {
+                    // The terminal event already updated the
+                    // row and reported the outcome; the row
+                    // retires with the id.
+                    self.running_agents.remove(&agent_id);
+                    self.agents.remove(&agent_id);
+                    self.sync_busy();
+                }
+                WorkerEvent::AgentFault {
+                    agent_id,
+                    scope,
+                    cause,
+                } => {
+                    if matches!(scope, FailureScope::All) {
+                        self.body_state = BodyDisplayState::NotReady(BodyNotReadyReason::Broken);
+                        for (id, row) in self.agents.iter_mut() {
+                            if *id == agent_id {
+                                row.fail_role = Some(FailAllRole::Causer);
+                                row.view.unknown_outcome = cause.contains("unknown_outcome");
+                            } else if row.view.turn_running {
+                                row.fail_role = Some(FailAllRole::StoppedBySystem);
+                            }
+                        }
+                        let name = agent_display_name(&agent_id);
+                        self.chat.add_system(format!(
+                            "Lỗi chạm tới body từ {name} ({cause}): mọi agent đều dừng, body phải rebuild mới chạy lại. Agent gây lỗi: {name}; các agent khác bị dừng theo hệ thống; agent nào kết thúc chưa xác minh sẽ hiện \"Kết quả chưa xác định\"."
+                        ));
+                    } else {
+                        let name = agent_display_name(&agent_id);
+                        self.chat.add_system(format!(
+                            "{name} gặp lỗi nội bộ và dừng một mình: {cause}. Các agent khác không bị ảnh hưởng."
+                        ));
+                    }
+                    self.log_event("agent_fault");
+                }
+                WorkerEvent::Degraded { agent_id, reason } => {
+                    self.degraded = true;
+                    self.degraded_reason = Some(reason);
+                    // The end is unverified: the UI cannot wait
+                    // forever for a terminal event that may
+                    // never arrive. The row keeps showing
+                    // "Kết quả chưa xác định".
+                    self.running_agents.remove(&agent_id);
+                    if let Some(row) = self.agents.get_mut(&agent_id) {
+                        row.view.turn_running = false;
+                        row.view.unknown_outcome = true;
+                        row.view.degraded = true;
+                        row.view.end_verified = false;
+                        row.phase.clear();
+                        row.stop_phase = next_stop_phase(row.stop_phase, StopEvent::JoinTimeout);
+                    }
+                    // The §15.4 #5 three-part message, verbatim.
+                    let message = error_message(ErrorSituation::TaskEndUnverified);
+                    let name = agent_display_name(&agent_id);
+                    self.chat.add_system(format!(
+                        "{name}: {}\n{}\n{}\n{} (mã kỹ thuật: {})",
+                        message.title,
+                        message.what,
+                        message.impact,
+                        message.next,
+                        message.tech_code
+                    ));
+                    self.sync_busy();
+                }
+                WorkerEvent::BodyRebuilt => {
+                    self.body_state = BodyDisplayState::Ready;
+                    for row in self.agents.values_mut() {
+                        row.fail_role = None;
+                    }
+                    // A rebuild replaces the body stack and its
+                    // stop flag: the stop latches from the
+                    // fault no longer apply.
+                    self.chat.body_stopped = false;
+                    self.chat.stopped = false;
+                    self.chat.add_system(
+                        "Body đã rebuild xong. Lượt tiếp theo sẽ chụp màn hình mới trước khi hành động."
+                            .to_string(),
+                    );
+                    self.log_event("body_rebuilt");
+                }
+                WorkerEvent::BodyRebuildFailed { error } => {
+                    self.body_state = BodyDisplayState::NotReady(BodyNotReadyReason::Broken);
+                    self.chat.add_system(format!(
+                        "Rebuild body thất bại: {error}. Body chưa sẵn sàng — thử rebuild lại hoặc khởi động lại ứng dụng."
+                    ));
+                }
+                WorkerEvent::McpStatus { servers } => {
+                    self.mcp_servers = servers;
+                }
             }
         }
+    }
+
+    /// The panel row for an agent, creating it with a default
+    /// label when the worker never announced the spawn
+    /// (defensive: spawns always precede progress in practice).
+    fn agent_row_mut(&mut self, agent_id: &str) -> &mut AgentRow {
+        self.agents
+            .entry(agent_id.to_string())
+            .or_insert_with(|| AgentRow::new(agent_display_name(agent_id), None))
+    }
+
+    /// Recompute `chat.busy` from the running set: busy while
+    /// any agent runs, idle when none does. The worker's first
+    /// progress event registers the agent before any terminal
+    /// event can arrive, so busy never drops mid-turn.
+    fn sync_busy(&mut self) {
+        self.chat.busy = !self.running_agents.is_empty();
+        if self.chat.busy {
+            if self.chat.turn_started.is_none() {
+                self.chat.turn_started = Some(Instant::now());
+            }
+        } else {
+            self.chat.status = TurnStatus::Idle;
+            self.chat.turn_started = None;
+        }
+    }
+
+    /// Clear the on-screen approval card, but only when it
+    /// belongs to the agent whose turn just ended: another
+    /// agent's live card must never be cleared by this agent's
+    /// completion.
+    fn clear_card_for_agent(&mut self, agent_id: &str, now: Instant) {
+        let belongs = self
+            .pending_job
+            .as_ref()
+            .is_some_and(|job| job.agent_id == agent_id)
+            || self
+                .chat
+                .pending_approval
+                .as_ref()
+                .is_some_and(|req| req.agent_id == agent_id);
+        if belongs {
+            self.clear_stale_card(now);
+        }
+    }
+
+    /// Post the §15.4 three-part message for an error whose
+    /// code is one of the five fixed situations; silently
+    /// nothing for other errors (they keep their own text).
+    fn report_error_message(&mut self, agent_id: &str, error: &str) {
+        let code = error.split(':').next().unwrap_or("");
+        let mut situation = match situation_for_code(code) {
+            Some(situation) => situation,
+            None => return,
+        };
+        // The budget message has three scopes: the ledger's
+        // message names the global cap when it is the global
+        // one ("global cap has ... tokens left").
+        if code == "budget_exhausted" && error.contains("global cap") {
+            situation = ErrorSituation::BudgetExhausted(BudgetScope::Global);
+        }
+        let message = error_message(situation);
+        let prefix = if agent_id == AGENT_DEFAULT {
+            String::new()
+        } else {
+            format!("{}: ", agent_display_name(agent_id))
+        };
+        self.chat.add_system(format!(
+            "{prefix}{}\n{}\n{}\n{} (mã kỹ thuật: {})",
+            message.title, message.what, message.impact, message.next, message.tech_code
+        ));
     }
 
     /// A turn ended: any card still on screen is stale (the worker
@@ -491,24 +942,25 @@ impl MimintApp {
         if self.pending_job.is_some() {
             return;
         }
-        if let Ok(job) = self.approvals.try_recv() {
-            self.chat.request_approval(
-                job.id,
-                job.tool.clone(),
-                job.args.clone(),
-                job.deadline,
-                job.timeout,
-                job.target.clone(),
-                job.observation_age,
-                job.max_observation_age,
-            );
+        // Drain until a live job shows: a withdrawn job (its
+        // agent was cancelled) must never flash on screen.
+        while let Ok(job) = self.approvals.try_recv() {
+            if job.withdrawn.load(Ordering::SeqCst) {
+                continue;
+            }
+            let agent_id = job.agent_id.clone();
+            self.chat.request_approval_job(&job);
             self.pending_job = Some(job);
+            if let Some(row) = self.agents.get_mut(&agent_id) {
+                row.view.pending_approval = true;
+            }
             // System state overrides model codes (F5-10): while
             // a card waits, the face shows Neutral, whatever
             // the model signaled. Turn-phase events and card
             // resolution clear the override.
             self.face.set_system_override(FaceState::Neutral, now);
             self.log_event("approval_shown");
+            return;
         }
     }
 
@@ -753,10 +1205,18 @@ impl eframe::App for MimintApp {
                     ui.label(state.label());
                 }
                 if self.chat.body_stopped {
-                    // A body stop only clears on restart: offering
-                    // "Tiếp tục" would lie (the body flag stays
-                    // tripped). Say so, plainly.
-                    if !minimal {
+                    // A body stop clears on a body rebuild when
+                    // one is possible (§4.1); otherwise only a
+                    // restart clears it. Offering "Tiếp tục"
+                    // without either would lie (the body flag
+                    // stays tripped).
+                    if self.can_rebuild_body {
+                        if ui.button("Rebuild body").clicked() {
+                            self.body_state =
+                                BodyDisplayState::NotReady(BodyNotReadyReason::Rebuilding);
+                            self.worker.rebuild_body();
+                        }
+                    } else if !minimal {
                         ui.label("Khởi động lại ứng dụng để điều khiển tiếp.");
                     }
                 } else if self.chat.stopped {
@@ -842,6 +1302,7 @@ impl eframe::App for MimintApp {
                     ui.heading("Cuộc trò chuyện");
                     ui.label("• Phiên hiện tại");
                     ui.separator();
+                    self.agents_panel_ui(ui);
                     ui.heading("Hồ sơ");
                     // Forced-safe fallback (F5-03): persistent
                     // banner while the mode is active. The
@@ -998,6 +1459,42 @@ impl eframe::App for MimintApp {
                             self.audit_rows = read_audit_tail(&self.audit_path, 100);
                         }
                         ui.checkbox(&mut self.audit_technical, "Kỹ thuật");
+                        // Phase 6: the agent filter appears only
+                        // when the loaded rows name more than
+                        // one agent (§1.4: hide the column when
+                        // the log holds a single agent).
+                        let agents = distinct_agents(&self.audit_rows);
+                        if agents.len() > 1 {
+                            let current = self
+                                .audit_agent_filter
+                                .clone()
+                                .unwrap_or_else(|| "Tất cả agent".to_string());
+                            egui::ComboBox::from_id_salt("audit_agent_filter")
+                                .selected_text(current)
+                                .show_ui(ui, |ui| {
+                                    if ui
+                                        .selectable_label(
+                                            self.audit_agent_filter.is_none(),
+                                            "Tất cả agent",
+                                        )
+                                        .clicked()
+                                    {
+                                        self.audit_agent_filter = None;
+                                    }
+                                    for agent in &agents {
+                                        if ui
+                                            .selectable_label(
+                                                self.audit_agent_filter.as_deref()
+                                                    == Some(agent.as_str()),
+                                                agent_display_name(agent),
+                                            )
+                                            .clicked()
+                                        {
+                                            self.audit_agent_filter = Some(agent.clone());
+                                        }
+                                    }
+                                });
+                        }
                         ui.label(format!(
                             "{} bản ghi mới nhất (giờ UTC)",
                             self.audit_rows.len()
@@ -1009,23 +1506,41 @@ impl eframe::App for MimintApp {
                         ui.colored_label(Color32::from_rgb(0xDC, 0x26, 0x26), banner);
                     }
                     egui::ScrollArea::vertical().show(ui, |ui| {
+                        let show_agent = distinct_agents(&self.audit_rows).len() > 1;
+                        let filter = self.audit_agent_filter.clone();
+                        let mut shown = 0usize;
                         for row in &self.audit_rows {
+                            if let Some(filter) = &filter {
+                                if &row.agent_id != filter {
+                                    continue;
+                                }
+                            }
+                            shown += 1;
+                            let agent_prefix = if show_agent {
+                                format!("[{}] ", agent_display_name(&row.agent_id))
+                            } else {
+                                String::new()
+                            };
                             if self.audit_technical {
                                 ui.label(format!(
-                                    "{} {}",
+                                    "{} {}{}",
                                     crate::audit_view::format_time_ms(row.ts_ms),
+                                    agent_prefix,
                                     row.raw
                                 ));
                             } else {
                                 ui.label(format!(
-                                    "{} {}",
+                                    "{} {}{}",
                                     crate::audit_view::format_time_ms(row.ts_ms),
+                                    agent_prefix,
                                     row.friendly_summary()
                                 ));
                             }
                         }
                         if self.audit_rows.is_empty() {
                             ui.label("Chưa có bản ghi. Bấm Làm mới sau một lượt trò chuyện.");
+                        } else if shown == 0 {
+                            ui.label("Không có bản ghi nào của agent đã chọn.");
                         }
                     });
                 });
@@ -1073,17 +1588,104 @@ impl eframe::App for MimintApp {
         // which pushed the input below the clip rect: laid out but
         // invisible and unclickable. The demo gate caught it.)
         egui::Panel::bottom("input_bar").show(ui, |ui| {
-            // Approval card (P0-17): action-specific content + countdown.
+            // Approval card (P0-17 + §15.2): action-specific
+            // content + countdown + multi-agent context.
             if let Some(req) = self.chat.pending_approval.clone() {
-                let detail = approval_detail(&req.tool, &req.args);
+                let detail = approval_detail_with_context(&req.tool, &req.args, &req.context);
                 // Crop preview, computed once per job (frozen at
                 // card time) from the newest stored frame.
                 let crop = self.approval_crop_texture(ui.ctx(), &req);
+                let (impact, impact_extra) = impact_labels(&req.tool, &req.context);
                 ui.group(|ui| {
                     ui.heading(format!("Cần phê duyệt — {}", detail.title));
                     ui.label(format!("Yêu cầu #{} · công cụ: {}", req.id, req.tool));
+                    // §15.2: the requesting agent + its task
+                    // label, when more than one agent exists.
+                    if self.multi_agent || self.agents.len() > 1 {
+                        let name = agent_display_name(&req.agent_id);
+                        let label = self
+                            .agents
+                            .get(&req.agent_id)
+                            .map(|row| row.label.clone())
+                            .unwrap_or_default();
+                        if label.is_empty() || label == name {
+                            ui.label(format!("Agent yêu cầu: {name}"));
+                        } else {
+                            ui.label(format!("Agent yêu cầu: {name} · {label}"));
+                        }
+                    }
+                    // §15.2: queue position (a snapshot taken
+                    // when the card was created — the app only
+                    // holds one card at a time, so the live
+                    // queue depth is not observable here).
+                    if req.queue_total > 1 {
+                        ui.label(format!(
+                            "Vị trí hàng đợi: {} / {} ({} yêu cầu đang chờ)",
+                            req.queue_position, req.queue_total, req.queue_total
+                        ));
+                    }
+                    // §15.2: the impact label (one primary +
+                    // secondaries), from the fixed set.
+                    if impact_extra.is_empty() {
+                        ui.label(format!("Mức độ ảnh hưởng: {impact}"));
+                    } else {
+                        ui.label(format!(
+                            "Mức độ ảnh hưởng: {impact} (+ {})",
+                            impact_extra.join(", ")
+                        ));
+                    }
                     for (label, value) in &detail.rows {
                         ui.label(format!("{label}: {value}"));
+                    }
+                    // §15.2: the full code hash on demand. The
+                    // short hash is in the rows above; the full
+                    // hash is one expand away. Post-run hash
+                    // verification is reported in the audit
+                    // panel (the card only exists pre-run).
+                    if req.tool == "execute_code" {
+                        if let Some(code) = req.args.get("code").and_then(|v| v.as_str()) {
+                            let full = execute_code_hash(code);
+                            let short = short_hash(&full);
+                            ui.collapsing("Hash code đầy đủ (SHA-256)", |ui| {
+                                ui.label(format!("{short} → {full}"));
+                                ui.label(
+                                    "Sau khi chạy, nhật ký kiểm tra sẽ ghi hash của code đã chạy và xác nhận có khớp hash này không.",
+                                );
+                            });
+                        }
+                    }
+                    // §15.2: the full JSON args on demand (the
+                    // rows above are the human summary).
+                    ui.collapsing("Tham số đầy đủ (JSON)", |ui| {
+                        ui.label(
+                            serde_json::to_string_pretty(&req.args)
+                                .unwrap_or_else(|_| req.args.to_string()),
+                        );
+                    });
+                    // §15.2: token estimate + unmeasured
+                    // warning. USD only ever appears when the
+                    // ledger measured it (§15.4: never show a
+                    // precise-looking USD figure from a reserve).
+                    if let Some(cost) = &req.cost {
+                        match cost {
+                            CostDisplay::MeasuredUsd(usd) => {
+                                ui.label(format!("Chi phí đo được: ${usd:.4}"));
+                            }
+                            CostDisplay::EstimateTokens(tokens) => {
+                                ui.label(format!(
+                                    "Ước tính token: {tokens} (ƯỚC TÍNH, không phải hóa đơn)"
+                                ));
+                            }
+                            CostDisplay::Unknown => {
+                                ui.label("Chi phí: chưa đo được.");
+                            }
+                        }
+                    }
+                    if req.unmeasured {
+                        ui.colored_label(
+                            Color32::from_rgb(0xB4, 0x53, 0x09),
+                            "Cảnh báo: một phần chi phí chưa đo được — con số trên là ước tính.",
+                        );
                     }
                     // Target identity at request time (F4-05):
                     // what window the action will land on.
@@ -1116,9 +1718,15 @@ impl eframe::App for MimintApp {
                         }
                     }
                     ui.label(format!("Hoàn tác: {}", detail.reversible));
+                    // Elapsed wait + expiry (§15.2).
+                    let waited = now.duration_since(req.created_at).as_secs();
                     if let Some(deadline) = req.deadline {
                         let left = deadline.saturating_duration_since(now).as_secs();
-                        ui.label(format!("Còn {left} giây — hết giờ sẽ tự từ chối."));
+                        ui.label(format!(
+                            "Đã chờ {waited} giây · còn {left} giây — hết giờ sẽ tự từ chối."
+                        ));
+                    } else {
+                        ui.label(format!("Đã chờ {waited} giây."));
                     }
                     ui.horizontal(|ui| {
                         // P5.8 (F5-CARRY-1): the labels name the
@@ -1130,13 +1738,13 @@ impl eframe::App for MimintApp {
                             .button("Cho phép thực hiện hành động này")
                             .on_hover_text("Chỉ cho phép MỘT lần này: hành động này sẽ chạy ngay, và lần sau công cụ này vẫn cần bạn phê duyệt lại.");
                         if allow.clicked() {
-                            self.decide_approval(req.id, ApprovalDecision::Allow);
+                            self.decide_approval(&req.agent_id, req.id, ApprovalDecision::Allow);
                         }
                         let deny = ui
                             .button("Từ chối hành động này")
                             .on_hover_text("Công cụ sẽ không chạy. Bạn có thể yêu cầu lại sau — mỗi lần đều cần phê duyệt riêng.");
                         if deny.clicked() {
-                            self.decide_approval(req.id, ApprovalDecision::Deny);
+                            self.decide_approval(&req.agent_id, req.id, ApprovalDecision::Deny);
                         }
                     });
                     ui.label("Từ chối là mặc định an toàn: công cụ sẽ không chạy.");
@@ -1376,11 +1984,14 @@ impl eframe::App for MimintApp {
 }
 
 impl MimintApp {
-    fn decide_approval(&mut self, id: u64, decision: ApprovalDecision) {
-        if self.chat.resolve_approval(id) {
+    fn decide_approval(&mut self, agent_id: &str, id: u64, decision: ApprovalDecision) {
+        if self.chat.resolve_approval(agent_id, id) {
             self.face.clear_system_override(Instant::now());
             if let Some(job) = self.pending_job.take() {
                 self.approval_crop = None;
+                if let Some(row) = self.agents.get_mut(agent_id) {
+                    row.view.pending_approval = false;
+                }
                 // Deadline re-check at the UI layer (F4-06):
                 // a card that expired between renders must
                 // never be answered, even if the button was
@@ -1413,13 +2024,14 @@ impl MimintApp {
         ctx: &egui::Context,
         req: &crate::chat::ApprovalRequest,
     ) -> Option<egui::TextureHandle> {
-        if let Some((cached_id, cached)) = &self.approval_crop {
-            if *cached_id == req.id {
+        let key = (req.agent_id.clone(), req.id);
+        if let Some((cached_key, cached)) = &self.approval_crop {
+            if *cached_key == key {
                 return cached.clone();
             }
         }
         let texture = self.build_approval_crop(ctx, req);
-        self.approval_crop = Some((req.id, texture.clone()));
+        self.approval_crop = Some((key, texture.clone()));
         texture
     }
 
@@ -1439,10 +2051,146 @@ impl MimintApp {
             ))
         })??;
         Some(ctx.load_texture(
-            format!("approval-crop-{}", req.id),
+            format!("approval-crop-{}-{}", req.agent_id, req.id),
             image,
             egui::TextureOptions::default(),
         ))
+    }
+
+    /// The agents panel (§15.1, §15.3). Invisible in
+    /// single-agent mode: when parallelism is off and no
+    /// multi-agent state exists, the sidebar is exactly as it
+    /// was before Phase 6.
+    fn agents_panel_ui(&mut self, ui: &mut egui::Ui) {
+        let show = self.multi_agent || self.agents.len() > 1 || self.degraded;
+        if !show {
+            return;
+        }
+        ui.heading("Agent");
+        // The global body state, separate from any one agent.
+        if let BodyDisplayState::NotReady(_) = self.body_state {
+            let reason = self.body_state.reason_label().unwrap_or("");
+            ui.colored_label(
+                Color32::from_rgb(0xDC, 0x26, 0x26),
+                format!("{}: {}", self.body_state.label(), reason),
+            );
+            if self.can_rebuild_body && ui.button("Rebuild body").clicked() {
+                self.body_state = BodyDisplayState::NotReady(BodyNotReadyReason::Rebuilding);
+                self.worker.rebuild_body();
+            }
+        }
+        if self.degraded {
+            ui.colored_label(
+                Color32::from_rgb(0xDC, 0x26, 0x26),
+                format!(
+                    "Degraded: {} — không spawn agent mới tới khi khởi động lại.",
+                    self.degraded_reason
+                        .as_deref()
+                        .unwrap_or("không xác minh được kết thúc")
+                ),
+            );
+        }
+        // F6D-19: the cap is a cap, not a promise of speed.
+        ui.label(format!(
+            "Tối đa {} agent cùng lúc. Thêm agent không đảm bảo tăng tốc (đặc biệt với backend cục bộ trên CPU).",
+            self.max_agents
+        ));
+        // One row per agent, in id order.
+        let mut ids: Vec<String> = self.agents.keys().cloned().collect();
+        ids.sort();
+        let mut stop_agent: Option<String> = None;
+        for id in ids {
+            let Some(row) = self.agents.get(&id) else {
+                continue;
+            };
+            let name = agent_display_name(&id);
+            let state = display_state(&row.view);
+            let mut title = if row.label.is_empty() || row.label == name {
+                name.clone()
+            } else {
+                format!("{name} · {}", row.label)
+            };
+            if let Some(parent) = &row.parent {
+                title.push_str(&format!(" (con của {})", agent_display_name(parent)));
+            }
+            ui.label(format!("• {title}: {}", state.label()));
+            if let Some(role) = row.fail_role {
+                ui.label(format!("    Vai trò sau lỗi: {}", role.label()));
+            }
+            if !row.phase.is_empty() {
+                ui.label(format!("    {}", row.phase));
+            }
+            // The stop transition (§15.3): requested, then
+            // confirmed or unverified — never "stopped" just
+            // because the cancel was sent.
+            if !matches!(row.stop_phase, StopPhase::Idle) {
+                ui.label(format!("    Dừng: {}", row.stop_phase.label()));
+            }
+            if row.view.turn_running
+                && matches!(row.stop_phase, StopPhase::Idle)
+                && ui.button("Dừng agent này").clicked()
+            {
+                stop_agent = Some(id.clone());
+            }
+        }
+        if let Some(id) = stop_agent {
+            if let Some(row) = self.agents.get_mut(&id) {
+                row.view.cancel_requested = true;
+                row.stop_phase = next_stop_phase(row.stop_phase, StopEvent::Requested);
+            }
+            self.worker.cancel_agent(id);
+        }
+        ui.separator();
+        // DỪNG TẤT CẢ (§15.3): a different action from stopping
+        // one agent, with a scope warning before it runs. The
+        // header's DỪNG NGAY stays the unwarned emergency
+        // button; this one always warns first.
+        if self.pending_stop_all {
+            ui.colored_label(
+                Color32::from_rgb(0xDC, 0x26, 0x26),
+                "DỪNG TẤT CẢ sẽ: dừng mọi agent; khóa dừng toàn hệ thống (latch) sẽ bật; thread body đang kẹt (nếu có) không giật được — nó chỉ dừng khi hành động hiện tại xong hoặc hết thời gian chờ.",
+            );
+            ui.horizontal(|ui| {
+                if ui.button("Xác nhận dừng tất cả").clicked() {
+                    self.pending_stop_all = false;
+                    self.worker.stop_all();
+                }
+                if ui.button("Hủy").clicked() {
+                    self.pending_stop_all = false;
+                }
+            });
+        } else if ui.button("DỪNG TẤT CẢ").clicked() {
+            self.pending_stop_all = true;
+        }
+        // MCP status: the continuous unsandboxed indicator
+        // (§6.3) for every connected server.
+        for server in &self.mcp_servers {
+            if server.unsandboxed {
+                ui.colored_label(
+                    Color32::from_rgb(0xDC, 0x26, 0x26),
+                    format!(
+                        "MCP {}: KHÔNG SANDBOX — server chạy trực tiếp trên máy này{}.",
+                        server.name,
+                        if server.connected {
+                            ""
+                        } else {
+                            " (chưa nối)"
+                        }
+                    ),
+                );
+            } else {
+                ui.label(format!(
+                    "MCP {}: chạy trong sandbox{}.",
+                    server.name,
+                    if server.connected {
+                        ""
+                    } else {
+                        " (chưa nối)"
+                    }
+                ));
+            }
+        }
+        ui.separator();
     }
 
     /// The backend picker, shared by the full/compact header and the

@@ -32,7 +32,7 @@ use mimint_core::{
     drift_findings, evaluate_finetune, evaluate_golden, evolve_skill, load_config_file,
     load_eval_tasks, probe_finetune, validate_skill, AuditLog, BackendKind, BackendSpec, Brain,
     CostCap, EgressPolicy, EvolveConfig, ExperienceStore, FallbackChain, MimintError, Notebook,
-    ResolvedConfig, SkillDef, SkillStatus, SkillStore, SoulStore, ValidationApprover,
+    Provider, ResolvedConfig, SkillDef, SkillStatus, SkillStore, SoulStore, ValidationApprover,
     DEFAULT_TIMEOUT_SECS, GOLDEN_PROMPTS, GOLDEN_PROMPTS_V2,
 };
 use serde_json::{json, Value};
@@ -323,7 +323,7 @@ fn write_report(report: &Value, path: Option<&PathBuf>) -> Result<(), MimintErro
 
 /// A built provider chain plus its identity, for reports.
 struct ProviderSetup {
-    chain: FallbackChain,
+    chain: Arc<FallbackChain>,
     names: Vec<String>,
     profile_name: String,
     privacy_enabled: bool,
@@ -431,7 +431,7 @@ fn build_provider(opts: &Opts) -> Result<ProviderSetup, MimintError> {
     eprintln!("Backend: {}", names.join(" -> "));
     let chain = FallbackChain::new(providers, resolved.retry)?;
     Ok(ProviderSetup {
-        chain,
+        chain: Arc::new(chain),
         names,
         profile_name: profile.name.clone(),
         privacy_enabled,
@@ -458,7 +458,7 @@ async fn cmd_eval(opts: &Opts) -> Result<bool, MimintError> {
         .unwrap_or_else(|| fresh_scratch_db("eval"));
     eprintln!("Scratch notebook: {}", notebook_path.display());
     let notebook = Arc::new(Notebook::open(&notebook_path)?);
-    let audit = AuditLog::open(audit_path(opts))?;
+    let audit = Arc::new(AuditLog::open(audit_path(opts))?);
     let experience = if opts.no_record {
         None
     } else {
@@ -484,11 +484,11 @@ async fn cmd_eval(opts: &Opts) -> Result<bool, MimintError> {
         }
         let turn_id = format!("{turn_prefix}-{}", task.id);
         let run = mimint_core::run_one_task_detailed(
-            &setup.chain,
+            Arc::clone(&setup.chain) as Arc<dyn Provider>,
             &system_prompt,
             task,
             Arc::clone(&notebook),
-            &audit,
+            Arc::clone(&audit),
             &turn_id,
             opts.max_steps,
         )
@@ -585,7 +585,7 @@ async fn cmd_evolve(opts: &Opts) -> Result<(), MimintError> {
         ))
     })?;
     eprintln!("Evolve run dir: {}", run_dir.display());
-    let audit = AuditLog::open(audit_path(opts))?;
+    let audit = Arc::new(AuditLog::open(audit_path(opts))?);
     let variants = mimint_core::build_variants(&skill);
     let factory = |key: &str| Ok(Arc::new(Notebook::open(run_dir.join(format!("{key}.db")))?));
     let config = EvolveConfig {
@@ -595,12 +595,12 @@ async fn cmd_evolve(opts: &Opts) -> Result<(), MimintError> {
     };
     let started = Instant::now();
     let report = evolve_skill(
-        &setup.chain,
+        Arc::clone(&setup.chain) as Arc<dyn Provider>,
         &skill,
         &variants,
         &tasks,
         &factory,
-        &audit,
+        Arc::clone(&audit),
         &config,
     )
     .await?;
@@ -672,7 +672,7 @@ async fn cmd_drift(opts: &Opts) -> Result<bool, MimintError> {
     })?;
     let setup = build_provider(opts)?;
     let notebook = Arc::new(Notebook::open(fresh_scratch_db("drift"))?);
-    let audit = AuditLog::open(audit_path(opts))?;
+    let audit = Arc::new(AuditLog::open(audit_path(opts))?);
     let system_prompt = build_system_prompt(&soul, &[]);
     let turn_prefix = format!("drift-{}-{}", std::process::id(), now_ms());
     let started = Instant::now();
@@ -704,15 +704,16 @@ async fn cmd_drift(opts: &Opts) -> Result<bool, MimintError> {
                 }
             }
             let turn_id = format!("{turn_prefix}-{}-r{rep}", golden.id);
-            let registry = mimint_core::default_registry(Arc::clone(&notebook));
-            let approver = ValidationApprover;
+            let registry = Arc::new(mimint_core::default_registry(Arc::clone(&notebook)));
+            let approver = Arc::new(ValidationApprover);
             let mut brain = Brain::new(
-                &setup.chain,
-                &registry,
-                Some(&approver),
-                &audit,
+                Arc::clone(&setup.chain) as Arc<dyn Provider>,
+                registry,
+                Some(approver),
+                Arc::clone(&audit),
                 Arc::clone(&notebook),
                 turn_id.clone(),
+                "agent-001",
                 opts.max_steps,
             )?;
             brain.set_system_prompt(system_prompt.clone());
@@ -899,15 +900,15 @@ async fn cmd_skill_validate(opts: &Opts) -> Result<bool, MimintError> {
         .unwrap_or_else(|| fresh_scratch_db("validate"));
     eprintln!("Scratch notebook: {}", notebook_path.display());
     let notebook = Arc::new(Notebook::open(&notebook_path)?);
-    let audit = AuditLog::open(audit_path(opts))?;
+    let audit = Arc::new(AuditLog::open(audit_path(opts))?);
     let store = skill_store(opts);
     let turn_prefix = format!("validate-{}-{}", std::process::id(), now_ms());
     let def = validate_skill(
         &store,
-        &setup.chain,
+        Arc::clone(&setup.chain) as Arc<dyn Provider>,
         &name,
         notebook,
-        &audit,
+        Arc::clone(&audit),
         &turn_prefix,
         opts.max_steps,
         time_budget(opts),

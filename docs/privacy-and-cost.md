@@ -42,6 +42,18 @@ while Privacy Mode is on. It does NOT cover:
 - DNS queries for names that pass the string check (the check runs
   on the hostname string; `localhost` issues no query at all, but
   other loopback spellings resolve through the system resolver).
+- **MCP servers (Phase 6).** An MCP server is a separate process
+  with its own network stack. On Linux it runs inside the same
+  bubblewrap sandbox as `execute_code` (no network namespace),
+  so a sandboxed server cannot reach the network at all. An
+  UNSANDBOXED server (macOS/Windows opt-in only, per server, with
+  an explicit confirmation) runs with the user's full network
+  access: Privacy Mode does NOT constrain it. Starting with
+  Privacy Mode ON and any MCP server configured prints a warning
+  naming every server and this limit, and records it in the
+  audit log (`mcp_privacy_warning`). The server's own egress is
+  the server author's responsibility; Mimint never claims
+  otherwise.
 
 ### Turning Privacy Mode off
 
@@ -87,6 +99,42 @@ usage is not parsed and dollars spent are not measured. The field
 keeps the name `cap_usd` for schema compatibility; a rename to an
 explicit allow-paid flag is planned for a later version. Real
 usage metering is future work.
+
+## Token ledger (Phase 6)
+
+Separate from the cost gate, Phase 6 keeps a per-agent token
+ledger. It records what can actually be known, in four kinds
+that are never mixed:
+
+- **Measured usage** — token counts the provider reported in
+  its response (`usage` field, OpenAI-style and Claude-style).
+- **Reserved tokens** — tokens held before a call
+  (`max_tokens`, at least 1000) and settled after it. A reserve
+  is not a measurement.
+- **Unmeasured estimate** — when a response carries no usage, the
+  whole reserve is charged as an ESTIMATE and flagged
+  `usage_unmeasured`. The UI labels it "ƯỚC TÍNH, không phải hóa
+  đơn" and never shows it as a precise figure.
+- **Actual USD** — shown ONLY when a price table exists AND every
+  charge is measured AND nothing is outstanding. Otherwise the
+  cost is "unknown" and the UI says "chưa đo được chi phí". A
+  reserve alone never produces a USD figure.
+
+Settle rules that matter: a timeout, a cancel after sending, or
+a disconnect does NOT release the reserve — it stays charged as
+an estimate with `outcome_unknown`, because the provider may
+have done the work. A cancel BEFORE sending reserves nothing.
+A retry is a new attempt with a new reserve; settling twice is
+refused. Every `provider_attempt` audit record carries the
+agent id, the attempt id, the charged tokens with their kind,
+and the remaining balances (per-agent + global). When an
+agent's budget runs out, only that agent stops; when the global
+cap runs out, all stop. In Phase 6 the worker runs the ledger
+unbounded (recording only — there is no global token-cap field
+in the config yet); finite budgets apply to sub-agent
+delegations, which are capped against the parent's remaining
+budget. The cost gate above remains the only paid-backend
+opt-in.
 
 ## Audit log
 

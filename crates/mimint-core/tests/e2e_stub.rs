@@ -6,7 +6,7 @@
 
 use mimint_core::{
     default_registry, Approver, AuditLog, Brain, EgressPolicy, GuardedHttpClient, MimintError,
-    Notebook, ProviderClient,
+    Notebook, Provider, ProviderClient,
 };
 use serde_json::Value;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -125,14 +125,18 @@ async fn e2e_turn_through_stub() {
             .expect("guarded client"),
     )
     .expect("provider");
-    let approver = TestApprover;
+    let approver: Arc<dyn Approver> = Arc::new(TestApprover);
+    let provider: Arc<dyn Provider> = Arc::new(provider);
+    let registry = Arc::new(registry);
+    let audit = Arc::new(audit);
     let brain = Brain::new(
-        &provider,
-        &registry,
-        Some(&approver),
-        &audit,
+        Arc::clone(&provider),
+        Arc::clone(&registry),
+        Some(Arc::clone(&approver)),
+        Arc::clone(&audit),
         Arc::clone(&notebook),
         "turn-e2e-stub",
+        "agent-001",
         5,
     )
     .expect("brain");

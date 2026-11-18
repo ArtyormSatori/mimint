@@ -17,13 +17,15 @@
 
 pub mod actor;
 pub mod frames;
+pub mod slots;
 pub mod tools;
 pub mod verify;
 
-pub use actor::{bridge, BodyActor, DEFAULT_ACTION_TIMEOUT};
+pub use actor::{bridge, ActorConfig, BodyActor, DEFAULT_ACTION_TIMEOUT, PROBE_QUEUE_SLA};
 pub use frames::{encode_png, hex_encode, sha256_hex, FrameMeta, FrameStore};
+pub use slots::AgentSnapshotSlots;
 pub use tools::{
-    register_body_tools, register_body_tools_configured, BodyTool, NamedBodyTool, PrivacyFlag,
-    DEFAULT_MAX_OBSERVATION_AGE,
+    register_body_tools, register_body_tools_configured, register_body_tools_for_agent, BodyTool,
+    NamedBodyTool, PrivacyFlag, DEFAULT_MAX_OBSERVATION_AGE,
 };
 pub use verify::BodyStepVerifier;

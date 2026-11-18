@@ -11,8 +11,10 @@
 //! and tested now so Phase 4 only has to drive it, and the lamp
 //! honestly shows `Idle` ("Chưa điều khiển") until then.
 
+use crate::approver::ApprovalJob;
 use crate::worker::FailureKind;
 use mimint_body::WindowIdentity;
+use mimint_core::CostDisplay;
 use serde_json::Value;
 use std::time::{Duration, Instant};
 
@@ -36,16 +38,22 @@ pub struct UiMessage {
 
 /// A guard approval waiting on the user. The `id` is the guard
 /// executor's request id — the same id binds the request, the card,
-/// the decision, and the audit record.
+/// the decision, and the audit record. The pair (`agent_id`, `id`)
+/// is the binding key (§3.1): request ids restart at 1 per turn,
+/// so the agent id is part of the identity.
 /// `target` is the window under the action point at request time
 /// (`None` when the probe was unavailable or the tool has no
 /// point). `observation_age` is the age of the newest stored
 /// frame at request time; the card warns when it exceeds
 /// `max_observation_age`. `timeout` is the full wait the worker
 /// allows, for the expiry message (never a hardcoded number).
+/// The Phase 6 fields carry the card context of §15.2: queue
+/// position, wait time, the agent + task label, the tool's audit
+/// fields (MCP server/tool/version), and the cost estimate.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ApprovalRequest {
     pub id: u64,
+    pub agent_id: String,
     pub tool: String,
     pub args: Value,
     /// When the worker times this request out (the card shows a
@@ -55,6 +63,20 @@ pub struct ApprovalRequest {
     pub target: Option<WindowIdentity>,
     pub observation_age: Option<Duration>,
     pub max_observation_age: Duration,
+    /// Position in the card queue at insertion time (1-based).
+    pub queue_position: usize,
+    /// Cards waiting at insertion time.
+    pub queue_total: usize,
+    /// When the worker created the card (elapsed wait on display).
+    pub created_at: Instant,
+    /// The tool's audit fields (MCP server/tool/version when the
+    /// tool is an MCP tool; empty otherwise).
+    pub context: Value,
+    /// The asking agent's cost display at request time, when the
+    /// ledger is wired.
+    pub cost: Option<CostDisplay>,
+    /// True when any of the estimate is unmeasured (§3.3).
+    pub unmeasured: bool,
 }
 
 /// What a running turn is doing, as far as the UI can honestly tell.
@@ -122,6 +144,18 @@ pub fn friendly_tool_error(error: &str) -> String {
         "ảnh chụp Mimint dựa vào đã quá cũ".to_string()
     } else if lower.contains("unknown_outcome") {
         "không rõ hành động có chạy hay không (không tự thử lại)".to_string()
+    } else if lower.contains("body_queue_full") {
+        "hàng đợi action đã đầy, action bị từ chối ngay".to_string()
+    } else if lower.contains("queue_sla_expired") {
+        "action chờ quá lâu trong hàng đợi nên hết hạn, không chạy".to_string()
+    } else if lower.contains("budget_exhausted") {
+        "ngân sách token đã hết".to_string()
+    } else if lower.contains("sandbox_unavailable") {
+        "sandbox chưa sẵn sàng, không chạy code ngoài sandbox".to_string()
+    } else if lower.contains("sandbox_unverified") {
+        "sandbox chưa được kiểm chứng trên hệ điều hành này".to_string()
+    } else if lower.contains("task_end_unverified") {
+        "không xác minh được agent đã dừng hẳn".to_string()
     } else if lower.contains("forbidden") {
         "mục tiêu bị cấm".to_string()
     } else if lower.contains("rate_limited") {
@@ -179,6 +213,10 @@ pub struct ChatState {
     /// When the running turn started, for the elapsed-time status
     /// line. Set on submit/resubmit, cleared when the turn ends.
     pub turn_started: Option<Instant>,
+    /// Multi-agent mode (§15): when true, submitting while a
+    /// turn runs starts (or queues) another agent instead of
+    /// being refused. Set by the app from the config flag.
+    pub multi_agent: bool,
 }
 
 impl ChatState {
@@ -206,10 +244,15 @@ impl ChatState {
     }
 
     /// Submit the input box. Returns the prompt when a turn may start:
-    /// non-empty input, no turn running, no approval pending, not
+    /// non-empty input, no turn running (or multi-agent mode, where
+    /// a new turn starts another agent), no approval pending, not
     /// stopped. The input is cleared and a user message is appended.
     pub fn submit_input(&mut self) -> Option<String> {
-        if self.busy || self.pending_approval.is_some() || self.stopped || self.body_stopped {
+        if (self.busy && !self.multi_agent)
+            || self.pending_approval.is_some()
+            || self.stopped
+            || self.body_stopped
+        {
             return None;
         }
         let prompt = self.input.trim().to_string();
@@ -237,7 +280,7 @@ impl ChatState {
     /// instead. Returns the prompt to send, or `None` when a turn
     /// cannot start.
     pub fn resubmit(&mut self, prompt: String) -> Option<String> {
-        if self.busy || self.pending_approval.is_some() || self.stopped {
+        if (self.busy && !self.multi_agent) || self.pending_approval.is_some() || self.stopped {
             return None;
         }
         self.last_error = None;
@@ -310,7 +353,10 @@ impl ChatState {
 
     /// Show an approval card for the guard's request id. While a card
     /// is on screen, `submit_input` refuses new turns: the user
-    /// answers the guard question first.
+    /// answers the guard question first. The Phase 6 card fields
+    /// default to the single-agent reading (agent-001, alone in
+    /// the queue); [`ChatState::request_approval_job`] carries
+    /// the full context from a worker job.
     #[allow(clippy::too_many_arguments)]
     pub fn request_approval(
         &mut self,
@@ -325,6 +371,7 @@ impl ChatState {
     ) {
         self.pending_approval = Some(ApprovalRequest {
             id,
+            agent_id: mimint_core::AGENT_DEFAULT.to_string(),
             tool,
             args,
             deadline: Some(deadline),
@@ -332,14 +379,46 @@ impl ChatState {
             target,
             observation_age,
             max_observation_age,
+            queue_position: 1,
+            queue_total: 1,
+            created_at: Instant::now(),
+            context: Value::Null,
+            cost: None,
+            unmeasured: false,
         });
     }
 
-    /// Resolve the pending approval. Returns false when the id does
-    /// not match the card on screen (stale decision, ignored).
-    pub fn resolve_approval(&mut self, id: u64) -> bool {
+    /// Show an approval card from a worker job, carrying the full
+    /// §15.2 context: queue position, wait time, agent, tool
+    /// audit fields, and cost estimate.
+    pub fn request_approval_job(&mut self, job: &ApprovalJob) {
+        self.pending_approval = Some(ApprovalRequest {
+            id: job.id,
+            agent_id: job.agent_id.clone(),
+            tool: job.tool.clone(),
+            args: job.args.clone(),
+            deadline: Some(job.deadline),
+            timeout: job.timeout,
+            target: job.target.clone(),
+            observation_age: job.observation_age,
+            max_observation_age: job.max_observation_age,
+            queue_position: job.queue_position,
+            queue_total: job.queue_total,
+            created_at: job.created_at,
+            context: job.context.clone(),
+            cost: job.cost.clone(),
+            unmeasured: job.unmeasured,
+        });
+    }
+
+    /// Resolve the pending approval. The key is the (`agent_id`,
+    /// `id`) pair (§3.1): request ids restart at 1 per turn, so
+    /// the id alone cannot bind a decision. Returns false when
+    /// the pair does not match the card on screen (stale
+    /// decision, ignored).
+    pub fn resolve_approval(&mut self, agent_id: &str, id: u64) -> bool {
         match &self.pending_approval {
-            Some(req) if req.id == id => {
+            Some(req) if req.id == id && req.agent_id == agent_id => {
                 self.pending_approval = None;
                 true
             }
@@ -456,11 +535,37 @@ mod tests {
         assert_eq!(chat.control_state(), ControlState::AwaitingApproval);
         chat.input = "wait".to_string();
         assert_eq!(chat.submit_input(), None);
-        assert!(!chat.resolve_approval(43));
+        assert!(!chat.resolve_approval("agent-001", 43));
         assert!(chat.pending_approval.is_some());
-        assert!(chat.resolve_approval(42));
+        // The binding key is (agent_id, id): the same id from
+        // another agent does not resolve this card.
+        assert!(!chat.resolve_approval("agent-002", 42));
+        assert!(chat.pending_approval.is_some());
+        assert!(chat.resolve_approval("agent-001", 42));
         assert!(chat.pending_approval.is_none());
         assert_eq!(chat.submit_input().as_deref(), Some("wait"));
+    }
+
+    #[test]
+    fn multi_agent_submit_is_allowed_while_busy() {
+        let mut chat = ChatState::new();
+        chat.multi_agent = true;
+        chat.input = "one".to_string();
+        assert_eq!(chat.submit_input().as_deref(), Some("one"));
+        assert!(chat.busy);
+        chat.input = "two".to_string();
+        assert_eq!(chat.submit_input().as_deref(), Some("two"));
+        assert_eq!(chat.messages.len(), 2);
+    }
+
+    #[test]
+    fn friendly_tool_error_maps_phase_6_codes() {
+        assert!(friendly_tool_error("body_queue_full: 64 queued").contains("đã đầy"));
+        assert!(friendly_tool_error("queue_sla_expired: waited 60s").contains("hết hạn"));
+        assert!(friendly_tool_error("budget_exhausted: no tokens left").contains("ngân sách"));
+        assert!(friendly_tool_error("sandbox_unavailable: no bwrap").contains("sandbox"));
+        assert!(friendly_tool_error("task_end_unverified: join timed out")
+            .contains("không xác minh được"));
     }
 
     #[test]
@@ -582,5 +687,92 @@ mod tests {
         assert_eq!(chat.control_state(), ControlState::Error);
         chat.resume();
         assert_eq!(chat.control_state(), ControlState::Idle);
+    }
+
+    /// §15.6 `ui_approval_card_contents` (F6D-17): the card's
+    /// data layer carries every §15.2 field — the requesting
+    /// agent, the queue position, the wait clock, the MCP
+    /// context, the cost estimate + unmeasured flag — and the
+    /// detail helpers render the tool-specific content (MCP
+    /// server/tool/unsandboxed mode, execute_code hash, delegate
+    /// limits, impact labels). The egui render itself is
+    /// untestable headless; it reads exactly these fields.
+    #[test]
+    fn ui_approval_card_contents() {
+        use crate::approval_text::{
+            approval_detail_with_context, execute_code_hash, impact_labels, short_hash,
+        };
+        use crate::approver::ApprovalJob;
+        use mimint_core::CostDisplay;
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+        use std::time::Instant;
+
+        let (reply, _rx) = std::sync::mpsc::channel();
+        let created_at = Instant::now();
+        let job = ApprovalJob {
+            id: 7,
+            agent_id: "agent-002".to_string(),
+            tool: "mcp_notes_search".to_string(),
+            args: json!({"query": "lunch"}),
+            deadline: created_at + Duration::from_secs(60),
+            timeout: Duration::from_secs(60),
+            target: None,
+            observation_age: None,
+            max_observation_age: Duration::from_secs(300),
+            reply,
+            withdrawn: Arc::new(AtomicBool::new(false)),
+            created_at,
+            queue_position: 2,
+            queue_total: 2,
+            context: json!({
+                "mcp_server": "notes",
+                "mcp_tool": "search",
+                "protocol_version": "2025-06-18",
+                "unsandboxed": true,
+            }),
+            cost: Some(CostDisplay::EstimateTokens(4096)),
+            unmeasured: true,
+        };
+        let mut chat = ChatState::new();
+        chat.request_approval_job(&job);
+        let req = chat.pending_approval.as_ref().expect("card on screen");
+        assert_eq!(req.agent_id, "agent-002");
+        assert_eq!(req.queue_position, 2);
+        assert_eq!(req.queue_total, 2);
+        assert_eq!(req.created_at, created_at);
+        assert_eq!(req.context["mcp_server"], "notes");
+        assert_eq!(req.cost, Some(CostDisplay::EstimateTokens(4096)));
+        assert!(req.unmeasured);
+
+        // The MCP detail names the server, the tool, the
+        // protocol version, and the unsandboxed mode.
+        let detail = approval_detail_with_context(&req.tool, &req.args, &req.context);
+        let rows: Vec<String> = detail.rows.iter().map(|(_, v)| v.clone()).collect();
+        assert!(rows.iter().any(|v| v == "notes"), "{rows:?}");
+        assert!(rows.iter().any(|v| v == "search"), "{rows:?}");
+        assert!(rows.iter().any(|v| v == "2025-06-18"), "{rows:?}");
+        assert!(rows.iter().any(|v| v.contains("KHÔNG SANDBOX")), "{rows:?}");
+        // MCP tools always carry at least "thực thi".
+        let (primary, _) = impact_labels(&req.tool, &req.context);
+        assert_eq!(primary, "thực thi");
+
+        // Execute_code: the short hash in the rows, the full
+        // hash one expand away (the render's CollapsingHeader
+        // reads the same helper).
+        let detail = approval_detail_with_context(
+            "execute_code",
+            &json!({"language": "python3", "code": "print('hello')"}),
+            &serde_json::Value::Null,
+        );
+        let full = execute_code_hash("print('hello')");
+        assert_eq!(full.len(), 64);
+        assert!(
+            detail.rows.iter().any(|(_, v)| *v == short_hash(&full)),
+            "{:?}",
+            detail.rows
+        );
+        assert!(detail.rows.iter().any(|(_, v)| v == "python3"));
+        assert!(detail.rows.iter().any(|(_, v)| v == "14 ký tự"));
     }
 }

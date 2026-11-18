@@ -64,6 +64,10 @@ pub struct TripInfo {
     /// Wall-clock time of the trip, epoch milliseconds
     /// (audit-compatible; `0` when the clock is unavailable).
     pub ts_ms: u64,
+    /// The agent whose action tripped the latch, when known
+    /// (Phase 6, §3). `None` for trips with no acting agent
+    /// (hotkey, bare `trip()`).
+    pub agent_id: Option<String>,
 }
 
 /// A shared, latching stop flag. The UI (Phase 4) and the wrapper
@@ -74,6 +78,47 @@ pub struct TripInfo {
 pub struct StopFlag {
     tripped: AtomicBool,
     info: Mutex<Option<TripInfo>>,
+}
+
+/// A replaceable handle to the CURRENT body stop flag
+/// (Phase 6, §4.1): a body rebuild swaps in a fresh, untripped
+/// flag, but the hotkey listener thread and the stop bridge
+/// outlive any one flag. They read the current flag through
+/// this cell on every iteration, so the chord always trips the
+/// flag the live actor consults. The cell itself never latches:
+/// only the flag inside it does.
+#[derive(Debug)]
+pub struct StopFlagCell {
+    inner: Mutex<Arc<StopFlag>>,
+}
+
+impl StopFlagCell {
+    pub fn new(flag: Arc<StopFlag>) -> Arc<Self> {
+        Arc::new(Self {
+            inner: Mutex::new(flag),
+        })
+    }
+
+    /// The current flag (a clone sharing the same latch).
+    pub fn get(&self) -> Arc<StopFlag> {
+        self.inner.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    /// Swap in a fresh flag (body rebuild). A flag already
+    /// tripped stays tripped; only new readers see the fresh one.
+    pub fn replace(&self, flag: Arc<StopFlag>) {
+        *self.inner.lock().unwrap_or_else(|p| p.into_inner()) = flag;
+    }
+
+    /// True when the CURRENT flag is tripped.
+    pub fn is_tripped(&self) -> bool {
+        self.get().is_tripped()
+    }
+
+    /// The current flag's trip context, when tripped.
+    pub fn trip_info(&self) -> Option<TripInfo> {
+        self.get().trip_info()
+    }
 }
 
 impl StopFlag {
@@ -90,6 +135,18 @@ impl StopFlag {
     /// Latch the flag, recording the first trip's context.
     /// Later calls leave the recorded context untouched.
     pub fn trip_with(&self, source: &'static str, reason: impl Into<String>) {
+        self.trip_with_agent(source, reason, None);
+    }
+
+    /// Latch the flag, recording the first trip's context
+    /// plus the acting agent (Phase 6, §3). Later calls
+    /// leave the recorded context untouched.
+    pub fn trip_with_agent(
+        &self,
+        source: &'static str,
+        reason: impl Into<String>,
+        agent_id: Option<&str>,
+    ) {
         if !self.tripped.swap(true, Ordering::SeqCst) {
             let ts_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -99,6 +156,7 @@ impl StopFlag {
                 source,
                 reason: reason.into(),
                 ts_ms,
+                agent_id: agent_id.map(str::to_string),
             });
         }
     }

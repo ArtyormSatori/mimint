@@ -13,6 +13,7 @@
 //! rendering, which lists every argument — never hidden.
 
 use mimint_body::{Framebuffer, WindowIdentity};
+use mimint_core::sha256_hex;
 use serde_json::Value;
 
 /// One card's content: a title plus label/value rows, and whether the
@@ -133,6 +134,163 @@ pub fn is_point_tool(tool: &str) -> bool {
             | "body_double_click"
             | "body_right_click"
     )
+}
+
+/// Impact labels (§15.2): one primary label plus secondary
+/// labels, from the fixed set đọc / ghi / thực thi / gửi ra
+/// ngoài. MCP tools always carry at least "thực thi" — the
+/// server's behavior is unknown (§6.2). Unknown tools fail
+/// closed to "thực thi". `context` is the card's audit-fields
+/// object (it names the MCP server when the tool is an MCP
+/// tool); the `mcp_` name prefix is a second signal.
+pub fn impact_labels(tool: &str, context: &Value) -> (&'static str, Vec<&'static str>) {
+    let is_mcp = context.get("mcp_server").is_some() || tool.starts_with("mcp_");
+    if is_mcp {
+        return ("thực thi", vec!["gửi ra ngoài"]);
+    }
+    match tool {
+        "body_screenshot" | "notebook_search" | "notebook_read" => ("đọc", Vec::new()),
+        "notebook_add" => ("ghi", Vec::new()),
+        "execute_code" => ("thực thi", vec!["ghi"]),
+        "delegate" => ("thực thi", Vec::new()),
+        _ if tool.starts_with("body_") => ("ghi", vec!["thực thi"]),
+        _ => ("thực thi", Vec::new()),
+    }
+}
+
+/// The full SHA-256 of the code an `execute_code` card approves
+/// (§15.2): the card shows the shortened form, the expanded
+/// view shows this in full, and the post-run audit record
+/// (`code_execution`) carries the executed hash plus the
+/// verified flag for comparison.
+pub fn execute_code_hash(code: &str) -> String {
+    sha256_hex(code.as_bytes())
+}
+
+/// Shortened hash for the card row: 16 hex characters + an
+/// ellipsis. The full hash is one expansion away.
+pub fn short_hash(full_hash: &str) -> String {
+    if full_hash.len() > 16 {
+        format!("{}…", &full_hash[..16])
+    } else {
+        full_hash.to_string()
+    }
+}
+
+/// Render the approval card content for one tool call, with the
+/// card's audit-fields context (MCP server/tool/version, when
+/// the tool is an MCP tool). Phase 6 tools get explicit cards;
+/// everything else uses [`approval_detail`].
+pub fn approval_detail_with_context(tool: &str, args: &Value, context: &Value) -> ApprovalDetail {
+    match tool {
+        "execute_code" => {
+            let language = arg_str(args, "language").unwrap_or("(không rõ)");
+            let code = arg_str(args, "code").unwrap_or("");
+            let hash = execute_code_hash(code);
+            let inputs = args
+                .get("inputs")
+                .and_then(|v| v.as_object())
+                .map(|obj| {
+                    let mut names: Vec<&str> = obj.keys().map(String::as_str).collect();
+                    names.sort_unstable();
+                    names.join(", ")
+                })
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "không có".to_string());
+            ApprovalDetail {
+                title: "Chạy code trong sandbox".to_string(),
+                rows: vec![
+                    ("Ngôn ngữ".to_string(), language.to_string()),
+                    ("Độ dài code".to_string(), format!("{} ký tự", code.chars().count())),
+                    ("Hash SHA-256".to_string(), short_hash(&hash)),
+                    ("Đầu vào".to_string(), truncate(&inputs, 120)),
+                    scope_row("Chỉ chạy một lần trong sandbox biệt lập: không mạng, không đọc file ngoài vùng làm việc."),
+                    (
+                        "Kiểm chứng".to_string(),
+                        "Hash này là hash đã phê duyệt; sau khi chạy, bản ghi audit xác nhận hash thực thi có khớp hay không.".to_string(),
+                    ),
+                ],
+                reversible: "Code chạy trong sandbox biệt lập; file tạo ra chỉ nằm trong vùng làm việc của lượt này.".to_string(),
+            }
+        }
+        "delegate" => {
+            let task = arg_str(args, "task").unwrap_or("(không rõ nhiệm vụ)");
+            let steps = args
+                .get("max_steps")
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "mặc định".to_string());
+            let budget = args
+                .get("token_budget")
+                .map(|v| format!("{} token", v))
+                .unwrap_or_else(|| "mặc định (1/4 ngân sách còn lại của cha)".to_string());
+            let time = args
+                .get("time_limit_secs")
+                .map(|v| format!("{v} giây"))
+                .unwrap_or_else(|| "mặc định".to_string());
+            ApprovalDetail {
+                title: "Giao việc cho sub-agent".to_string(),
+                rows: vec![
+                    ("Nhiệm vụ".to_string(), truncate(task, 200).replace('\n', " ")),
+                    ("Số bước tối đa".to_string(), steps),
+                    ("Ngân sách token".to_string(), budget),
+                    ("Giới hạn thời gian".to_string(), time),
+                    scope_row("Chỉ giao một lần; sub-agent chạy dưới cùng hệ thống phê duyệt."),
+                ],
+                reversible: "Sub-agent chạy trong cùng hệ thống phê duyệt; kết quả của nó chỉ là báo cáo — agent cha đánh giá độc lập trước khi dùng.".to_string(),
+            }
+        }
+        _ if context.get("mcp_server").is_some() || tool.starts_with("mcp_") => {
+            let server = context
+                .get("mcp_server")
+                .and_then(|v| v.as_str())
+                .unwrap_or("(không rõ server)");
+            let mcp_tool = context
+                .get("mcp_tool")
+                .and_then(|v| v.as_str())
+                .unwrap_or(tool);
+            let version = context
+                .get("protocol_version")
+                .and_then(|v| v.as_str())
+                .unwrap_or("(chưa nối)");
+            let unsandboxed = context
+                .get("unsandboxed")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let mut rows = vec![
+                ("Server MCP".to_string(), server.to_string()),
+                ("Công cụ".to_string(), mcp_tool.to_string()),
+                ("Phiên bản protocol".to_string(), version.to_string()),
+                (
+                    "Chế độ".to_string(),
+                    if unsandboxed {
+                        "KHÔNG SANDBOX — server chạy trực tiếp trên máy này".to_string()
+                    } else {
+                        "Chạy trong sandbox".to_string()
+                    },
+                ),
+            ];
+            // Arguments, listed, never hidden.
+            if let Some(obj) = args.as_object() {
+                let mut keys: Vec<&String> = obj.keys().collect();
+                keys.sort();
+                for key in keys {
+                    let rendered = match &obj[key] {
+                        Value::String(s) => truncate(s, 80),
+                        other => truncate(&other.to_string(), 80),
+                    };
+                    rows.push((key.clone(), rendered));
+                }
+            }
+            rows.push(scope_row("Chỉ gọi một lần với các tham số trên."));
+            ApprovalDetail {
+                title: "Gọi công cụ MCP".to_string(),
+                rows,
+                reversible: "Không biết server MCP làm gì bên trong — coi như không hoàn tác được."
+                    .to_string(),
+            }
+        }
+        _ => approval_detail(tool, args),
+    }
 }
 
 /// Render the approval card content for one tool call.
@@ -576,5 +734,140 @@ mod tests {
         // Empty frame: no preview.
         let empty = Framebuffer::new(0, 0, Vec::new()).unwrap();
         assert!(crop_preview(&empty, 0, 0, 120).is_none());
+    }
+
+    #[test]
+    fn impact_labels_follow_the_fixed_set() {
+        let empty = json!({});
+        assert_eq!(
+            impact_labels("body_screenshot", &empty),
+            ("đọc", Vec::new())
+        );
+        assert_eq!(
+            impact_labels("notebook_search", &empty),
+            ("đọc", Vec::new())
+        );
+        assert_eq!(impact_labels("notebook_add", &empty), ("ghi", Vec::new()));
+        assert_eq!(
+            impact_labels("body_click", &empty),
+            ("ghi", vec!["thực thi"])
+        );
+        assert_eq!(
+            impact_labels("execute_code", &empty),
+            ("thực thi", vec!["ghi"])
+        );
+        assert_eq!(impact_labels("delegate", &empty), ("thực thi", Vec::new()));
+        // Unknown tools fail closed to "thực thi".
+        assert_eq!(
+            impact_labels("mystery_tool", &empty),
+            ("thực thi", Vec::new())
+        );
+        // MCP tools always carry at least "thực thi", via the
+        // context or via the name prefix.
+        let mcp_ctx = json!({"mcp_server": "files", "mcp_tool": "read"});
+        assert_eq!(
+            impact_labels("mcp_files_read", &mcp_ctx),
+            ("thực thi", vec!["gửi ra ngoài"])
+        );
+        assert_eq!(
+            impact_labels("mcp_files_read", &empty),
+            ("thực thi", vec!["gửi ra ngoài"])
+        );
+        assert_eq!(
+            impact_labels("something_else", &mcp_ctx),
+            ("thực thi", vec!["gửi ra ngoài"])
+        );
+    }
+
+    #[test]
+    fn execute_code_card_shows_language_length_and_short_hash() {
+        let code = "print('hello')";
+        let detail = approval_detail_with_context(
+            "execute_code",
+            &json!({"language": "python3", "code": code}),
+            &json!({}),
+        );
+        assert_eq!(detail.title, "Chạy code trong sandbox");
+        assert!(detail
+            .rows
+            .iter()
+            .any(|(k, v)| k == "Ngôn ngữ" && v == "python3"));
+        assert!(detail
+            .rows
+            .iter()
+            .any(|(k, v)| k == "Độ dài code" && v == "14 ký tự"));
+        let full = execute_code_hash(code);
+        assert_eq!(full.len(), 64);
+        assert!(detail
+            .rows
+            .iter()
+            .any(|(k, v)| k == "Hash SHA-256" && *v == short_hash(&full) && v.len() < full.len()));
+        // The full hash is the real SHA-256 of the approved code.
+        assert_eq!(full, sha256_hex(code.as_bytes()));
+        assert!(detail.rows.iter().any(|(k, _)| k == "Kiểm chứng"));
+    }
+
+    #[test]
+    fn delegate_card_shows_the_task_and_limits() {
+        let detail = approval_detail_with_context(
+            "delegate",
+            &json!({"task": "tìm tài liệu", "max_steps": 5}),
+            &json!({}),
+        );
+        assert_eq!(detail.title, "Giao việc cho sub-agent");
+        assert!(detail
+            .rows
+            .iter()
+            .any(|(k, v)| k == "Nhiệm vụ" && v == "tìm tài liệu"));
+        assert!(detail
+            .rows
+            .iter()
+            .any(|(k, v)| k == "Số bước tối đa" && v == "5"));
+        assert!(detail.reversible.contains("chỉ là báo cáo"));
+    }
+
+    #[test]
+    fn mcp_card_names_server_tool_and_unsandboxed_mode() {
+        let ctx = json!({
+            "mcp_server": "files",
+            "mcp_tool": "read",
+            "protocol_version": "2025-06-18",
+            "unsandboxed": true,
+        });
+        let detail =
+            approval_detail_with_context("mcp_files_read", &json!({"path": "/tmp/x"}), &ctx);
+        assert_eq!(detail.title, "Gọi công cụ MCP");
+        assert!(detail
+            .rows
+            .iter()
+            .any(|(k, v)| k == "Server MCP" && v == "files"));
+        assert!(detail
+            .rows
+            .iter()
+            .any(|(k, v)| k == "Công cụ" && v == "read"));
+        assert!(detail
+            .rows
+            .iter()
+            .any(|(k, v)| k == "Phiên bản protocol" && v == "2025-06-18"));
+        assert!(detail
+            .rows
+            .iter()
+            .any(|(k, v)| k == "Chế độ" && v.contains("KHÔNG SANDBOX")));
+        assert!(detail
+            .rows
+            .iter()
+            .any(|(k, v)| k == "path" && v == "/tmp/x"));
+        // Sandboxed servers say so.
+        let ctx = json!({
+            "mcp_server": "files",
+            "mcp_tool": "read",
+            "protocol_version": "2025-06-18",
+            "unsandboxed": false,
+        });
+        let detail = approval_detail_with_context("mcp_files_read", &json!({}), &ctx);
+        assert!(detail
+            .rows
+            .iter()
+            .any(|(k, v)| k == "Chế độ" && v == "Chạy trong sandbox"));
     }
 }

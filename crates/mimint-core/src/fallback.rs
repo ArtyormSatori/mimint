@@ -24,6 +24,18 @@
 //! and audit log arrive with each call, so one chain can serve many
 //! turns safely.
 //!
+//! Phase 6 (§3.3, §10): when the call context carries a cost ledger,
+//! the chain reserves tokens before each attempt and settles after
+//! it, following the settle matrix (measured usage, unmeasured
+//! estimate, unknown outcome kept as estimate, release only when
+//! the call provably never left). Attempt records carry the
+//! ledger's `attempt_id`, charged tokens with their kind, and the
+//! remaining balances. Cancel tokens from the context are checked
+//! between attempts and raced against backoff sleeps; an in-flight
+//! request is interrupted by dropping the future (the brain's
+//! `select!`), which drops the attempt's reservation guard and
+//! converts the reserve to an unknown-outcome estimate.
+//!
 //! When a chain escalates from a local backend to a remote (paid)
 //! provider mid-call, the whole conversation history so far is sent to
 //! that remote provider. The first such escalation in a call prints one
@@ -32,18 +44,21 @@
 //! beyond the cost-cap lock and Privacy Mode, which already gate
 //! whether a remote provider can be in the chain at all.
 
-use crate::error::MimintError;
+use crate::cancel::WaitAnyCancelled;
+use crate::error::{BudgetScope, MimintError};
+use crate::ledger::{PendingReservation, SettleOutcome};
 use crate::provider::{BoxFuture, CallContext, ChatMessage, Provider};
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-/// Called with the provider name before every attempt the chain
-/// starts, so a UI can say which backend is being tried ("trying
-/// another backend…"). The hook must return quickly and must never
-/// panic: it runs inside the attempt loop. It is reporting only — it
-/// cannot change which provider is tried.
-pub type ProgressHook = Arc<dyn Fn(&str) + Send + Sync>;
+/// Called with the provider name and the asking agent's id
+/// before every attempt the chain starts, so a UI can say which
+/// backend is being tried for which agent ("trying another
+/// backend…"). The hook must return quickly and must never
+/// panic: it runs inside the attempt loop. It is reporting only
+/// — it cannot change which provider is tried.
+pub type ProgressHook = Arc<dyn Fn(&str, &str) + Send + Sync>;
 
 /// Bounded retry policy for the fallback chain.
 #[derive(Debug, Clone, Copy)]
@@ -198,6 +213,9 @@ impl FallbackChain {
         self.retry
     }
 
+    // 8 parameters: one audit row needs the whole attempt
+    // context; splitting it would scatter the audit contract.
+    #[allow(clippy::too_many_arguments)]
     fn audit_attempt(
         &self,
         ctx: &CallContext<'_>,
@@ -206,6 +224,7 @@ impl FallbackChain {
         latency: Duration,
         escalated_to_remote: bool,
         result: &Result<ChatMessage, MimintError>,
+        settle: Option<&SettleOutcome>,
     ) -> Result<(), MimintError> {
         let Some(audit) = ctx.audit else {
             return Ok(());
@@ -245,11 +264,83 @@ impl FallbackChain {
         if let (Some(profile), Value::Object(map)) = (ctx.profile, &mut detail) {
             map.insert("profile".to_string(), Value::String(profile.to_string()));
         }
-        audit.log(
+        // Ledger settlement (§3.3): every attempt record carries
+        // the attempt id, charged tokens with their kind, and the
+        // remaining balances (per-agent + global).
+        if let (Some(settle), Value::Object(map)) = (settle, &mut detail) {
+            map.insert("attempt_id".to_string(), json!(settle.attempt_id));
+            map.insert("charged_tokens".to_string(), json!(settle.charged_tokens));
+            map.insert(
+                "charge_kind".to_string(),
+                json!(match settle.kind {
+                    crate::ledger::ChargeKind::Measured => "measured",
+                    crate::ledger::ChargeKind::Estimate => "estimate",
+                }),
+            );
+            map.insert(
+                "usage_unmeasured".to_string(),
+                json!(settle.usage_unmeasured),
+            );
+            map.insert("outcome_unknown".to_string(), json!(settle.outcome_unknown));
+            map.insert(
+                "provider_disconnect".to_string(),
+                json!(settle.provider_disconnect),
+            );
+            map.insert(
+                "agent_remaining".to_string(),
+                settle
+                    .agent_remaining
+                    .map(Value::from)
+                    .unwrap_or(Value::Null),
+            );
+            map.insert(
+                "global_remaining".to_string(),
+                settle
+                    .global_remaining
+                    .map(Value::from)
+                    .unwrap_or(Value::Null),
+            );
+        }
+        audit.log_for(
+            ctx.agent_id,
             ctx.turn_id,
             "provider_attempt",
             None,
             Some(decision),
+            detail,
+        )
+    }
+
+    /// Audit a reserve failure: the budget ran out before any
+    /// attempt started. No `provider_attempt` with a settlement
+    /// exists for this case; the record names the scope so the
+    /// coordinator can tell an agent-scope stop from a global one.
+    fn audit_budget_exhausted(
+        &self,
+        ctx: &CallContext<'_>,
+        provider: &dyn Provider,
+        attempt: usize,
+        err: &MimintError,
+    ) -> Result<(), MimintError> {
+        let Some(audit) = ctx.audit else {
+            return Ok(());
+        };
+        let mut detail = json!({
+            "provider": provider.name(),
+            "model": provider.model(),
+            "attempt": attempt,
+            "error": err.to_string(),
+            "scope": err.budget_scope().map(|s| s.as_str()).unwrap_or("unknown"),
+        });
+        if let (Some(profile), Value::Object(map)) = (ctx.profile, &mut detail) {
+            map.insert("profile".to_string(), Value::String(profile.to_string()));
+        }
+        audit.log_for(
+            ctx.agent_id,
+            ctx.turn_id,
+            "provider_attempt",
+            None,
+            Some("budget_exhausted"),
             detail,
         )
     }
@@ -272,6 +363,13 @@ impl FallbackChain {
         let mut budget_exhausted = false;
         let mut saw_local = false;
         let mut warned_escalation = false;
+        // A budget error from a provider must survive the
+        // all-failed wrapper (§3.3/G6-9): the coordinator keys
+        // fail-all on the scope, and wrapping it into a generic
+        // provider failure would silently downgrade a global
+        // exhaustion to a single-agent failure. The first one
+        // wins: providers are tried in order.
+        let mut first_budget_error: Option<(BudgetScope, String)> = None;
 
         'providers: for provider in &self.providers {
             for attempt in 1..=self.retry.max_attempts {
@@ -280,6 +378,15 @@ impl FallbackChain {
                 if attempted_any && Instant::now() >= deadline {
                     budget_exhausted = true;
                     break 'providers;
+                }
+                // Cancel-before-send (§3.3, §10): a cancel that
+                // landed before this attempt means no reserve and
+                // no ledger entry. Legacy callers attach no
+                // tokens, so this is a no-op for them.
+                if ctx.is_cancelled() {
+                    return Err(MimintError::Cancelled(
+                        "cancelled before provider attempt".to_string(),
+                    ));
                 }
                 attempted_any = true;
                 // Local -> remote escalation inside one call: the whole
@@ -296,11 +403,41 @@ impl FallbackChain {
                     saw_local = true;
                 }
                 if let Some(hook) = &self.progress_hook {
-                    hook(provider.name());
+                    hook(provider.name(), ctx.agent_id);
+                }
+                // Reserve-before (§3.3): a retry is a new attempt
+                // with a new reserve. Budget exhaustion fails the
+                // call at once — no attempt is started.
+                let reservation: Option<PendingReservation> = match ctx.ledger {
+                    Some(ledger) => match ledger.reserve(ctx.agent_id, ctx.max_tokens) {
+                        Ok(reservation) => Some(reservation),
+                        Err(err) => {
+                            self.audit_budget_exhausted(ctx, provider.as_ref(), attempt, &err)?;
+                            return Err(err);
+                        }
+                    },
+                    None => None,
+                };
+                // A cancel that landed between the reserve and the
+                // send means the call provably never left: release
+                // the reserve with no charge.
+                if ctx.is_cancelled() {
+                    if let Some(reservation) = reservation {
+                        let _ = reservation.release();
+                    }
+                    return Err(MimintError::Cancelled(
+                        "cancelled before provider attempt".to_string(),
+                    ));
                 }
                 let started = Instant::now();
                 let result = provider.chat(ctx, messages, tools).await;
                 let latency = started.elapsed();
+                // Settle-after (§3.3). Dropping the reservation
+                // without settling (the brain's `select!` dropping
+                // this future mid-call) converts the reserve to an
+                // unknown-outcome estimate — never a release — so
+                // the cancel-after-send case needs no code here.
+                let settle = settle_attempt(result.as_ref(), reservation);
                 // Audit failures fail closed, like guard decisions: an
                 // attempt that cannot be recorded fails the turn.
                 self.audit_attempt(
@@ -310,6 +447,7 @@ impl FallbackChain {
                     latency,
                     escalating,
                     &result,
+                    settle.as_ref(),
                 )?;
                 match result {
                     Ok(message) => {
@@ -320,6 +458,11 @@ impl FallbackChain {
                     }
                     Err(err) => {
                         failures.push(format!("{}: {}", provider.name(), err));
+                        if first_budget_error.is_none() {
+                            if let Some(scope) = err.budget_scope() {
+                                first_budget_error = Some((scope, err.message().to_string()));
+                            }
+                        }
                         if !err.is_transient() {
                             break; // Permanent: next provider, no retry.
                         }
@@ -343,7 +486,20 @@ impl FallbackChain {
                             budget_exhausted = true;
                             break 'providers;
                         }
-                        tokio::time::sleep(delay).await;
+                        // Backoff sleeps are cancellable (§10): race
+                        // the sleep against the context's cancel
+                        // tokens instead of sleeping blindly.
+                        // Legacy callers attach no tokens, so the
+                        // cancel branch is disabled for them.
+                        let cancelled = WaitAnyCancelled::new(ctx.cancel_tokens);
+                        tokio::select! {
+                            _ = tokio::time::sleep(delay) => {}
+                            _ = cancelled, if !ctx.cancel_tokens.is_empty() => {
+                                return Err(MimintError::Cancelled(
+                                    "cancelled during retry backoff".to_string(),
+                                ));
+                            }
+                        }
                     }
                 }
             }
@@ -358,13 +514,17 @@ impl FallbackChain {
             if let (Some(profile), Value::Object(map)) = (ctx.profile, &mut detail) {
                 map.insert("profile".to_string(), Value::String(profile.to_string()));
             }
-            audit.log(
+            audit.log_for(
+                ctx.agent_id,
                 ctx.turn_id,
                 "provider_failure",
                 None,
                 Some("all_failed"),
                 detail,
             )?;
+        }
+        if let Some((scope, message)) = first_budget_error {
+            return Err(MimintError::BudgetExhausted(scope, message));
         }
         Err(MimintError::Provider(format!(
             "all {} provider(s) failed{}: {}",
@@ -376,6 +536,40 @@ impl FallbackChain {
             },
             failures.join("; ")
         )))
+    }
+}
+
+/// Settle one attempt's reservation per the §3.3 matrix.
+/// Returns the settle outcome for the audit record, or `None`
+/// when no ledger was attached. A settle failure here is
+/// unreachable (each reservation settles exactly once, by
+/// construction of the attempt loop), so a failed settle yields
+/// no outcome rather than discarding the attempt's result.
+fn settle_attempt(
+    result: Result<&ChatMessage, &MimintError>,
+    reservation: Option<PendingReservation>,
+) -> Option<SettleOutcome> {
+    let reservation = reservation?;
+    match result {
+        Ok(message) => {
+            let outcome = match message.usage {
+                Some(usage) => reservation.settle_measured(usage),
+                None => reservation.settle_unmeasured(),
+            };
+            outcome.ok()
+        }
+        Err(err) => {
+            if err.is_cancelled() || err.is_no_response() {
+                reservation
+                    .settle_unknown(err.is_provider_disconnect(), None)
+                    .ok()
+            } else {
+                // The request was provably rejected (HTTP status
+                // error) or never sent (config/egress error):
+                // release with no charge.
+                reservation.release_settled().ok()
+            }
+        }
     }
 }
 
