@@ -28,11 +28,15 @@
 //! check reads the server's input focus directly.
 
 use crate::action::{Key, MAX_HOLD_MILLIS};
-use crate::body::{Body, Framebuffer, FramebufferPool, PermissionState, Permissions, ScreenRect};
+use crate::body::{
+    luminance_of, snapshot_crop_origin, snapshot_grid, Body, Framebuffer, FramebufferPool,
+    PermissionState, Permissions, ScreenRect, TargetSnapshot, WindowIdentity,
+};
 use crate::error::BodyError;
-use crate::forbidden::check_forbidden_window;
+use crate::forbidden::{check_forbidden_signals, WindowSignals};
 use std::collections::HashMap;
-use std::time::Duration;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 use x11rb::connection::Connection;
 use x11rb::cookie::{Cookie, VoidCookie};
 use x11rb::errors::ConnectionError;
@@ -85,6 +89,39 @@ fn keysym_for_char(ch: char) -> u32 {
     } else {
         0x0100_0000 | cp
     }
+}
+
+/// The executable basename of a process, from `/proc/<pid>/exe`
+/// (the canonical path, symlinks resolved by the kernel), falling
+/// back to the basename of argv[0] from `/proc/<pid>/cmdline`
+/// when the exe link is unreadable. Returns the BASENAME only —
+/// never a full path, never a command line. `None` when the
+/// process is gone or neither source is readable.
+fn exe_basename_for_pid(pid: u32) -> Option<String> {
+    if let Ok(target) = std::fs::read_link(format!("/proc/{pid}/exe")) {
+        if let Some(name) = target.file_name().and_then(|n| n.to_str()) {
+            if !name.is_empty() {
+                return Some(name.to_string());
+            }
+        }
+    }
+    // Fallback: argv[0] from cmdline (NUL-separated). Only the
+    // first argument's basename is ever read.
+    if let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline")) {
+        if let Some(first) = cmdline.split(|b| *b == 0).next() {
+            if let Ok(arg) = std::str::from_utf8(first) {
+                if let Some(name) = std::path::Path::new(arg)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                {
+                    if !name.is_empty() {
+                        return Some(name.to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Await a void request (no reply), mapping both error layers.
@@ -188,6 +225,12 @@ pub struct X11Body {
     remapped_originals: Vec<(u8, Vec<u32>)>,
     /// Reusable screenshot buffers (P4.6.2).
     pool: FramebufferPool,
+    /// Cached ids of this process's own windows (F4-04): the
+    /// XID registry, refreshed at most once per second. The
+    /// cache lives behind a mutex because `check_target` takes
+    /// `&self`. A poisoned lock fails open to an empty list
+    /// (the rect-based exclusion is the primary gate).
+    own_windows: Mutex<(Instant, Vec<u32>)>,
 }
 
 impl Drop for X11Body {
@@ -243,6 +286,7 @@ impl X11Body {
             unicode_keycodes: HashMap::new(),
             remapped_originals: Vec::new(),
             pool: FramebufferPool::new(),
+            own_windows: Mutex::new((Instant::now() - Duration::from_secs(2), Vec::new())),
         })
     }
 
@@ -350,38 +394,34 @@ impl X11Body {
         String::from_utf8(reply.value).ok()
     }
 
-    /// The active window's (class, title), from the window
-    /// manager's `_NET_ACTIVE_WINDOW` property on the root window.
-    /// `None` fields mean undeterminable (no WM, no active window,
-    /// unreadable property). WM_CLASS holds "instance\0class\0";
-    /// the class segment is the second one.
-    fn active_window_info(&self) -> (Option<String>, Option<String>) {
-        let active_atom = match self.intern(b"_NET_ACTIVE_WINDOW") {
-            Some(atom) => atom,
-            None => return (None, None),
-        };
-        let reply = match get_property(
+    /// Read a CARDINAL property of a window (one 32-bit value);
+    /// `None` on any failure.
+    fn cardinal_property(&self, window: Window, name: &[u8]) -> Option<u32> {
+        let property = self.intern(name)?;
+        let reply = get_property(
             &self.conn,
             false,
-            self.root,
-            active_atom,
-            AtomEnum::WINDOW,
+            window,
+            property,
+            AtomEnum::CARDINAL,
             0,
             1,
         )
-        .ok()
-        .and_then(|cookie| cookie.reply().ok())
-        {
-            Some(reply) => reply,
-            None => return (None, None),
-        };
+        .ok()?
+        .reply()
+        .ok()?;
         if reply.format != 32 || reply.value.len() < 4 {
-            return (None, None);
+            return None;
         }
-        let window = u32::from_ne_bytes(reply.value[0..4].try_into().unwrap());
-        if window == 0 {
-            return (None, None);
-        }
+        Some(u32::from_ne_bytes(reply.value[0..4].try_into().unwrap()))
+    }
+
+    /// The identity of one window: class, title, and the
+    /// executable basename of the owning process (via
+    /// `_NET_WM_PID` → `/proc`). Every field is `None` when
+    /// undeterminable. WM_CLASS holds "instance\0class\0";
+    /// the class segment is the second one.
+    fn window_identity(&self, window: Window) -> WindowIdentity {
         let class_raw = self.string_property(window, b"WM_CLASS", AtomEnum::STRING.into());
         let class = class_raw.and_then(|raw| {
             let parts: Vec<&str> = raw.split('\0').filter(|s| !s.is_empty()).collect();
@@ -394,32 +434,258 @@ impl X11Body {
         });
         let utf8 = self.intern(b"UTF8_STRING");
         let title = utf8.and_then(|atom| self.string_property(window, b"_NET_WM_NAME", atom));
-        (class, title)
+        let exe_basename = self
+            .cardinal_property(window, b"_NET_WM_PID")
+            .and_then(exe_basename_for_pid);
+        WindowIdentity {
+            window_id: Some(u64::from(window)),
+            class,
+            title,
+            exe_basename,
+        }
+    }
+
+    /// The active window's id, from the window manager's
+    /// `_NET_ACTIVE_WINDOW` property on the root window.
+    fn active_window_id(&self) -> Option<u32> {
+        let active_atom = self.intern(b"_NET_ACTIVE_WINDOW")?;
+        let reply = get_property(
+            &self.conn,
+            false,
+            self.root,
+            active_atom,
+            AtomEnum::WINDOW,
+            0,
+            1,
+        )
+        .ok()?
+        .reply()
+        .ok()?;
+        if reply.format != 32 || reply.value.len() < 4 {
+            return None;
+        }
+        let window = u32::from_ne_bytes(reply.value[0..4].try_into().unwrap());
+        if window == 0 {
+            None
+        } else {
+            Some(window)
+        }
     }
 
     /// Refuse input when the active window is on the forbidden
-    /// list (P4.6.1). Undeterminable active window allows.
+    /// list (P4.6.1), on ANY signal (class, title, executable
+    /// basename). Undeterminable active window allows.
     fn check_forbidden(&self) -> Result<(), BodyError> {
-        let (class, title) = self.active_window_info();
-        check_forbidden_window(class.as_deref(), title.as_deref())
+        if let Some(window) = self.active_window_id() {
+            let identity = self.window_identity(window);
+            check_forbidden_signals(
+                &WindowSignals {
+                    class: identity.class.as_deref(),
+                    title: identity.title.as_deref(),
+                    exe_basename: identity.exe_basename.as_deref(),
+                },
+                "active",
+            )?;
+        }
+        Ok(())
     }
 
-    fn fake_key(&self, keycode: u8, press: bool) -> Result<(), BodyError> {
+    /// Refuse input when the window UNDER THE TARGET POINT is
+    /// on the forbidden list (F4-03): the unfocused-click
+    /// attack. Undeterminable (no window at the point, or the
+    /// tree walk fails) allows.
+    fn check_forbidden_at(&self, x: i32, y: i32) -> Result<(), BodyError> {
+        if let Some(identity) = self.window_at_inner(x, y) {
+            check_forbidden_signals(
+                &WindowSignals {
+                    class: identity.class.as_deref(),
+                    title: identity.title.as_deref(),
+                    exe_basename: identity.exe_basename.as_deref(),
+                },
+                "target",
+            )?;
+        }
+        Ok(())
+    }
+
+    /// The deepest mapped window containing the point, by
+    /// descending the window tree from the root in reverse
+    /// stacking order (topmost first). Under a reparenting
+    /// window manager the direct child of the root is the
+    /// frame; descending finds the client window inside it.
+    /// `None` when the point is on the bare root, or when any
+    /// query fails (undeterminable). Depth-capped: a
+    /// pathological tree cannot loop this walk forever.
+    fn window_at_point(&self, x: i32, y: i32) -> Option<u32> {
+        let mut current = self.root;
+        for _ in 0..16 {
+            let tree = query_tree(&self.conn, current).ok()?.reply().ok()?;
+            let mut found = None;
+            // Children arrive bottom-to-top; reverse to visit
+            // the topmost first.
+            for child in tree.children.iter().rev() {
+                let attrs = match get_window_attributes(&self.conn, *child) {
+                    Ok(cookie) => match cookie.reply() {
+                        Ok(attrs) => attrs,
+                        Err(_) => continue,
+                    },
+                    Err(_) => continue,
+                };
+                if attrs.map_state != MapState::VIEWABLE {
+                    continue;
+                }
+                let geom = match get_geometry(&self.conn, *child) {
+                    Ok(cookie) => match cookie.reply() {
+                        Ok(geom) => geom,
+                        Err(_) => continue,
+                    },
+                    Err(_) => continue,
+                };
+                let pos = translate_coordinates(&self.conn, *child, self.root, 0, 0)
+                    .ok()?
+                    .reply()
+                    .ok()?;
+                let (left, top) = (i32::from(pos.dst_x), i32::from(pos.dst_y));
+                let (w, h) = (i32::from(geom.width), i32::from(geom.height));
+                if x >= left && x < left + w && y >= top && y < top + h {
+                    found = Some(*child);
+                    break;
+                }
+            }
+            match found {
+                Some(child) => current = child,
+                None => break,
+            }
+        }
+        if current == self.root {
+            None
+        } else {
+            Some(current)
+        }
+    }
+
+    /// The identity of the window under the point, walking UP
+    /// from the deepest window to the first ancestor that
+    /// carries a class or a PID (a clicked child widget has
+    /// neither; its toplevel does). `None` when no window, or
+    /// no identity, is found.
+    fn window_at_inner(&self, x: i32, y: i32) -> Option<WindowIdentity> {
+        let mut window = self.window_at_point(x, y)?;
+        for _ in 0..8 {
+            let identity = self.window_identity(window);
+            if identity.class.is_some() || identity.exe_basename.is_some() {
+                return Some(identity);
+            }
+            let tree = query_tree(&self.conn, window).ok()?.reply().ok()?;
+            if tree.parent == window || tree.parent == self.root {
+                return None;
+            }
+            window = tree.parent;
+        }
+        None
+    }
+
+    /// Ids of this process's own windows (F4-04): every
+    /// client-listed window whose `_NET_WM_PID` is our pid.
+    /// Refreshed at most once per second; a failed scan fails
+    /// open to the previous list (the rect-based exclusion is
+    /// the primary gate — this registry is a second signal).
+    /// A window that LIES about its PID (claiming ours) is
+    /// treated as ours and refused input: fail-closed, a DoS
+    /// against the liar at worst.
+    fn own_window_ids(&self) -> Vec<u32> {
+        let now = Instant::now();
+        {
+            let cache = self.own_windows.lock().unwrap_or_else(|p| p.into_inner());
+            if now.duration_since(cache.0) < Duration::from_secs(1) {
+                return cache.1.clone();
+            }
+        }
+        let scanned = self.scan_own_window_ids().unwrap_or_default();
+        if let Ok(mut cache) = self.own_windows.lock() {
+            *cache = (now, scanned.clone());
+        }
+        scanned
+    }
+
+    fn scan_own_window_ids(&self) -> Option<Vec<u32>> {
+        let list_atom = self.intern(b"_NET_CLIENT_LIST")?;
+        let reply = get_property(
+            &self.conn,
+            false,
+            self.root,
+            list_atom,
+            AtomEnum::WINDOW,
+            0,
+            u32::MAX,
+        )
+        .ok()?
+        .reply()
+        .ok()?;
+        if reply.format != 32 {
+            return None;
+        }
+        let own_pid = std::process::id();
+        let mut ids = Vec::new();
+        for chunk in reply.value.as_chunks::<4>().0 {
+            let window = u32::from_ne_bytes(*chunk);
+            if window == 0 || window == self.root {
+                continue;
+            }
+            if self.cardinal_property(window, b"_NET_WM_PID") == Some(own_pid) {
+                ids.push(window);
+            }
+        }
+        Some(ids)
+    }
+
+    /// Refuse a point that lands on one of this process's own
+    /// windows (F4-04, XID registry). Undeterminable (no
+    /// window at the point, scan failed) allows — the rect
+    /// gate above this one is the primary defense.
+    fn check_own_window(&self, x: i32, y: i32) -> Result<(), BodyError> {
+        if let Some(window) = self.window_at_point(x, y) {
+            if self.own_window_ids().contains(&window) {
+                return Err(BodyError::ForbiddenTarget {
+                    x,
+                    y,
+                    reason: format!(
+                        "point lies inside Mimint's own window (XID {window}); \
+                         input to the assistant's own window is refused"
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// A round-trip barrier (F4-13): x11rb exposes no direct
+    /// XSync, so a reply-bearing request is the sync
+    /// primitive — when its reply arrives, the server has
+    /// processed every request sent before it. Used between
+    /// drag phases so the button-down is known-delivered
+    /// before the motion path starts.
+    fn sync_barrier(&self) -> Result<(), BodyError> {
+        let _ = reply_cookie("drag sync barrier", get_input_focus(&self.conn))?;
+        Ok(())
+    }
+
+    fn fake_key(&self, keycode: u8, press: bool, delay: u32) -> Result<(), BodyError> {
         let event = if press { KEY_PRESS } else { KEY_RELEASE };
         void_cookie(
             "XTest key event failed",
-            fake_input(&self.conn, event, keycode, 0, 0, 0, 0, 0),
+            fake_input(&self.conn, event, keycode, delay, 0, 0, 0, 0),
         )
     }
 
-    fn fake_motion(&self, x: i32, y: i32) -> Result<(), BodyError> {
+    fn fake_motion(&self, x: i32, y: i32, delay: u32) -> Result<(), BodyError> {
         void_cookie(
             "XTest motion failed",
             fake_input(
                 &self.conn,
                 MOTION_NOTIFY,
                 0,
-                0,
+                delay,
                 self.root,
                 x as i16,
                 y as i16,
@@ -428,24 +694,31 @@ impl X11Body {
         )
     }
 
-    fn fake_button(&self, detail: u8, press: bool, x: i32, y: i32) -> Result<(), BodyError> {
+    fn fake_button(
+        &self,
+        detail: u8,
+        press: bool,
+        x: i32,
+        y: i32,
+        delay: u32,
+    ) -> Result<(), BodyError> {
         let event = if press { BUTTON_PRESS } else { BUTTON_RELEASE };
         void_cookie(
             "XTest button event failed",
             fake_input(
-                &self.conn, event, detail, 0, self.root, x as i16, y as i16, 0,
+                &self.conn, event, detail, delay, self.root, x as i16, y as i16, 0,
             ),
         )
     }
 
     fn press_keycode(&self, keycode: u8, shift: bool) -> Result<(), BodyError> {
         if shift {
-            self.fake_key(self.shift_keycode, true)?;
+            self.fake_key(self.shift_keycode, true, 0)?;
         }
-        self.fake_key(keycode, true)?;
-        self.fake_key(keycode, false)?;
+        self.fake_key(keycode, true, 0)?;
+        self.fake_key(keycode, false, 0)?;
         if shift {
-            self.fake_key(self.shift_keycode, false)?;
+            self.fake_key(self.shift_keycode, false, 0)?;
         }
         self.flush()
     }
@@ -531,6 +804,7 @@ impl Body for X11Body {
         self.check_bounds(x, y)?;
         self.check_target(x, y)?;
         self.check_forbidden()?;
+        self.check_forbidden_at(x, y)?;
         self.verify_focus()?;
         let (x16, y16) = (x as i16, y as i16);
         void_cookie(
@@ -541,11 +815,12 @@ impl Body for X11Body {
             "XTest button press failed",
             fake_input(&self.conn, BUTTON_PRESS, 1, 0, self.root, x16, y16, 0),
         )?;
-        self.flush()?;
-        std::thread::sleep(Duration::from_millis(5));
+        // Server-side 5ms press hold (F4-13): the XTest `delay`
+        // is enforced by the server, so the hold survives client
+        // scheduling load that would stretch a client sleep.
         void_cookie(
             "XTest button release failed",
-            fake_input(&self.conn, BUTTON_RELEASE, 1, 0, self.root, x16, y16, 0),
+            fake_input(&self.conn, BUTTON_RELEASE, 1, 5, self.root, x16, y16, 0),
         )?;
         self.flush()
     }
@@ -554,6 +829,7 @@ impl Body for X11Body {
         self.check_bounds(x, y)?;
         self.check_target(x, y)?;
         self.check_forbidden()?;
+        self.check_forbidden_at(x, y)?;
         void_cookie(
             "XTest motion failed",
             fake_input(
@@ -615,15 +891,16 @@ impl Body for X11Body {
         self.check_bounds(x, y)?;
         self.check_target(x, y)?;
         self.check_forbidden()?;
+        self.check_forbidden_at(x, y)?;
         self.verify_focus()?;
         // X11 wheel: button 4 = up, 5 = down, 6 = left, 7 = right.
         // One press+release per notch, at the aim point.
-        self.fake_motion(x, y)?;
+        self.fake_motion(x, y, 0)?;
         self.flush()?;
         let wheel = |detail: u8, count: u32| -> Result<(), BodyError> {
             for _ in 0..count {
-                self.fake_button(detail, true, x, y)?;
-                self.fake_button(detail, false, x, y)?;
+                self.fake_button(detail, true, x, y, 0)?;
+                self.fake_button(detail, false, x, y, 0)?;
             }
             Ok(())
         };
@@ -646,20 +923,43 @@ impl Body for X11Body {
         self.check_target(from_x, from_y)?;
         self.check_target(to_x, to_y)?;
         self.check_forbidden()?;
+        self.check_forbidden_at(from_x, from_y)?;
+        self.check_forbidden_at(to_x, to_y)?;
         self.verify_focus()?;
-        self.fake_motion(from_x, from_y)?;
-        self.fake_button(1, true, from_x, from_y)?;
+        self.fake_motion(from_x, from_y, 0)?;
+        self.fake_button(1, true, from_x, from_y, 0)?;
         self.flush()?;
+        // Round-trip barrier: the button-down is known-delivered
+        // before the motion path starts (F4-13).
+        self.sync_barrier()?;
+        // Priming motion (F4-13): move past the drag threshold
+        // (~8px) along the drag vector before the interpolated
+        // path, so targets that only start a drag after a
+        // threshold motion see a real drag, not a click. The
+        // prime is capped at half the drag length, so short
+        // drags do not overshoot their endpoint.
+        let dx = to_x - from_x;
+        let dy = to_y - from_y;
+        let len = ((dx * dx + dy * dy) as f64).sqrt();
+        let (start_x, start_y) = if len > 0.0 {
+            let prime = if len >= 16.0 { 8.0 } else { len / 2.0 };
+            let px = from_x + (dx as f64 * prime / len).round() as i32;
+            let py = from_y + (dy as f64 * prime / len).round() as i32;
+            self.fake_motion(px, py, 0)?;
+            (px, py)
+        } else {
+            (from_x, from_y)
+        };
         // Interpolate so the target observes motion with the button
         // held (a teleport press/release at two points is not a
         // drag to most targets).
         const STEPS: i32 = 10;
         for step in 1..=STEPS {
-            let x = from_x + (to_x - from_x) * step / STEPS;
-            let y = from_y + (to_y - from_y) * step / STEPS;
-            self.fake_motion(x, y)?;
+            let x = start_x + (to_x - start_x) * step / STEPS;
+            let y = start_y + (to_y - start_y) * step / STEPS;
+            self.fake_motion(x, y, 0)?;
         }
-        self.fake_button(1, false, to_x, to_y)?;
+        self.fake_button(1, false, to_x, to_y, 0)?;
         self.flush()
     }
 
@@ -667,29 +967,30 @@ impl Body for X11Body {
         self.check_bounds(x, y)?;
         self.check_target(x, y)?;
         self.check_forbidden()?;
+        self.check_forbidden_at(x, y)?;
         self.verify_focus()?;
-        self.fake_motion(x, y)?;
-        for _ in 0..2 {
-            self.fake_button(1, true, x, y)?;
-            self.flush()?;
-            std::thread::sleep(Duration::from_millis(5));
-            self.fake_button(1, false, x, y)?;
-            self.flush()?;
-            std::thread::sleep(Duration::from_millis(30));
-        }
-        Ok(())
+        self.fake_motion(x, y, 0)?;
+        // Server-side inter-click timing (F4-13): the XTest
+        // `delay` of each event is enforced by the server in
+        // request order (press, release +5ms, press +30ms,
+        // release +5ms), so the ~35ms inter-press gap survives
+        // client scheduling load. No client sleeps, one flush.
+        self.fake_button(1, true, x, y, 0)?;
+        self.fake_button(1, false, x, y, 5)?;
+        self.fake_button(1, true, x, y, 30)?;
+        self.fake_button(1, false, x, y, 5)?;
+        self.flush()
     }
 
     fn right_click(&mut self, x: i32, y: i32) -> Result<(), BodyError> {
         self.check_bounds(x, y)?;
         self.check_target(x, y)?;
         self.check_forbidden()?;
+        self.check_forbidden_at(x, y)?;
         self.verify_focus()?;
-        self.fake_motion(x, y)?;
-        self.fake_button(3, true, x, y)?;
-        self.flush()?;
-        std::thread::sleep(Duration::from_millis(5));
-        self.fake_button(3, false, x, y)?;
+        self.fake_motion(x, y, 0)?;
+        self.fake_button(3, true, x, y, 0)?;
+        self.fake_button(3, false, x, y, 5)?;
         self.flush()
     }
 
@@ -708,14 +1009,14 @@ impl Body for X11Body {
             ))
         })?;
         if shift {
-            self.fake_key(self.shift_keycode, true)?;
+            self.fake_key(self.shift_keycode, true, 0)?;
         }
-        self.fake_key(keycode, true)?;
+        self.fake_key(keycode, true, 0)?;
         self.flush()?;
         std::thread::sleep(Duration::from_millis(u64::from(millis)));
-        self.fake_key(keycode, false)?;
+        self.fake_key(keycode, false, 0)?;
         if shift {
-            self.fake_key(self.shift_keycode, false)?;
+            self.fake_key(self.shift_keycode, false, 0)?;
         }
         self.flush()
     }
@@ -748,6 +1049,73 @@ impl Body for X11Body {
             .map(|reply| reply.focus as u64)
     }
 
+    fn window_at(&mut self, x: i32, y: i32) -> Option<WindowIdentity> {
+        self.window_at_inner(x, y)
+    }
+
+    fn snapshot_target(&mut self, x: i32, y: i32) -> Option<TargetSnapshot> {
+        let (width, height) = self.current_size().ok()?;
+        if x < 0 || y < 0 || x as u32 >= width || y as u32 >= height {
+            return None;
+        }
+        let window_id = self.window_at_point(x, y).map(u64::from);
+        let (ox, oy, cw, ch) = snapshot_crop_origin(x, y, width, height);
+        let reply = get_image(
+            &self.conn,
+            ImageFormat::Z_PIXMAP,
+            self.root,
+            ox as i16,
+            oy as i16,
+            cw as u16,
+            ch as u16,
+            u32::MAX,
+        )
+        .ok()?
+        .reply()
+        .ok()?;
+        if reply.depth != 24 && reply.depth != 32 {
+            return None;
+        }
+        let expected = cw as usize * ch as usize * 4;
+        if reply.data.len() < expected {
+            return None;
+        }
+        // Depth-24/32 ZPixmap on LSBFirst: 4 bytes/px, B,G,R,X.
+        // Only the luminance grid is retained; the crop bytes
+        // are dropped with the reply.
+        let data = &reply.data;
+        let grid = snapshot_grid(
+            |px, py| {
+                let idx = ((py - oy) as usize * cw as usize + (px - ox) as usize) * 4;
+                luminance_of(data[idx + 2], data[idx + 1], data[idx])
+            },
+            ox,
+            oy,
+            cw,
+            ch,
+        );
+        Some(TargetSnapshot { window_id, grid })
+    }
+
+    fn check_target(&self, x: i32, y: i32) -> Result<(), BodyError> {
+        // Owned rects: the same rule as the trait default.
+        for rect in &self.excluded {
+            if rect.contains(x, y) {
+                return Err(BodyError::ForbiddenTarget {
+                    x,
+                    y,
+                    reason: format!(
+                        "point lies inside excluded rectangle ({}, {}) {}x{}",
+                        rect.x, rect.y, rect.width, rect.height
+                    ),
+                });
+            }
+        }
+        // Plus the XID registry (F4-04): the assistant's own
+        // windows, identified by PID, not by name or rect.
+        self.check_own_window(x, y)
+    }
+
     fn expected_focus(&self) -> Option<u64> {
         self.expected_focus
     }
@@ -766,5 +1134,28 @@ impl Body for X11Body {
 
     fn framebuffer_pool(&self) -> Option<&FramebufferPool> {
         Some(&self.pool)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exe_basename_for_own_pid_is_the_test_binary_name() {
+        let pid = std::process::id();
+        let name = exe_basename_for_pid(pid).expect("own pid resolves");
+        // A basename: no separators, non-empty, and it matches
+        // the current executable's file name.
+        assert!(!name.contains('/'));
+        assert!(!name.is_empty());
+        let current = std::env::current_exe().unwrap();
+        assert_eq!(name, current.file_name().unwrap().to_str().unwrap());
+    }
+
+    #[test]
+    fn exe_basename_for_a_dead_pid_is_none() {
+        // A pid that cannot exist (far beyond any real pid).
+        assert!(exe_basename_for_pid(u32::MAX - 1).is_none());
     }
 }

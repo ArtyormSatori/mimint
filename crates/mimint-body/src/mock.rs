@@ -15,11 +15,15 @@
 //! exactly the Retina bug the contract exists to prevent.
 
 use crate::action::{Key, MAX_HOLD_MILLIS};
-use crate::body::{Body, Framebuffer, FramebufferPool, PermissionState, Permissions, ScreenRect};
+use crate::body::{
+    luminance_of, snapshot_crop_origin, snapshot_grid, Body, Framebuffer, FramebufferPool,
+    PermissionState, Permissions, ScreenRect, TargetSnapshot, WindowIdentity,
+};
 use crate::conformance::TargetOracle;
 use crate::error::BodyError;
-use crate::forbidden::check_forbidden_window;
+use crate::forbidden::{check_forbidden_signals, check_forbidden_window, WindowSignals};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 /// Events a target window would observe, in order.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,6 +75,86 @@ pub enum Fault {
     FrozenFramebuffer,
     /// Typed text and keys are silently dropped.
     DropInput,
+    /// The body disconnects mid-action: the event is recorded
+    /// (the action partially landed) and the call returns
+    /// [`BodyError::UnknownOutcome`]. The caller must not retry.
+    DisconnectMidAction,
+    /// The body never answers (blocks past any actor timeout).
+    /// The actor reports `UnknownOutcome` and marks itself
+    /// broken; the stuck thread is detached, never killed.
+    Hang,
+}
+
+/// One scripted window on the mock display (F4-03/F4-07).
+/// Windows are stored in stacking order: the LAST window in
+/// the list is topmost. A window's `fill` color is what its
+/// pixels look like, so snapshot tests can distinguish two
+/// windows (or a moved window) by content as well as by id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MockWindow {
+    pub id: u64,
+    pub rect: ScreenRect,
+    pub class: Option<String>,
+    pub title: Option<String>,
+    pub exe_basename: Option<String>,
+    pub fill: (u8, u8, u8),
+}
+
+impl MockWindow {
+    pub fn new(id: u64, rect: ScreenRect) -> Self {
+        Self {
+            id,
+            rect,
+            class: None,
+            title: None,
+            exe_basename: None,
+            fill: (128, 128, 128),
+        }
+    }
+
+    pub fn with_class(mut self, class: &str) -> Self {
+        self.class = Some(class.to_string());
+        self
+    }
+
+    pub fn with_title(mut self, title: &str) -> Self {
+        self.title = Some(title.to_string());
+        self
+    }
+
+    pub fn with_exe(mut self, exe_basename: &str) -> Self {
+        self.exe_basename = Some(exe_basename.to_string());
+        self
+    }
+
+    pub fn with_fill(mut self, fill: (u8, u8, u8)) -> Self {
+        self.fill = fill;
+        self
+    }
+}
+
+/// Deterministic latency state (F4-13): a seeded LCG draws a
+/// delay per input action, so load simulations are repeatable.
+/// The draws are recorded for the bench to report.
+#[derive(Debug)]
+struct LatencyState {
+    rng: u64,
+    min_ms: u64,
+    max_ms: u64,
+    draws: Vec<u64>,
+}
+
+impl LatencyState {
+    fn draw(&mut self) -> u64 {
+        // LCG (Numerical Recipes constants); the high bits are
+        // the random ones.
+        self.rng = self
+            .rng
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let span = self.max_ms.saturating_sub(self.min_ms) + 1;
+        self.min_ms + (self.rng >> 33) % span
+    }
 }
 
 /// Lock the shared mock state, recovering from poisoning (a test that
@@ -98,6 +182,13 @@ struct MockState {
     /// Fake active-window identity for the forbidden-window policy
     /// (P4.6.1): (class, title). `None` means undeterminable.
     active_window: Option<(Option<String>, Option<String>)>,
+    /// Scripted windows for the point-target check and the
+    /// re-verify snapshot (F4-03/F4-07). Empty by default:
+    /// `window_at` then returns `None` (undeterminable) and the
+    /// point check passes, exactly as before.
+    windows: Vec<MockWindow>,
+    /// Deterministic latency mode (F4-13). `None` by default.
+    latency: Option<LatencyState>,
 }
 
 /// Deterministic in-memory body. Default display is 800x600 at scale
@@ -136,6 +227,8 @@ impl MockBody {
                 expected_focus: None,
                 max_capture_dimension: None,
                 active_window: None,
+                windows: Vec::new(),
+                latency: None,
             })),
             pool: FramebufferPool::new(),
         }
@@ -180,6 +273,35 @@ impl MockBody {
             Some((class.map(str::to_string), title.map(str::to_string)));
     }
 
+    /// Script the windows on the mock display, in stacking
+    /// order (last = topmost). Drives `window_at`,
+    /// `snapshot_target`, the point-target forbidden check,
+    /// and the pixels screenshots show inside each window.
+    pub fn set_windows(&self, windows: Vec<MockWindow>) {
+        lock_state(&self.state).windows = windows;
+    }
+
+    /// Enable deterministic latency: every input action sleeps
+    /// a seeded-LCG delay in `[min_ms, max_ms]`. The same seed
+    /// always draws the same delays (see [`MockBody::latency_draws`]).
+    pub fn set_latency(&self, seed: u64, min_ms: u64, max_ms: u64) {
+        lock_state(&self.state).latency = Some(LatencyState {
+            rng: seed,
+            min_ms,
+            max_ms,
+            draws: Vec::new(),
+        });
+    }
+
+    /// The latency delays drawn so far, in order.
+    pub fn latency_draws(&self) -> Vec<u64> {
+        lock_state(&self.state)
+            .latency
+            .as_ref()
+            .map(|lat| lat.draws.clone())
+            .unwrap_or_default()
+    }
+
     /// The oracle sharing this body's state.
     pub fn oracle(&self) -> MockOracle {
         MockOracle {
@@ -202,42 +324,112 @@ impl MockBody {
     /// rectangle whose color depends on the content variant. Two
     /// variants always differ in the rectangle's pixels. Variant 3
     /// is the pixel-pattern oracle pattern: four quadrants (red /
-    /// green / blue / yellow), matching the test targets.
+    /// green / blue / yellow), matching the test targets. The
+    /// pattern variant ignores scripted windows (the C9 contract);
+    /// other variants paint each scripted window's `fill` color
+    /// inside its rect (topmost wins).
     ///
     /// Fills `data` (which must already be exactly
     /// `width * height * 4` bytes, e.g. from the framebuffer pool)
     /// instead of allocating: the mock captures through the same
     /// pool discipline as the real bodies.
-    fn fill_pixels(data: &mut [u8], width: u32, height: u32, variant: u8) {
+    fn fill_pixels(data: &mut [u8], width: u32, height: u32, variant: u8, windows: &[MockWindow]) {
+        for y in 0..height {
+            for x in 0..width {
+                let (r, g, b) = Self::pixel_color(x, y, width, height, variant, windows);
+                let idx = (y as usize * width as usize + x as usize) * 4;
+                data[idx..idx + 4].copy_from_slice(&[r, g, b, 255]);
+            }
+        }
+    }
+
+    /// One pixel of the deterministic frame, for screenshots and
+    /// for the re-verify snapshot grid (same function, so the
+    /// snapshot always agrees with what a screenshot would show).
+    fn pixel_color(
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+        variant: u8,
+        windows: &[MockWindow],
+    ) -> (u8, u8, u8) {
+        if variant == crate::conformance::PATTERN_VARIANT {
+            // Quadrants: top-left red, top-right green,
+            // bottom-left blue, bottom-right yellow.
+            return match (x < width / 2, y < height / 2) {
+                (true, true) => (255u8, 0u8, 0u8),
+                (false, true) => (0u8, 255u8, 0u8),
+                (true, false) => (0u8, 0u8, 255u8),
+                (false, false) => (255u8, 255u8, 0u8),
+            };
+        }
+        if let Some(win) = windows
+            .iter()
+            .rev()
+            .find(|w| w.rect.contains(x as i32, y as i32))
+        {
+            return win.fill;
+        }
         // Rectangle color per variant: distinct, far apart.
         let rect = match variant % 3 {
             0 => (200u8, 40u8, 40u8),
             1 => (40u8, 200u8, 40u8),
             _ => (40u8, 40u8, 200u8),
         };
-        for y in 0..height {
-            for x in 0..width {
-                let (r, g, b) = if variant == crate::conformance::PATTERN_VARIANT {
-                    // Quadrants: top-left red, top-right green,
-                    // bottom-left blue, bottom-right yellow.
-                    match (x < width / 2, y < height / 2) {
-                        (true, true) => (255u8, 0u8, 0u8),
-                        (false, true) => (0u8, 255u8, 0u8),
-                        (true, false) => (0u8, 0u8, 255u8),
-                        (false, false) => (255u8, 255u8, 0u8),
-                    }
-                } else {
-                    let in_rect = (100..300).contains(&x) && (100..250).contains(&y);
-                    if in_rect {
-                        rect
-                    } else {
-                        // Gentle gradient so the frame is never uniform.
-                        ((x % 251) as u8, (y % 251) as u8, ((x + y) % 251) as u8)
-                    }
-                };
-                let idx = (y as usize * width as usize + x as usize) * 4;
-                data[idx..idx + 4].copy_from_slice(&[r, g, b, 255]);
+        let in_rect = (100..300).contains(&x) && (100..250).contains(&y);
+        if in_rect {
+            rect
+        } else {
+            // Gentle gradient so the frame is never uniform.
+            ((x % 251) as u8, (y % 251) as u8, ((x + y) % 251) as u8)
+        }
+    }
+
+    /// Fault gate for input actions, after the policy checks.
+    /// `partial` is the event the action would have recorded:
+    /// - `DropInput`: succeed without recording anything.
+    /// - `DisconnectMidAction`: record `partial` (the action
+    ///   partially landed) and return `UnknownOutcome`.
+    /// - `Hang`: block past any actor timeout.
+    /// - anything else (including no fault): apply the latency
+    ///   draw, if latency mode is on, and let the caller record
+    ///   the event. Returns `true` when the caller should
+    ///   record the event and succeed.
+    fn fault_gate(&self, partial: Option<MockEvent>) -> Result<bool, BodyError> {
+        let fault = lock_state(&self.state).fault;
+        match fault {
+            Some(Fault::DropInput) => Ok(false),
+            Some(Fault::DisconnectMidAction) => {
+                if let Some(event) = partial {
+                    lock_state(&self.state).events.push(event);
+                }
+                Err(BodyError::UnknownOutcome {
+                    reason: "mock body disconnected mid-action (injected fault)".to_string(),
+                })
             }
+            Some(Fault::Hang) => {
+                // Longer than any actor timeout used in tests;
+                // the actor thread is detached, never joined.
+                std::thread::sleep(Duration::from_secs(30));
+                Ok(true)
+            }
+            _ => {
+                self.apply_latency();
+                Ok(true)
+            }
+        }
+    }
+
+    /// Sleep one deterministic latency draw, when latency mode
+    /// is on. No-op otherwise.
+    fn apply_latency(&self) {
+        let mut state = lock_state(&self.state);
+        if let Some(lat) = state.latency.as_mut() {
+            let ms = lat.draw();
+            lat.draws.push(ms);
+            drop(state);
+            std::thread::sleep(Duration::from_millis(ms));
         }
     }
 
@@ -271,6 +463,24 @@ impl MockBody {
             Some((class, title)) => check_forbidden_window(class.as_deref(), title.as_deref()),
             None => Ok(()),
         }
+    }
+
+    /// Refuse when the window UNDER THE TARGET POINT is
+    /// forbidden (F4-03) — the unfocused-click attack: a
+    /// forbidden window need not be focused to receive a
+    /// click. Undeterminable (no scripted windows) allows.
+    fn check_forbidden_at(&mut self, x: i32, y: i32) -> Result<(), BodyError> {
+        if let Some(identity) = self.window_at(x, y) {
+            check_forbidden_signals(
+                &WindowSignals {
+                    class: identity.class.as_deref(),
+                    title: identity.title.as_deref(),
+                    exe_basename: identity.exe_basename.as_deref(),
+                },
+                "target",
+            )?;
+        }
+        Ok(())
     }
 
     /// Simulate the body's internal coordinate conversion:
@@ -313,7 +523,7 @@ impl Body for MockBody {
                     .to_string(),
             });
         }
-        let (width, height, scale, origin, max_dim, variant) = {
+        let (width, height, scale, origin, max_dim, variant, windows) = {
             let state = lock_state(&self.state);
             let variant = if state.fault == Some(Fault::FrozenFramebuffer) {
                 0
@@ -327,10 +537,11 @@ impl Body for MockBody {
                 state.origin,
                 state.max_capture_dimension,
                 variant,
+                state.windows.clone(),
             )
         };
         let mut buffer = self.pool.acquire(width as usize * height as usize * 4);
-        Self::fill_pixels(&mut buffer, width, height, variant);
+        Self::fill_pixels(&mut buffer, width, height, variant, &windows);
         let frame = Framebuffer::with_geometry(width, height, buffer, scale, origin)?;
         Ok(match max_dim {
             Some(max) => frame.downscale(max),
@@ -343,20 +554,20 @@ impl Body for MockBody {
         self.check_target(x, y)?;
         self.check_input_permission()?;
         self.check_forbidden()?;
+        self.check_forbidden_at(x, y)?;
         self.verify_focus()?;
         let state = lock_state(&self.state);
-        if state.fault == Some(Fault::DropInput) {
-            return Ok(());
-        }
         let (x, y) = match state.fault {
             Some(Fault::ClickOffset { dx, dy }) => (x + dx, y + dy),
             _ => (x, y),
         };
         drop(state);
         let (x, y) = self.round_trip(x, y);
-        lock_state(&self.state)
-            .events
-            .push(MockEvent::Click { x, y });
+        if self.fault_gate(Some(MockEvent::Click { x, y }))? {
+            lock_state(&self.state)
+                .events
+                .push(MockEvent::Click { x, y });
+        }
         Ok(())
     }
 
@@ -365,11 +576,12 @@ impl Body for MockBody {
         self.check_target(x, y)?;
         self.check_input_permission()?;
         self.check_forbidden()?;
-        let mut state = lock_state(&self.state);
-        if state.fault == Some(Fault::DropInput) {
-            return Ok(());
+        self.check_forbidden_at(x, y)?;
+        if self.fault_gate(Some(MockEvent::Move { x, y }))? {
+            lock_state(&self.state)
+                .events
+                .push(MockEvent::Move { x, y });
         }
-        state.events.push(MockEvent::Move { x, y });
         Ok(())
     }
 
@@ -377,12 +589,15 @@ impl Body for MockBody {
         self.check_input_permission()?;
         self.check_forbidden()?;
         self.verify_focus()?;
-        let mut state = lock_state(&self.state);
-        if state.fault == Some(Fault::DropInput) {
-            return Ok(());
-        }
-        for ch in text.chars() {
-            state.events.push(MockEvent::Char(ch));
+        // A half-way disconnect records the first character as
+        // the partial event (something was typed, the rest is
+        // unknown) — never the whole text.
+        let partial = text.chars().next().map(MockEvent::Char);
+        if self.fault_gate(partial)? {
+            let mut state = lock_state(&self.state);
+            for ch in text.chars() {
+                state.events.push(MockEvent::Char(ch));
+            }
         }
         Ok(())
     }
@@ -391,18 +606,17 @@ impl Body for MockBody {
         self.check_input_permission()?;
         self.check_forbidden()?;
         self.verify_focus()?;
-        let mut state = lock_state(&self.state);
-        if state.fault == Some(Fault::DropInput) {
-            return Ok(());
+        if self.fault_gate(Some(MockEvent::Key(key)))? {
+            let mut state = lock_state(&self.state);
+            // Mirror what a real target observes: Enter and Tab arrive
+            // both as a key event and as text ('\n' / '\t').
+            match key {
+                Key::Enter => state.events.push(MockEvent::Char('\n')),
+                Key::Tab => state.events.push(MockEvent::Char('\t')),
+                _ => {}
+            }
+            state.events.push(MockEvent::Key(key));
         }
-        // Mirror what a real target observes: Enter and Tab arrive
-        // both as a key event and as text ('\n' / '\t').
-        match key {
-            Key::Enter => state.events.push(MockEvent::Char('\n')),
-            Key::Tab => state.events.push(MockEvent::Char('\t')),
-            _ => {}
-        }
-        state.events.push(MockEvent::Key(key));
         Ok(())
     }
 
@@ -411,12 +625,13 @@ impl Body for MockBody {
         self.check_target(x, y)?;
         self.check_input_permission()?;
         self.check_forbidden()?;
+        self.check_forbidden_at(x, y)?;
         self.verify_focus()?;
-        let mut state = lock_state(&self.state);
-        if state.fault == Some(Fault::DropInput) {
-            return Ok(());
+        if self.fault_gate(Some(MockEvent::Scroll { x, y, dx, dy }))? {
+            lock_state(&self.state)
+                .events
+                .push(MockEvent::Scroll { x, y, dx, dy });
         }
-        state.events.push(MockEvent::Scroll { x, y, dx, dy });
         Ok(())
     }
 
@@ -427,17 +642,22 @@ impl Body for MockBody {
         self.check_target(to_x, to_y)?;
         self.check_input_permission()?;
         self.check_forbidden()?;
+        self.check_forbidden_at(from_x, from_y)?;
+        self.check_forbidden_at(to_x, to_y)?;
         self.verify_focus()?;
-        let mut state = lock_state(&self.state);
-        if state.fault == Some(Fault::DropInput) {
-            return Ok(());
-        }
-        state.events.push(MockEvent::Drag {
+        if self.fault_gate(Some(MockEvent::Drag {
             from_x,
             from_y,
             to_x,
             to_y,
-        });
+        }))? {
+            lock_state(&self.state).events.push(MockEvent::Drag {
+                from_x,
+                from_y,
+                to_x,
+                to_y,
+            });
+        }
         Ok(())
     }
 
@@ -446,12 +666,13 @@ impl Body for MockBody {
         self.check_target(x, y)?;
         self.check_input_permission()?;
         self.check_forbidden()?;
+        self.check_forbidden_at(x, y)?;
         self.verify_focus()?;
-        let mut state = lock_state(&self.state);
-        if state.fault == Some(Fault::DropInput) {
-            return Ok(());
+        if self.fault_gate(Some(MockEvent::DoubleClick { x, y }))? {
+            lock_state(&self.state)
+                .events
+                .push(MockEvent::DoubleClick { x, y });
         }
-        state.events.push(MockEvent::DoubleClick { x, y });
         Ok(())
     }
 
@@ -460,12 +681,13 @@ impl Body for MockBody {
         self.check_target(x, y)?;
         self.check_input_permission()?;
         self.check_forbidden()?;
+        self.check_forbidden_at(x, y)?;
         self.verify_focus()?;
-        let mut state = lock_state(&self.state);
-        if state.fault == Some(Fault::DropInput) {
-            return Ok(());
+        if self.fault_gate(Some(MockEvent::RightClick { x, y }))? {
+            lock_state(&self.state)
+                .events
+                .push(MockEvent::RightClick { x, y });
         }
-        state.events.push(MockEvent::RightClick { x, y });
         Ok(())
     }
 
@@ -478,11 +700,11 @@ impl Body for MockBody {
         self.check_input_permission()?;
         self.check_forbidden()?;
         self.verify_focus()?;
-        let mut state = lock_state(&self.state);
-        if state.fault == Some(Fault::DropInput) {
-            return Ok(());
+        if self.fault_gate(Some(MockEvent::Hold { key, millis }))? {
+            lock_state(&self.state)
+                .events
+                .push(MockEvent::Hold { key, millis });
         }
-        state.events.push(MockEvent::Hold { key, millis });
         Ok(())
     }
 
@@ -521,6 +743,50 @@ impl Body for MockBody {
 
     fn active_window(&mut self) -> Option<u64> {
         Some(lock_state(&self.state).focus_window)
+    }
+
+    fn window_at(&mut self, x: i32, y: i32) -> Option<WindowIdentity> {
+        let state = lock_state(&self.state);
+        state
+            .windows
+            .iter()
+            .rev()
+            .find(|w| w.rect.contains(x, y))
+            .map(|w| WindowIdentity {
+                window_id: Some(w.id),
+                class: w.class.clone(),
+                title: w.title.clone(),
+                exe_basename: w.exe_basename.clone(),
+            })
+    }
+
+    fn snapshot_target(&mut self, x: i32, y: i32) -> Option<TargetSnapshot> {
+        let (width, height, variant, windows) = {
+            let state = lock_state(&self.state);
+            (
+                state.width,
+                state.height,
+                state.variant,
+                state.windows.clone(),
+            )
+        };
+        if x < 0 || y < 0 || x as u32 >= width || y as u32 >= height {
+            return None;
+        }
+        let window_id = self.window_at(x, y).and_then(|id| id.window_id);
+        let (ox, oy, cw, ch) = snapshot_crop_origin(x, y, width, height);
+        let grid = snapshot_grid(
+            |px, py| {
+                let (r, g, b) =
+                    Self::pixel_color(px as u32, py as u32, width, height, variant, &windows);
+                luminance_of(r, g, b)
+            },
+            ox,
+            oy,
+            cw,
+            ch,
+        );
+        Some(TargetSnapshot { window_id, grid })
     }
 
     fn expected_focus(&self) -> Option<u64> {
@@ -849,5 +1115,136 @@ mod tests {
         body.set_max_capture_dimension(None);
         let frame = body.screenshot().unwrap();
         assert_eq!((frame.width, frame.height), (800, 600));
+    }
+
+    #[test]
+    fn window_at_returns_the_topmost_window_at_the_point() {
+        let mut body = MockBody::new();
+        assert!(body.window_at(150, 150).is_none(), "no windows scripted");
+        body.set_windows(vec![
+            MockWindow::new(1, ScreenRect::new(100, 100, 300, 200)).with_class("firefox"),
+            MockWindow::new(2, ScreenRect::new(150, 150, 100, 100)).with_class("editor"),
+        ]);
+        // Overlapping region: the later (topmost) window wins.
+        let top = body.window_at(175, 175).unwrap();
+        assert_eq!(top.window_id, Some(2));
+        assert_eq!(top.class.as_deref(), Some("editor"));
+        // Only the bottom window covers this point.
+        let bottom = body.window_at(110, 110).unwrap();
+        assert_eq!(bottom.window_id, Some(1));
+        assert!(body.window_at(10, 10).is_none());
+    }
+
+    #[test]
+    fn forbidden_target_window_refuses_even_when_unfocused() {
+        let mut body = MockBody::new();
+        // Focused window is innocent; the click target is not.
+        body.set_active_window(Some("firefox"), Some("Inbox"));
+        body.set_windows(vec![MockWindow::new(
+            1,
+            ScreenRect::new(100, 100, 200, 200),
+        )
+        .with_class("KeePassXC")
+        .with_fill((10, 10, 10))]);
+        let err = body.click(150, 150).unwrap_err();
+        assert_eq!(err.code(), "forbidden_window");
+        assert!(err.message().contains("target window"));
+        assert!(body.events().is_empty());
+        // A click outside the forbidden window still works.
+        assert!(body.click(500, 500).is_ok());
+        // Drags check BOTH endpoints.
+        let err = body.drag(500, 500, 150, 150).unwrap_err();
+        assert_eq!(err.code(), "forbidden_window");
+    }
+
+    #[test]
+    fn spoofed_class_with_denylisted_exe_is_refused_at_the_point() {
+        let mut body = MockBody::new();
+        body.set_windows(vec![MockWindow::new(
+            1,
+            ScreenRect::new(100, 100, 200, 200),
+        )
+        .with_class("Firefox")
+        .with_exe("keepassxc-probe")]);
+        let err = body.click(150, 150).unwrap_err();
+        assert_eq!(err.code(), "forbidden_window");
+    }
+
+    #[test]
+    fn snapshot_matches_the_same_target_and_mismatches_a_swapped_one() {
+        let mut body = MockBody::new();
+        body.set_windows(vec![MockWindow::new(
+            1,
+            ScreenRect::new(100, 100, 300, 300),
+        )
+        .with_class("editor")
+        .with_fill((200, 40, 40))]);
+        let before = body.snapshot_target(200, 200).unwrap();
+        assert_eq!(before.window_id, Some(1));
+        // Unchanged: matches.
+        let same = body.snapshot_target(200, 200).unwrap();
+        assert!(before.matches(&same));
+        // The window is replaced by another window with
+        // different content at the same point: mismatch.
+        body.set_windows(vec![MockWindow::new(
+            2,
+            ScreenRect::new(100, 100, 300, 300),
+        )
+        .with_class("browser")
+        .with_fill((40, 40, 200))]);
+        let after = body.snapshot_target(200, 200).unwrap();
+        assert_eq!(after.window_id, Some(2));
+        assert!(!before.matches(&after));
+        // Same window id, changed fill: grid mismatch.
+        body.set_windows(vec![MockWindow::new(
+            2,
+            ScreenRect::new(100, 100, 300, 300),
+        )
+        .with_class("browser")
+        .with_fill((240, 240, 240))]);
+        let changed = body.snapshot_target(200, 200).unwrap();
+        assert!(!after.matches(&changed));
+        // Out of bounds: no snapshot.
+        assert!(body.snapshot_target(900, 900).is_none());
+    }
+
+    #[test]
+    fn latency_draws_are_deterministic_for_a_seed() {
+        let a = MockBody::new();
+        a.set_latency(42, 1, 3);
+        let b = MockBody::new();
+        b.set_latency(42, 1, 3);
+        let mut a = a;
+        let mut b = b;
+        for _ in 0..5 {
+            a.click(10, 10).unwrap();
+            b.click(10, 10).unwrap();
+        }
+        assert_eq!(a.latency_draws(), b.latency_draws());
+        assert_eq!(a.latency_draws().len(), 5);
+        assert!(a.latency_draws().iter().all(|d| (1..=3).contains(d)));
+        // A different seed draws a different sequence.
+        let c = MockBody::new();
+        c.set_latency(7, 1, 3);
+        let mut c = c;
+        for _ in 0..5 {
+            c.click(10, 10).unwrap();
+        }
+        assert_ne!(c.latency_draws(), a.latency_draws());
+    }
+
+    #[test]
+    fn disconnect_mid_action_records_the_partial_event_and_reports_unknown() {
+        let mut body = MockBody::with_fault(Fault::DisconnectMidAction);
+        let err = body.click(10, 10).unwrap_err();
+        assert_eq!(err.code(), "unknown_outcome");
+        // The partial event IS recorded: the click may have
+        // landed, and the caller must know that.
+        assert_eq!(body.events(), vec![MockEvent::Click { x: 10, y: 10 }]);
+        // Type: the first character is the partial event.
+        let err = body.type_text("hello").unwrap_err();
+        assert_eq!(err.code(), "unknown_outcome");
+        assert!(body.events().contains(&MockEvent::Char('h')));
+        assert!(!body.events().contains(&MockEvent::Char('e')));
     }
 }

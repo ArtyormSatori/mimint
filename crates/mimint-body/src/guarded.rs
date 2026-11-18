@@ -38,19 +38,42 @@
 //! implemented and tested here.
 
 use crate::action::Key;
-use crate::body::{Body, Framebuffer, FramebufferPool, Permissions, ScreenRect};
+use crate::body::{
+    Body, Framebuffer, FramebufferPool, Permissions, ScreenRect, TargetSnapshot, WindowIdentity,
+};
 use crate::error::BodyError;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
+
+/// Context recorded by the FIRST trip of a [`StopFlag`]
+/// (F4-16): which mechanism tripped it, why, and when. The
+/// latch used to be a bare boolean, so the UI could only show
+/// a generic "stopped" message and the audit log recorded
+/// nothing about the trip. First trip wins: a later trip
+/// cannot overwrite the cause of the latch — the first cause
+/// is the one that stopped the session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TripInfo {
+    /// Mechanism that tripped: `"hotkey"`, `"approval_pending"`,
+    /// `"ui_stop"`, or `"unknown"` (bare `trip()` callers).
+    pub source: &'static str,
+    /// Human-readable reason, no secrets, no screen content.
+    pub reason: String,
+    /// Wall-clock time of the trip, epoch milliseconds
+    /// (audit-compatible; `0` when the clock is unavailable).
+    pub ts_ms: u64,
+}
 
 /// A shared, latching stop flag. The UI (Phase 4) and the wrapper
 /// share one `Arc<StopFlag>`; `trip()` latches it, `is_tripped()`
 /// reads it. There is no untrip: a new session uses a new flag.
+/// Use [`StopFlag::trip_with`] to record WHY it tripped.
 #[derive(Debug, Default)]
 pub struct StopFlag {
     tripped: AtomicBool,
+    info: Mutex<Option<TripInfo>>,
 }
 
 impl StopFlag {
@@ -58,12 +81,35 @@ impl StopFlag {
         Arc::new(Self::default())
     }
 
+    /// Latch the flag with no context (kept for callers that
+    /// genuinely have none). Prefer [`StopFlag::trip_with`].
     pub fn trip(&self) {
-        self.tripped.store(true, Ordering::SeqCst);
+        self.trip_with("unknown", "emergency stop tripped");
+    }
+
+    /// Latch the flag, recording the first trip's context.
+    /// Later calls leave the recorded context untouched.
+    pub fn trip_with(&self, source: &'static str, reason: impl Into<String>) {
+        if !self.tripped.swap(true, Ordering::SeqCst) {
+            let ts_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            *self.info.lock().unwrap_or_else(|p| p.into_inner()) = Some(TripInfo {
+                source,
+                reason: reason.into(),
+                ts_ms,
+            });
+        }
     }
 
     pub fn is_tripped(&self) -> bool {
         self.tripped.load(Ordering::SeqCst)
+    }
+
+    /// The first trip's context, or `None` when never tripped.
+    pub fn trip_info(&self) -> Option<TripInfo> {
+        self.info.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
 }
 
@@ -227,7 +273,10 @@ impl<B: Body> GuardedBody<B> {
 
     fn trip_stop(&self) {
         if let Some(flag) = &self.stop_flag {
-            flag.trip();
+            flag.trip_with(
+                "approval_pending",
+                "input attempted while an approval card was waiting (self-approval attempt)",
+            );
         }
     }
 
@@ -424,6 +473,14 @@ impl<B: Body> Body for GuardedBody<B> {
         self.inner.active_window()
     }
 
+    fn window_at(&mut self, x: i32, y: i32) -> Option<WindowIdentity> {
+        self.inner.window_at(x, y)
+    }
+
+    fn snapshot_target(&mut self, x: i32, y: i32) -> Option<TargetSnapshot> {
+        self.inner.snapshot_target(x, y)
+    }
+
     fn expected_focus(&self) -> Option<u64> {
         self.inner.expected_focus()
     }
@@ -576,6 +633,34 @@ mod tests {
         pending.store(false, Ordering::SeqCst);
         assert_eq!(body.click(100, 100).unwrap_err().code(), "stopped");
         assert!(body.into_inner().events().is_empty());
+    }
+
+    #[test]
+    fn trip_records_first_context_and_latches() {
+        let flag = StopFlag::new();
+        assert!(flag.trip_info().is_none());
+        flag.trip_with("hotkey", "global STOP hotkey pressed");
+        let info = flag.trip_info().unwrap();
+        assert_eq!(info.source, "hotkey");
+        assert!(info.reason.contains("hotkey"));
+        assert!(info.ts_ms > 0);
+        // A later trip cannot overwrite the first cause.
+        flag.trip_with("approval_pending", "second cause");
+        assert_eq!(flag.trip_info().unwrap(), info);
+        assert!(flag.is_tripped());
+    }
+
+    #[test]
+    fn approval_pending_trip_records_its_source() {
+        let flag = StopFlag::new();
+        let pending = Arc::new(AtomicBool::new(true));
+        let mut body = guarded(RateLimits::default())
+            .with_stop_flag(Arc::clone(&flag))
+            .with_approval_pending(Arc::clone(&pending));
+        let _ = body.click(100, 100).unwrap_err();
+        let info = flag.trip_info().unwrap();
+        assert_eq!(info.source, "approval_pending");
+        assert!(info.reason.contains("approval card"));
     }
 
     #[test]

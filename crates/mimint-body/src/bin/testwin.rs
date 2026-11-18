@@ -23,6 +23,11 @@
 //! can be exercised against a denylisted class. The value is also
 //! logged as a `CLASS <name>` line.
 //!
+//! The window always sets `_NET_WM_PID` to its own pid, like any
+//! toolkit client, so the PID→executable multi-signal check
+//! (F4-03) and the XID registry (F4-04) can be exercised live.
+//! The pid is logged as a `PID <pid>` line.
+//!
 //! Linux only. On other platforms this binary exits with an error.
 
 #[cfg(target_os = "linux")]
@@ -234,6 +239,26 @@ mod linux {
                 );
                 log.log(&format!("CLASS {class}"));
             }
+        }
+        // _NET_WM_PID, like any toolkit client: the body's
+        // PID→executable check resolves the owner through it.
+        {
+            let pid = std::process::id();
+            if let Ok(cookie) = intern_atom(&conn, false, b"_NET_WM_PID") {
+                if let Ok(reply) = cookie.reply() {
+                    let _ = change_property(
+                        &conn,
+                        PropMode::REPLACE,
+                        win,
+                        reply.atom,
+                        AtomEnum::CARDINAL,
+                        32,
+                        1,
+                        &pid.to_ne_bytes(),
+                    );
+                }
+            }
+            log.log(&format!("PID {pid}"));
         }
         create_gc(&conn, gc, win, &CreateGCAux::new()).unwrap();
         map_window(&conn, win).unwrap();

@@ -78,6 +78,25 @@ pub enum BodyError {
     /// itself. The refusal also trips the emergency stop (see
     /// `GuardedBody`). Nothing was executed.
     ApprovalPending,
+    /// The action may or may not have executed: the body
+    /// disconnected, timed out, or panicked mid-action, so the
+    /// outcome is unknowable. The caller MUST NOT retry
+    /// automatically (a retry could execute the action twice)
+    /// and MUST surface the uncertainty to the user. See
+    /// `BodyActor` (timeout/disconnect/panic) and the Android
+    /// body's transport rule (input methods never retry).
+    UnknownOutcome { reason: String },
+    /// The target changed between the approval snapshot and
+    /// execution: the window under the point, or the pixels
+    /// around it, no longer match what the user approved
+    /// (see `TargetSnapshot`). Nothing was executed; the user
+    /// must re-approve against the current screen.
+    TargetChanged { reason: String },
+    /// The observation the action was planned from is older
+    /// than the allowed age: the screen may have changed since
+    /// the screenshot the model saw. Nothing was executed; the
+    /// caller must take a fresh screenshot first.
+    StaleObservation { age_secs: u64, max_secs: u64 },
 }
 
 impl BodyError {
@@ -98,6 +117,9 @@ impl BodyError {
             BodyError::InvalidArgument { .. } => "invalid_argument",
             BodyError::ForbiddenWindow { .. } => "forbidden_window",
             BodyError::ApprovalPending => "approval_pending",
+            BodyError::UnknownOutcome { .. } => "unknown_outcome",
+            BodyError::TargetChanged { .. } => "target_changed",
+            BodyError::StaleObservation { .. } => "stale_observation",
         }
     }
 
@@ -146,6 +168,17 @@ impl BodyError {
             }
             BodyError::ApprovalPending => {
                 "an approval card is waiting: refusing input until the user decides".to_string()
+            }
+            BodyError::UnknownOutcome { reason } => {
+                format!("action outcome unknown (not auto-retried): {reason}")
+            }
+            BodyError::TargetChanged { reason } => {
+                format!(
+                    "target changed since approval, refusing to act on a stale approval: {reason}"
+                )
+            }
+            BodyError::StaleObservation { age_secs, max_secs } => {
+                format!("observation is {age_secs}s old (limit {max_secs}s): take a fresh screenshot first")
             }
         }
     }

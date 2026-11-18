@@ -48,6 +48,7 @@
 
 use crate::action::{action_specs, Action, ActionSpec};
 use crate::error::BodyError;
+use std::time::Instant;
 
 /// A rectangle in framebuffer-pixel space, origin top-left.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,6 +99,14 @@ pub struct Framebuffer {
     /// displays whose origin is not (0, 0)). (0, 0) on a single
     /// primary display.
     pub origin: (i32, i32),
+    /// Monotonic capture time, set when the frame is built. Used
+    /// for the observation-TTL rule (F4-08): an action planned
+    /// from a frame older than the allowed age is refused until
+    /// a fresh screenshot is taken. Cloning and downscaling
+    /// preserve it — a copy of an old observation is still old.
+    /// Tests that need a specific age use
+    /// [`Framebuffer::with_captured_at`].
+    pub captured_at: Instant,
 }
 
 impl Framebuffer {
@@ -136,7 +145,21 @@ impl Framebuffer {
             data,
             scale_factor,
             origin,
+            captured_at: Instant::now(),
         })
+    }
+
+    /// Re-stamp the capture time. For tests (and only tests in
+    /// practice): production frames always carry the time they
+    /// were built. Returns the frame, for chaining.
+    pub fn with_captured_at(mut self, captured_at: Instant) -> Self {
+        self.captured_at = captured_at;
+        self
+    }
+
+    /// Age of this observation, from capture to now.
+    pub fn age(&self) -> std::time::Duration {
+        self.captured_at.elapsed()
     }
 
     /// True when every pixel is identical (a cheap "is this blank?"
@@ -161,8 +184,8 @@ impl Framebuffer {
         let this = std::mem::ManuallyDrop::new(self);
         // SAFETY: `this` is `ManuallyDrop`, so no drop runs; reading
         // the owned `Vec<u8>` out moves it without duplicating the
-        // allocation, and the remaining fields are `Copy` scalars
-        // that need no drop.
+        // allocation, and the remaining fields need no drop
+        // (scalars plus `captured_at`, which has no destructor).
         unsafe { std::ptr::read(&this.data) }
     }
 
@@ -222,6 +245,7 @@ impl Framebuffer {
             data,
             scale_factor: self.scale_factor,
             origin: self.origin,
+            captured_at: self.captured_at,
         }
     }
 }
@@ -286,6 +310,197 @@ pub struct Permissions {
     pub screen_capture: PermissionState,
     /// Moving the pointer and typing (macOS Accessibility; X11: no gate).
     pub input_control: PermissionState,
+}
+
+/// Identity of one OS window, as far as the platform can report
+/// it. Every field is optional: a platform that cannot determine
+/// a signal reports `None` for it, and the forbidden policy
+/// treats undeterminable as allow (see `crate::forbidden`).
+/// `exe_basename` is the BASENAME of the owning process's
+/// executable only — never a full path, never a command line.
+/// Titles are never echoed in error messages (they can contain
+/// secrets); they are matched, then dropped.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct WindowIdentity {
+    /// OS window id, when the platform exposes one.
+    pub window_id: Option<u64>,
+    /// Window class (X11 `WM_CLASS`, Windows class name).
+    pub class: Option<String>,
+    /// Window title, when readable.
+    pub title: Option<String>,
+    /// Basename of the owning process's executable, when the
+    /// platform can resolve the window to a process.
+    pub exe_basename: Option<String>,
+}
+
+/// A re-verification snapshot of the target at approval time
+/// (F4-07): enough to detect that the target changed before
+/// execution, without retaining any pixels.
+///
+/// The grid is 8x8 mean-luminance values over a 64x64 crop
+/// centered on the target point (row-major). 64 bytes of
+/// coarse brightness cannot reconstruct text or images; the
+/// snapshot is safe to hold in memory across the approval
+/// wait and to compare, but it is never logged or audited.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TargetSnapshot {
+    /// OS window id under the point at snapshot time, when known.
+    pub window_id: Option<u64>,
+    /// 8x8 mean-luminance grid over the 64x64 crop.
+    pub grid: [u8; 64],
+}
+
+/// Maximum mean absolute grid difference for two snapshots of
+/// the SAME target to still match. A blinking cursor or a
+/// clock tick moves a few cells by a little; a different
+/// window or a scrolled page moves most cells by a lot. The
+/// value is a judgment call, recorded here and covered by the
+/// mock TOCTOU tests (same target: diff 0; swapped target:
+/// diff far above the threshold).
+pub const REVERIFY_GRID_MAX_MEAN_DIFF: f32 = 12.0;
+
+impl TargetSnapshot {
+    /// True when `other` still shows the same target: the
+    /// window id must match whenever both snapshots know it,
+    /// and the luminance grids must be close. A window-id
+    /// mismatch is decisive on its own (the point now belongs
+    /// to a different window); a grid mismatch means the
+    /// content under the point changed.
+    pub fn matches(&self, other: &TargetSnapshot) -> bool {
+        if let (Some(a), Some(b)) = (self.window_id, other.window_id) {
+            if a != b {
+                return false;
+            }
+        }
+        let total: u32 = self
+            .grid
+            .iter()
+            .zip(other.grid.iter())
+            .map(|(a, b)| a.abs_diff(*b) as u32)
+            .sum();
+        total as f32 / 64.0 <= REVERIFY_GRID_MAX_MEAN_DIFF
+    }
+
+    /// Why two snapshots do not match, for the refusal message.
+    /// Returns `None` when they match. Never includes pixels.
+    pub fn mismatch_reason(&self, other: &TargetSnapshot) -> Option<String> {
+        if let (Some(a), Some(b)) = (self.window_id, other.window_id) {
+            if a != b {
+                return Some("a different window is now under the target point".to_string());
+            }
+        }
+        let total: u32 = self
+            .grid
+            .iter()
+            .zip(other.grid.iter())
+            .map(|(a, b)| a.abs_diff(*b) as u32)
+            .sum();
+        let mean = total as f32 / 64.0;
+        if mean > REVERIFY_GRID_MAX_MEAN_DIFF {
+            return Some(format!(
+                "the screen content under the target point changed (grid difference {mean:.1})"
+            ));
+        }
+        None
+    }
+}
+
+/// A slot holding the approval-time snapshot for the action
+/// currently awaiting a decision. Shared between the approver
+/// (which fills it when the card is created) and the body tool
+/// (which consumes it at execution). One slot per worker: only
+/// one approval waits at a time, and the slot is cleared on
+/// every non-Allow resolution and on consume, so a snapshot
+/// can never authorize a different action.
+#[derive(Debug, Default)]
+pub struct TargetSnapshotSlot {
+    inner: std::sync::Mutex<Option<(i32, i32, TargetSnapshot)>>,
+}
+
+impl TargetSnapshotSlot {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Store the snapshot for the action aimed at (`x`, `y`).
+    pub fn set(&self, x: i32, y: i32, snapshot: TargetSnapshot) {
+        *self.inner.lock().unwrap_or_else(|p| p.into_inner()) = Some((x, y, snapshot));
+    }
+
+    /// Take the snapshot for the action aimed at (`x`, `y`).
+    /// Returns `None` when the slot is empty or the point
+    /// differs (a snapshot never applies to another point).
+    /// The slot is cleared either way on a matching take.
+    pub fn take_for(&self, x: i32, y: i32) -> Option<TargetSnapshot> {
+        let mut slot = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        match slot.as_ref() {
+            Some((sx, sy, _)) if *sx == x && *sy == y => slot.take().map(|(_, _, s)| s),
+            _ => None,
+        }
+    }
+
+    /// Clear the slot unconditionally (non-Allow resolution).
+    pub fn clear(&self) {
+        *self.inner.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    }
+}
+
+/// Rec. 601 luma of one RGB pixel, for re-verify snapshot
+/// grids. Shared by the mock and X11 bodies so both grids mean
+/// the same thing.
+pub(crate) fn luminance_of(r: u8, g: u8, b: u8) -> u8 {
+    ((u32::from(r) * 299 + u32::from(g) * 587 + u32::from(b) * 114) / 1000) as u8
+}
+
+/// The 64x64 crop origin for a re-verify snapshot centered on
+/// (`x`, `y`), clamped inside a `width`x`height` display.
+/// Returns (origin_x, origin_y, crop_width, crop_height); the
+/// crop shrinks on displays smaller than 64px in a dimension.
+pub(crate) fn snapshot_crop_origin(
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+) -> (i32, i32, u32, u32) {
+    let cw = width.min(64);
+    let ch = height.min(64);
+    let ox = (x - 32).clamp(0, width.saturating_sub(cw) as i32);
+    let oy = (y - 32).clamp(0, height.saturating_sub(ch) as i32);
+    (ox, oy, cw, ch)
+}
+
+/// An 8x8 mean-luminance grid over the crop at (`ox`, `oy`) of
+/// size `cw`x`ch`, sampled through `luminance` (absolute
+/// framebuffer coordinates). Each cell averages its pixels;
+/// leftover edge pixels (when the crop size is not divisible
+/// by 8) are ignored, identically on every body.
+pub(crate) fn snapshot_grid(
+    luminance: impl Fn(i32, i32) -> u8,
+    ox: i32,
+    oy: i32,
+    cw: u32,
+    ch: u32,
+) -> [u8; 64] {
+    let cell_w = (cw / 8).max(1);
+    let cell_h = (ch / 8).max(1);
+    let mut grid = [0u8; 64];
+    for gy in 0..8 {
+        for gx in 0..8 {
+            let mut sum: u32 = 0;
+            let mut n: u32 = 0;
+            for dy in 0..cell_h {
+                for dx in 0..cell_w {
+                    sum += u32::from(luminance(
+                        ox + gx as i32 * cell_w as i32 + dx as i32,
+                        oy + gy as i32 * cell_h as i32 + dy as i32,
+                    ));
+                    n += 1;
+                }
+            }
+            grid[gy * 8 + gx] = (sum / n) as u8;
+        }
+    }
+    grid
 }
 
 /// The result of dispatching one [`Action`] through [`Body::act`].
@@ -435,6 +650,28 @@ pub trait Body: Send {
     /// focus, when the platform can report it. `None` means "cannot
     /// be determined on this platform".
     fn active_window(&mut self) -> Option<u64> {
+        None
+    }
+
+    /// The window under the point (`x`, `y`), when the platform
+    /// can report it (F4-03). `None` means "cannot be determined"
+    /// — the forbidden policy treats that as allow, exactly as
+    /// for the active window. Bodies that implement it return the
+    /// topmost window containing the point. The default is `None`
+    /// (platforms without a window-at-point API: macOS, Android,
+    /// Wayland — see `docs/body-aci.md` for the per-body gaps).
+    fn window_at(&mut self, _x: i32, _y: i32) -> Option<WindowIdentity> {
+        None
+    }
+
+    /// A re-verification snapshot of the target at (`x`, `y`)
+    /// (F4-07): the window id under the point plus a coarse
+    /// luminance grid, no pixels. `None` means the body cannot
+    /// snapshot (same platforms as [`Body::window_at`], plus
+    /// bodies whose capture path cannot do a sub-rectangle).
+    /// Callers treat `None` as "no re-verification available"
+    /// and proceed without it — never as a refusal.
+    fn snapshot_target(&mut self, _x: i32, _y: i32) -> Option<TargetSnapshot> {
         None
     }
 
@@ -772,5 +1009,86 @@ mod tests {
         assert!(!rect.contains(40, 20));
         assert!(!rect.contains(10, 60));
         assert!(!rect.contains(9, 20));
+    }
+
+    #[test]
+    fn captured_at_is_stamped_and_preserved_by_clone_and_downscale() {
+        let frame = Framebuffer::new(4, 4, vec![0u8; 64]).unwrap();
+        assert!(frame.age() < std::time::Duration::from_secs(5));
+        let old = std::time::Instant::now() - std::time::Duration::from_secs(400);
+        let stamped = frame.clone().with_captured_at(old);
+        assert!(stamped.age() >= std::time::Duration::from_secs(400));
+        assert_eq!(
+            stamped.clone().captured_at,
+            old,
+            "clone preserves the stamp"
+        );
+        let small = stamped.downscale(2);
+        assert_eq!(
+            small.captured_at, old,
+            "a downscaled copy of an old observation is still old"
+        );
+    }
+
+    #[test]
+    fn snapshot_match_requires_same_window_and_close_grid() {
+        let base = TargetSnapshot {
+            window_id: Some(7),
+            grid: [100; 64],
+        };
+        assert!(base.matches(&base.clone()));
+        // Small drift (blinking cursor): still matches.
+        let mut drifted = base.clone();
+        drifted.grid[0] = 110;
+        drifted.grid[1] = 90;
+        assert!(base.matches(&drifted));
+        // Different window: decisive mismatch, even with an
+        // identical grid.
+        let mut other_window = base.clone();
+        other_window.window_id = Some(8);
+        assert!(!base.matches(&other_window));
+        assert!(base
+            .mismatch_reason(&other_window)
+            .unwrap()
+            .contains("different window"));
+        // Changed content: large grid difference mismatches.
+        let mut changed = base.clone();
+        changed.grid = [200; 64];
+        assert!(!base.matches(&changed));
+        assert!(base.mismatch_reason(&changed).unwrap().contains("changed"));
+        // Unknown window ids on either side: the grid decides.
+        let unknown = TargetSnapshot {
+            window_id: None,
+            grid: [100; 64],
+        };
+        assert!(base.matches(&unknown));
+        assert!(base.mismatch_reason(&unknown).is_none());
+    }
+
+    #[test]
+    fn snapshot_slot_binds_to_one_point_and_clears() {
+        let slot = TargetSnapshotSlot::new();
+        assert!(slot.take_for(10, 10).is_none());
+        let snap = TargetSnapshot {
+            window_id: Some(1),
+            grid: [0; 64],
+        };
+        slot.set(10, 10, snap);
+        assert!(
+            slot.take_for(11, 10).is_none(),
+            "a snapshot never applies to another point"
+        );
+        assert!(slot.take_for(10, 10).is_some());
+        assert!(slot.take_for(10, 10).is_none(), "a take consumes the slot");
+        slot.set(
+            5,
+            5,
+            TargetSnapshot {
+                window_id: None,
+                grid: [1; 64],
+            },
+        );
+        slot.clear();
+        assert!(slot.take_for(5, 5).is_none(), "clear empties the slot");
     }
 }

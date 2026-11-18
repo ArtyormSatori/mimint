@@ -35,7 +35,12 @@
 //!   rule as the forbidden-window policy).
 //! * Forbidden windows: the foreground window class (via
 //!   `GetClassNameW`) is checked against the shared denylist in
-//!   [`crate::forbidden`] before every input action.
+//!   [`crate::forbidden`] before every input action, and
+//!   coordinate actions ALSO check the window under the target
+//!   point (`WindowFromPoint` + root ancestor). Both checks use
+//!   all three signals (class, title, executable basename via
+//!   the owning process's image name), so a spoofed class
+//!   cannot hide a denylisted executable. Code only, NEVER RUN.
 //! * uiAccess / signing: the main path per D8 is a signed binary
 //!   with `uiAccess="true"` in its manifest, which bypasses UIPI
 //!   for accessibility purposes. This crate does not embed a
@@ -48,10 +53,11 @@
 //! or token handle behind.
 
 use crate::action::{Key, MAX_HOLD_MILLIS};
-use crate::body::{Body, Framebuffer, PermissionState, Permissions, ScreenRect};
+use crate::body::{Body, Framebuffer, PermissionState, Permissions, ScreenRect, WindowIdentity};
 use crate::error::BodyError;
-use crate::forbidden::check_forbidden_window;
+use crate::forbidden::{check_forbidden_signals, WindowSignals};
 use std::time::Duration;
+use windows::core::PWSTR;
 use windows::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, HWND, POINT};
 use windows::Win32::Graphics::Gdi::{
     BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, GetDIBits,
@@ -63,7 +69,8 @@ use windows::Win32::Security::{
     TOKEN_MANDATORY_LABEL, TOKEN_QUERY,
 };
 use windows::Win32::System::Threading::{
-    GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
+    GetCurrentProcess, OpenProcess, OpenProcessToken, QueryFullProcessImageNameW,
+    PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::Win32::UI::HiDpi::{
     GetDpiForSystem, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
@@ -76,9 +83,9 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_DELETE, VK_DOWN, VK_ESCAPE, VK_F5, VK_LEFT, VK_RETURN, VK_RIGHT, VK_SPACE, VK_TAB, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetClassNameW, GetForegroundWindow, GetSystemMetrics, GetWindowThreadProcessId,
-    WindowFromPoint, SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN, SM_CYVIRTUALSCREEN,
-    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+    GetAncestor, GetClassNameW, GetForegroundWindow, GetSystemMetrics, GetWindowTextW,
+    GetWindowThreadProcessId, WindowFromPoint, GA_ROOT, SM_CXSCREEN, SM_CXVIRTUALSCREEN,
+    SM_CYSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
 };
 
 const WHEEL_DELTA: i32 = 120;
@@ -218,6 +225,78 @@ fn window_integrity_level(window: HWND) -> Option<u32> {
     }
 }
 
+/// The executable basename of the process owning `window`, or
+/// `None` when undeterminable. The BASENAME only — never the
+/// full image path (it can contain the username).
+fn window_exe_basename(window: HWND) -> Option<String> {
+    let mut pid = 0u32;
+    unsafe {
+        GetWindowThreadProcessId(window, Some(&mut pid));
+        if pid == 0 {
+            return None;
+        }
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        let mut buffer = [0u16; 1024];
+        let mut size = buffer.len() as u32;
+        let ok = QueryFullProcessImageNameW(
+            process,
+            PROCESS_NAME_WIN32,
+            PWSTR(buffer.as_mut_ptr()),
+            &mut size,
+        );
+        let _ = CloseHandle(process);
+        if !ok.as_bool() || size == 0 {
+            return None;
+        }
+        let path = String::from_utf16_lossy(&buffer[..size as usize]);
+        std::path::Path::new(&path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(str::to_string)
+    }
+}
+
+/// The identity of one window: class, title, and executable
+/// basename. `WindowFromPoint` returns the deepest child
+/// window, so the identity is read from the ROOT ancestor
+/// (the app window the user recognizes); a failure to find
+/// the ancestor falls back to the window itself.
+fn window_identity(window: HWND) -> WindowIdentity {
+    let root = unsafe { GetAncestor(window, GA_ROOT) };
+    let window = if root.is_invalid() { window } else { root };
+    let (class, title) = unsafe {
+        let mut name = [0u16; 256];
+        let class_len = GetClassNameW(window, &mut name);
+        let class = if class_len == 0 {
+            None
+        } else {
+            Some(String::from_utf16_lossy(&name[..class_len as usize]))
+        };
+        let mut text = [0u16; 512];
+        let text_len = GetWindowTextW(window, &mut text);
+        let title = if text_len == 0 {
+            None
+        } else {
+            Some(String::from_utf16_lossy(&text[..text_len as usize]))
+        };
+        (class, title)
+    };
+    WindowIdentity {
+        window_id: Some(window.0 as u64),
+        class,
+        title,
+        exe_basename: window_exe_basename(window),
+    }
+}
+
+fn window_signals(identity: &WindowIdentity) -> WindowSignals<'_> {
+    WindowSignals {
+        class: identity.class.as_deref(),
+        title: identity.title.as_deref(),
+        exe_basename: identity.exe_basename.as_deref(),
+    }
+}
+
 /// Human name for an integrity level, for the UIPI error.
 /// Levels between the named constants take the lower name
 /// (e.g. 0x2001 is still "medium" for display purposes).
@@ -314,21 +393,29 @@ impl WindowsBody {
         Ok(())
     }
 
-    /// Forbidden-window check on the foreground window class.
-    /// Undeterminable (no foreground window, unreadable class)
-    /// allows.
+    /// Forbidden-window check on the foreground window, on all
+    /// three signals (class, title, executable basename).
+    /// Undeterminable (no foreground window, unreadable
+    /// identity) allows.
     fn check_forbidden(&self) -> Result<(), BodyError> {
         let foreground = unsafe { GetForegroundWindow() };
         if foreground.is_invalid() {
             return Ok(());
         }
-        let mut name = [0u16; 256];
-        let len = unsafe { GetClassNameW(foreground, &mut name) };
-        if len == 0 {
+        let identity = window_identity(foreground);
+        check_forbidden_signals(&window_signals(&identity), "active")
+    }
+
+    /// Forbidden-window check on the window under the target
+    /// point (F4-03): the unfocused-click attack. Undeterminable
+    /// allows, as for the foreground check.
+    fn check_forbidden_at_point(&self, x: i32, y: i32) -> Result<(), BodyError> {
+        let window = unsafe { WindowFromPoint(POINT { x, y }) };
+        if window.is_invalid() {
             return Ok(());
         }
-        let class = String::from_utf16_lossy(&name[..len as usize]);
-        check_forbidden_window(Some(&class), None)
+        let identity = window_identity(window);
+        check_forbidden_signals(&window_signals(&identity), "target")
     }
 
     /// UIPI check for the window owning `target`: refuse when its
@@ -531,6 +618,7 @@ impl Body for WindowsBody {
         self.check_bounds(x, y)?;
         self.check_target(x, y)?;
         self.check_forbidden()?;
+        self.check_forbidden_at_point(x, y)?;
         self.check_uipi_at_point(x, y)?;
         self.verify_focus()?;
         Self::send(&[
@@ -545,6 +633,7 @@ impl Body for WindowsBody {
         self.check_bounds(x, y)?;
         self.check_target(x, y)?;
         self.check_forbidden()?;
+        self.check_forbidden_at_point(x, y)?;
         self.move_to(x, y)
     }
 
@@ -597,6 +686,7 @@ impl Body for WindowsBody {
         self.check_bounds(x, y)?;
         self.check_target(x, y)?;
         self.check_forbidden()?;
+        self.check_forbidden_at_point(x, y)?;
         self.check_uipi_at_point(x, y)?;
         self.verify_focus()?;
         self.move_to(x, y)?;
@@ -629,6 +719,8 @@ impl Body for WindowsBody {
         self.check_target(from_x, from_y)?;
         self.check_target(to_x, to_y)?;
         self.check_forbidden()?;
+        self.check_forbidden_at_point(from_x, from_y)?;
+        self.check_forbidden_at_point(to_x, to_y)?;
         self.check_uipi_at_point(from_x, from_y)?;
         self.verify_focus()?;
         self.move_to(from_x, from_y)?;
@@ -646,6 +738,7 @@ impl Body for WindowsBody {
         self.check_bounds(x, y)?;
         self.check_target(x, y)?;
         self.check_forbidden()?;
+        self.check_forbidden_at_point(x, y)?;
         self.check_uipi_at_point(x, y)?;
         self.verify_focus()?;
         self.move_to(x, y)?;
@@ -662,6 +755,7 @@ impl Body for WindowsBody {
         self.check_bounds(x, y)?;
         self.check_target(x, y)?;
         self.check_forbidden()?;
+        self.check_forbidden_at_point(x, y)?;
         self.check_uipi_at_point(x, y)?;
         self.verify_focus()?;
         self.move_to(x, y)?;
@@ -713,6 +807,15 @@ impl Body for WindowsBody {
             None
         } else {
             Some(foreground.0 as u64)
+        }
+    }
+
+    fn window_at(&mut self, x: i32, y: i32) -> Option<WindowIdentity> {
+        let window = unsafe { WindowFromPoint(POINT { x, y }) };
+        if window.is_invalid() {
+            None
+        } else {
+            Some(window_identity(window))
         }
     }
 

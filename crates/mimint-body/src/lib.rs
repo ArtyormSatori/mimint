@@ -44,7 +44,8 @@ pub use android::{
 };
 pub use body::{
     write_ppm, ActOutcome, Body, Framebuffer, FramebufferPool, PermissionState, Permissions,
-    PoolStats, ScreenRect,
+    PoolStats, ScreenRect, TargetSnapshot, TargetSnapshotSlot, WindowIdentity,
+    REVERIFY_GRID_MAX_MEAN_DIFF,
 };
 pub use captures::{
     append_audit_line, bodyctl_audit_line, captures_dir, ensure_captures_dir, shot_path_allowed,
@@ -55,14 +56,17 @@ pub use conformance::{
 };
 pub use error::BodyError;
 pub use file_oracle::FileOracle;
-pub use forbidden::{check_forbidden_window, is_forbidden_window};
-pub use guarded::{GuardedBody, RateLimits, StopFlag};
+pub use forbidden::{
+    check_forbidden_signals, check_forbidden_window, is_forbidden_signals, is_forbidden_window,
+    WindowSignals,
+};
+pub use guarded::{GuardedBody, RateLimits, StopFlag, TripInfo};
 #[cfg(target_os = "linux")]
 pub use hotkey::HotkeyListener;
 pub use hotkey::{chord_matches, grab_modifier_combinations, CHORD_MODIFIERS};
 #[cfg(target_os = "macos")]
 pub use macos::MacOsBody;
-pub use mock::{Fault, MockBody, MockEvent, MockOracle};
+pub use mock::{Fault, MockBody, MockEvent, MockOracle, MockWindow};
 pub use wayland::{
     MockPortal, PortalClient, PortalSession, SessionKinds, SessionTokenStore, WaylandBody,
     WaylandOracle,
