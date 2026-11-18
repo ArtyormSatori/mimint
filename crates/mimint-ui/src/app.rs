@@ -822,6 +822,11 @@ impl eframe::App for MimintApp {
             egui::Panel::left("sidebar")
                 .default_size(200.0)
                 .show(ui, |ui| {
+                    // Scrollable (fix pass): the profile
+                    // explanations + SOUL section overflow a
+                    // short window; without the scroll area
+                    // the lower sections are unreachable.
+                    egui::ScrollArea::vertical().show(ui, |ui| {
                     ui.heading("Cuộc trò chuyện");
                     ui.label("• Phiên hiện tại");
                     ui.separator();
@@ -966,6 +971,7 @@ impl eframe::App for MimintApp {
                     ui.heading("Chó robot (ESP32)");
                     ui.label("Trạng thái: chưa kết nối");
                     ui.label("Kết nối robot là việc Phase 7.");
+                    });
                 });
         }
 
