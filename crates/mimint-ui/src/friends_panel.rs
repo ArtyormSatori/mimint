@@ -395,11 +395,28 @@ fn handle_command(
 ) -> Result<(), MimintError> {
     match cmd {
         FriendsCommand::Pair { addr, flow, guest } => {
-            let mut stream = TcpStream::connect(&addr)
-                .map_err(|err| MimintError::Io(format!("cannot connect to {addr}: {err}")))?;
-            stream
-                .set_read_timeout(Some(Duration::from_secs(30)))
-                .map_err(|err| MimintError::Io(err.to_string()))?;
+            // F7-15 follow-up (found while screenshotting):
+            // every failure in this arm must report PairFailed.
+            // The old code returned Err on connect failure, and
+            // the worker's generic Err path only sent a Status
+            // event — so `pair_busy` stayed true forever and the
+            // "Ghép đôi" button stayed disabled after one
+            // failed attempt, with no way to retry.
+            let mut stream = match TcpStream::connect(&addr) {
+                Ok(stream) => stream,
+                Err(err) => {
+                    let _ = event_tx.send(FriendsEvent::PairFailed {
+                        error: format!("cannot connect to {addr}: {err}"),
+                    });
+                    return Ok(());
+                }
+            };
+            if let Err(err) = stream.set_read_timeout(Some(Duration::from_secs(30))) {
+                let _ = event_tx.send(FriendsEvent::PairFailed {
+                    error: err.to_string(),
+                });
+                return Ok(());
+            }
             let ui = PanelInitiatorUi::new(event_tx.clone());
             let wanted = if guest { Trust::Guest } else { Trust::Owner };
             match run_ceremony_initiator(

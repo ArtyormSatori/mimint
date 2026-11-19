@@ -30,7 +30,7 @@ pub const HUB_EXPOSURE_LAN_UNPAIRED: &str =
 /// the OTA accept loop is serving, so closing LAN without
 /// closing OTA can never be invisible again.
 pub const HUB_EXPOSURE_OTA_OPEN: &str =
-    "OTA đang mở — cổng 19132 vẫn nhận kiểm tra từ thiết bị XiaoZhi đã đăng ký UUID (đóng LAN sẽ đóng luôn OTA)";
+    "OTA đang mở — vẫn nhận kiểm tra từ thiết bị XiaoZhi đã đăng ký UUID (đóng LAN sẽ đóng luôn OTA)";
 
 /// Note shown with the "close LAN now" control (§5.1).
 pub const CLOSE_LAN_KEEPS_PAIRING: &str = "Đóng LAN không thu hồi pairing — các thiết bị đã pair vẫn còn trong danh sách và nối lại được khi bạn bật LAN.";
