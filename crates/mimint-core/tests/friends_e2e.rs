@@ -4187,6 +4187,47 @@ fn xiaozhi_fake_device_end_to_end() {
     hub.stop();
 }
 
+/// The XiaoZhi path on a LOOPBACK hub (listen_lan = false,
+/// the default): the WS listener must serve loopback
+/// connections. An earlier accept-loop gate refused ALL WS
+/// service unless LAN was on, so the lab path was dead on
+/// the default hub while the LAN-on test above still passed.
+#[test]
+fn xiaozhi_fake_device_loopback_hub() {
+    let hub_node = Node::new("xfe-loop");
+    let uuid = "xiao-zhi-test-loop-0001";
+    register_uuid(&hub_node, uuid);
+    let backend = MockBackend::new();
+    let config = HubConfig {
+        listen_lan: false,
+        lab_mode: true,
+        ..Default::default()
+    };
+    let hub = start_hub(&hub_node, config, backend.clone());
+    let brain: Arc<dyn Fn(&str) -> String + Send + Sync> =
+        Arc::new(|prompt: &str| format!("brain: {prompt}"));
+    hub.set_ws_handler(mimint_core::friends::context::make_ws_turn_handler(
+        Arc::clone(&brain),
+    ));
+    hub.install_v2_brain_turn(Arc::clone(&brain));
+    let ota = hub.ota_server();
+    let ws_addr = format!("127.0.0.1:{}", hub.xiaozhi_port());
+    let response = ota.check(uuid, &ws_addr, true).unwrap();
+    let mut device = FakeXiaoZhiDevice::connect(&ws_addr, uuid, &response.websocket.token)
+        .expect("fake device must connect to a loopback hub");
+    let hello_ack = device.read_text().unwrap();
+    assert!(
+        hello_ack.contains("\"hello\"") && hello_ack.contains("opus"),
+        "hello ack expected, got {hello_ack}"
+    );
+    device.send_text("turn from xiaozhi on loopback").unwrap();
+    let reply = device.read_text().unwrap();
+    assert!(
+        reply.contains("brain: turn from xiaozhi on loopback"),
+        "got {reply}"
+    );
+}
+
 #[test]
 fn v2_reference_client_handshake() {
     let a = Node::new("v2r-a");

@@ -502,26 +502,22 @@ impl Hub {
             if self.stop_flag.load(Ordering::SeqCst) {
                 return;
             }
-            if is_ws && !self.config.listen_lan {
-                // The XiaoZhi WS listener only serves while LAN
-                // is on (loopback-only hubs do not expose it).
-                std::thread::sleep(Duration::from_millis(50));
-                continue;
-            }
             match listener.accept() {
                 Ok((stream, addr)) => {
-                    // After `close_lan` the friends listener
-                    // (bound to 0.0.0.0 while LAN was on) must
-                    // refuse LAN connections, matching the
-                    // exposure state — otherwise the UI would
-                    // report loopback-only while LAN still
-                    // connects (found while writing
+                    // After `close_lan` the listeners (bound to
+                    // 0.0.0.0 while LAN was on) must refuse LAN
+                    // connections, matching the exposure state —
+                    // otherwise the UI would report loopback-only
+                    // while LAN still connects (found while
+                    // writing
                     // `hub_close_lan_lists_sessions_and_keeps_pairing`).
-                    // Loopback is always accepted.
-                    if !is_ws
-                        && !self.lan_listener_on.load(Ordering::SeqCst)
-                        && !addr.ip().is_loopback()
-                    {
+                    // Loopback is always accepted. (An earlier
+                    // version refused ALL WS service on
+                    // loopback-only hubs, which broke the XiaoZhi
+                    // lab path on the default hub — the WS
+                    // listener is already bound to 127.0.0.1
+                    // there, so the gate served no purpose.)
+                    if !self.lan_listener_on.load(Ordering::SeqCst) && !addr.ip().is_loopback() {
                         drop(stream);
                         continue;
                     }

@@ -756,10 +756,13 @@ fn cmd_fake_esp32(args: &FriendsArgs, rest: &[String]) -> Result<(), MimintError
                 .and_then(|w| w.get("url"))
                 .and_then(|u| u.as_str())
                 .unwrap_or("");
+            // The OTA URL is scheme://host:port/path?token=...:
+            // the fake device takes host:port only (it builds
+            // its own /xiaozhi path with the real token).
             let ws_addr = url
                 .trim_start_matches("wss://")
                 .trim_start_matches("ws://")
-                .split('?')
+                .split(['?', '/'])
                 .next()
                 .unwrap_or(&addr)
                 .to_string();
