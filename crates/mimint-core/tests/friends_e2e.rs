@@ -5526,3 +5526,39 @@ fn notebook_cross_agent_private_never_leaves() {
     );
     assert!(ctx.contains("sync me"));
 }
+
+/// F7-28: after this body rotates its identity key, pairings
+/// made with the old key are incomplete until re-paired, and
+/// already-revoked entries are deleted instead of lingering
+/// as stale rows.
+#[test]
+fn rotation_cleanup_marks_peers_incomplete_and_drops_revoked() {
+    let a = Node::new("rot-a");
+    let b = Node::new("rot-b");
+    let c = Node::new("rot-c");
+    pair_nodes(&a, &b, SasFlow::Compare);
+    pair_nodes(&c, &b, SasFlow::Compare);
+    // A completes a handshake (pairing complete); C is
+    // revoked before its first handshake.
+    let (sa, _sb) = handshake_pair(&a, &b);
+    drop(sa);
+    assert!(!b
+        .registry
+        .get_peer(&a.device_id())
+        .unwrap()
+        .unwrap()
+        .pairing_incomplete);
+    b.registry
+        .revoke_peer(&c.device_id(), b.clock.now_ms())
+        .unwrap();
+    let (marked, deleted) = b.registry.cleanup_after_rotation().unwrap();
+    assert_eq!(marked, 1, "the complete peer must be marked incomplete");
+    assert_eq!(deleted, 1, "the revoked entry must be deleted");
+    assert!(b
+        .registry
+        .get_peer(&a.device_id())
+        .unwrap()
+        .unwrap()
+        .pairing_incomplete);
+    assert!(b.registry.get_peer(&c.device_id()).unwrap().is_none());
+}
