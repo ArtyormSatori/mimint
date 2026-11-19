@@ -260,6 +260,20 @@ impl ApprovalRelay {
             .collect()
     }
 
+    /// Pending cards with the peer that must decide them
+    /// (F7-13): the panel shows both the hub that created the
+    /// card (the origin) and the responding device, so the user
+    /// never has to guess who is being asked.
+    pub fn pending_cards_detailed(&self) -> Vec<(ApprovalCard, String)> {
+        let now = self.clock.now_ms();
+        let pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
+        pending
+            .values()
+            .filter(|entry| !entry.consumed && now <= entry.card.expires_ms)
+            .map(|entry| (entry.card.clone(), entry.target_peer.clone()))
+            .collect()
+    }
+
     /// Drop expired cards, delivering Denied to their waiters.
     /// Returns the expired request ids.
     pub fn expire_stale(&self) -> Vec<String> {

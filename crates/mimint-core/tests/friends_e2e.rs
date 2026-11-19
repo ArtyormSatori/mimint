@@ -5217,10 +5217,13 @@ fn session_rekey_flood_rate_limited_receiver_stays_open() {
     // The receiver only processes rekey requests while
     // waiting in `recv` (same pump pattern as
     // `friends_rekey_works`): run it on a thread.
+    let pump_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let pump_done2 = Arc::clone(&pump_done);
     let pump = std::thread::spawn(move || {
         let mut sb = sb;
         let _ = sb.recv();
-        (sb.rekey_count(), sb.is_closed())
+        pump_done2.store(true, Ordering::SeqCst);
+        sb.rekey_count()
     });
     sa.initiate_rekey().unwrap();
     // Second rekey 0 s later: under the 5 s cooldown, the
@@ -5230,12 +5233,19 @@ fn session_rekey_flood_rate_limited_receiver_stays_open() {
         poll_audit_contains(&b, "rekey_rate_limited", 20),
         "excess rekey must be audited"
     );
+    // The receiver session must still be alive after the
+    // flood: its recv is still blocked (a failed session
+    // would have returned from recv already).
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert!(
+        !pump_done.load(Ordering::SeqCst),
+        "receiver session must stay open after the flood"
+    );
     // Dropping the sender closes the socket, so the pump's
     // recv returns and the thread can be joined.
     drop(sa);
-    let (sb_rekeys, sb_closed) = pump.join().unwrap();
+    let sb_rekeys = pump.join().unwrap();
     assert_eq!(sb_rekeys, 1, "receiver rekey count bounded");
-    assert!(!sb_closed, "receiver session must stay open");
 }
 
 /// F7-11: a handoff turn is visible while Running, its
@@ -5313,6 +5323,19 @@ fn handoff_turn_cancel_releases_lease_early() {
     // once — no lease_busy to the TTL.
     let package2 = make_package(&a, &b, "second task");
     offer_over_session(&mut session, &package2);
+    let mut pending2 = false;
+    for _ in 0..50 {
+        if hub_b
+            .pending_handoffs()
+            .iter()
+            .any(|item| item.package.package_id == package2.package_id)
+        {
+            pending2 = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(pending2, "second offer must become pending");
     hub_b
         .decide_handoff(&package2.package_id, true)
         .expect("second offer must be accepted: lease was freed");
@@ -5441,7 +5464,12 @@ fn handoff_strange_actuator_rejected_over_session() {
 fn soul_symlink_never_syncs_and_load_refuses() {
     let a = Node::new("ssy-a");
     let b = Node::new("ssy-b");
-    let target = a.dir.join("outside.md");
+    // The target lives in a subdir: it is not itself a
+    // soul file (only top-level .md files sync), so the only
+    // thing that could leak it is the symlink.
+    let target_dir = a.dir.join("not-soul");
+    std::fs::create_dir_all(&target_dir).unwrap();
+    let target = target_dir.join("outside.md");
     std::fs::write(
         &target,
         "# SOUL\n\nYou are an impostor soul.\n",

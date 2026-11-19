@@ -22,7 +22,9 @@ use mimint_core::friends::context::FriendsContext;
 use mimint_core::friends::esp32::esp32_status_label;
 use mimint_core::friends::esp32::Esp32Path;
 use mimint_core::friends::handoff::HandoffManager;
-use mimint_core::friends::handoff::{shared_notebook_context, HandoffOffer, HandoffReject};
+use mimint_core::friends::handoff::{
+    shared_notebook_context, HandoffOffer, HandoffReject, HANDOFF_ACTUATOR,
+};
 use mimint_core::friends::hub::Hub;
 use mimint_core::friends::identity::Identity;
 use mimint_core::friends::pairing::{
@@ -479,51 +481,58 @@ fn handle_command(
             }
         }
         FriendsCommand::CreateCard { target, action } => {
-            let prefs = ctx.registry.get_prefs(&target).unwrap_or_default();
-            let origin = CardOrigin {
-                device_id: ctx.identity.device_id().to_string(),
-                device_name: format!(
-                    "Thiết bị {}",
-                    &ctx.identity.device_id()[..8.min(ctx.identity.device_id().len())]
-                ),
-                agent_id: "agent-001".to_string(),
-                request_id: random_hex(16),
-                action,
-                detail: serde_json::json!({"source": "friends panel test card"}),
-            };
-            match ctx
-                .relay
-                .create_card(origin, &target, prefs.approve_allowed)
-            {
-                Ok((card, rx)) => {
-                    let _ = event_tx.send(FriendsEvent::Status(format!(
-                        "Đã tạo thẻ {} — đang chờ peer quyết định (tối đa 60 giây).",
-                        card.request_id
-                    )));
-                    match rx.recv_timeout(Duration::from_secs(65)) {
-                        Ok(outcome) => {
-                            let outcome = match outcome {
-                                DecisionOutcome::Approved => "approved",
-                                DecisionOutcome::Denied => "denied",
-                            };
-                            let _ = event_tx.send(FriendsEvent::CardDecided {
-                                request_id: card.request_id,
-                                outcome: outcome.to_string(),
-                            });
-                        }
-                        Err(_) => {
-                            let _ = event_tx.send(FriendsEvent::Status(
-                                "Thẻ hết hạn mà peer chưa quyết định.".to_string(),
-                            ));
+            // F7-12: the card wait (up to 65 s) runs on its OWN
+            // thread. It used to block this worker thread, so a
+            // card awaiting a decision queued every other
+            // friends operation behind it.
+            let relay = Arc::clone(&ctx.relay);
+            let registry = Arc::clone(&ctx.registry);
+            let identity = Arc::clone(&ctx.identity);
+            let event_tx = event_tx.clone();
+            std::thread::spawn(move || {
+                let prefs = registry.get_prefs(&target).unwrap_or_default();
+                let origin = CardOrigin {
+                    device_id: identity.device_id().to_string(),
+                    device_name: format!(
+                        "Thiết bị {}",
+                        &identity.device_id()[..8.min(identity.device_id().len())]
+                    ),
+                    agent_id: "agent-001".to_string(),
+                    request_id: random_hex(16),
+                    action,
+                    detail: serde_json::json!({"source": "friends panel test card"}),
+                };
+                match relay.create_card(origin, &target, prefs.approve_allowed) {
+                    Ok((card, rx)) => {
+                        let _ = event_tx.send(FriendsEvent::Status(format!(
+                            "Đã tạo thẻ {} — đang chờ peer quyết định (tối đa 60 giây).",
+                            card.request_id
+                        )));
+                        match rx.recv_timeout(Duration::from_secs(65)) {
+                            Ok(outcome) => {
+                                let outcome = match outcome {
+                                    DecisionOutcome::Approved => "approved",
+                                    DecisionOutcome::Denied => "denied",
+                                };
+                                let _ = event_tx.send(FriendsEvent::CardDecided {
+                                    request_id: card.request_id,
+                                    outcome: outcome.to_string(),
+                                });
+                            }
+                            Err(_) => {
+                                let _ = event_tx.send(FriendsEvent::Status(
+                                    "Thẻ hết hạn mà peer chưa quyết định.".to_string(),
+                                ));
+                            }
                         }
                     }
+                    Err(err) => {
+                        let _ = event_tx.send(FriendsEvent::Status(format!(
+                            "Không tạo được thẻ phê duyệt: {err}"
+                        )));
+                    }
                 }
-                Err(err) => {
-                    let _ = event_tx.send(FriendsEvent::Status(format!(
-                        "Không tạo được thẻ phê duyệt: {err}"
-                    )));
-                }
-            }
+            });
         }
         FriendsCommand::HandoffOffer {
             to,
@@ -541,7 +550,7 @@ fn handle_command(
                 Vec::new(),
                 Vec::new(),
                 notebook_context,
-                "default",
+                HANDOFF_ACTUATOR,
             )?;
             let stream = TcpStream::connect(&addr)
                 .map_err(|err| MimintError::Io(format!("cannot connect to {addr}: {err}")))?;
@@ -714,6 +723,17 @@ pub struct FriendsPanel {
     handoff_turn_reply: Option<String>,
     card_target: String,
     card_action: String,
+    /// F7-23: the registry was recreated after peers.db was
+    /// deleted — shown as a warning above the tabs.
+    peers_db_restored: bool,
+    /// F7-16: the initiator's separate fingerprint check —
+    /// ticked only after comparing the peer fingerprint with
+    /// the other device's screen. The confirm button stays
+    /// disabled until then.
+    sas_fingerprint_checked: bool,
+    /// F7-15: when the current pairing ceremony started, for
+    /// the 5-minute expiry countdown.
+    pair_started_ms: Option<u64>,
     rename_target: Option<String>,
     rename_text: String,
     diff_cache: HashMap<i64, Vec<String>>,
@@ -754,6 +774,9 @@ impl FriendsPanel {
             handoff_turn_reply: None,
             card_target: String::new(),
             card_action: "screenshot".to_string(),
+            peers_db_restored: ctx.peers_db_restored,
+            sas_fingerprint_checked: false,
+            pair_started_ms: None,
             rename_target: None,
             rename_text: String::new(),
             diff_cache: HashMap::new(),
@@ -780,7 +803,31 @@ impl FriendsPanel {
                 }
                 FriendsEvent::PairFailed { error } => {
                     self.pair_busy = false;
-                    self.status = format!("Ghép đôi thất bại: {error}");
+                    // F7-15: pairing errors name their cause and
+                    // say what to do next, instead of one generic
+                    // line.
+                    let lower = error.to_lowercase();
+                    if lower.contains("locked") {
+                        self.status = format!(
+                            "Ghép đôi bị khóa sau nhiều lần sai (lockout 15 phút): {error} — đợi hết 15 phút rồi thử lại, kiểm tra mã SAS kỹ trước khi bấm."
+                        );
+                    } else if lower.contains("sas")
+                        || lower.contains("mismatch")
+                        || lower.contains("mismatched")
+                    {
+                        self.status = format!(
+                            "Mã SAS không khớp: {error} — so sánh lại mã trên cả hai màn hình rồi thử lại từ đầu."
+                        );
+                    } else if lower.contains("expired")
+                        || lower.contains("timeout")
+                        || lower.contains("timed out")
+                    {
+                        self.status = format!(
+                            "Ceremony đã hết hạn (5 phút): {error} — bật lại chế độ ghép đôi ở phía hub rồi thử lại."
+                        );
+                    } else {
+                        self.status = format!("Ghép đôi thất bại: {error}");
+                    }
                 }
                 FriendsEvent::SasShown {
                     sas,
@@ -788,6 +835,11 @@ impl FriendsPanel {
                     device_id,
                     decision_tx,
                 } => {
+                    // A fresh SAS resets the initiator's
+                    // separate fingerprint check (F7-16) and
+                    // starts the ceremony countdown (F7-15).
+                    self.sas_fingerprint_checked = false;
+                    self.pair_started_ms = Some(Clock::system().now_ms());
                     self.pending_sas = Some(PendingSas {
                         sas,
                         fingerprint,
@@ -848,8 +900,15 @@ impl FriendsPanel {
                     self.status = format!("Giải quyết xung đột thất bại: {error}");
                 }
                 FriendsEvent::HandoffDone { device_id } => {
+                    // F7-04: the RECEIVER holds the lease now —
+                    // the sender's notice must not claim it
+                    // holds the lease. Also clears the
+                    // "Đang gửi…" status set at click time.
+                    if self.status.starts_with("Đang gửi handoff") {
+                        self.status.clear();
+                    }
                     self.handoff_notice = Some(format!(
-                        "Đã bàn giao cho {device_id:.8} — lease đang giữ, task dừng ở phía này."
+                        "Đã bàn giao cho {device_id:.8} — máy nhận đang giữ lease và tiếp tục task; phía này đã dừng task."
                     ));
                 }
                 FriendsEvent::HandoffFailed { error } => {
