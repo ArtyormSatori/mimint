@@ -355,6 +355,8 @@ impl FriendsContext {
     /// Open (or create) all friends state for one body.
     /// `backend` is the driver backend (the production one
     /// drives the `BodyActor`; tests pass a mock).
+    /// Open with the terminal listener UI (the default: a
+    /// human answers the ceremony prompts on stdin).
     #[allow(clippy::too_many_arguments)]
     pub fn open(
         data_dir: impl AsRef<Path>,
@@ -364,6 +366,31 @@ impl FriendsContext {
         backend: Arc<dyn DriverBackend>,
         audit: Option<Arc<AuditLog>>,
         clock: Clock,
+    ) -> Result<Self, MimintError> {
+        Self::open_with_ui(
+            data_dir,
+            config_path,
+            notebook_path,
+            hub_config,
+            backend,
+            audit,
+            clock,
+            Arc::new(TerminalListenerUi),
+        )
+    }
+
+    /// Open with an explicit ceremony listener UI (headless
+    /// demos pass `AutoListenerUi`; the GUI passes its own).
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_with_ui(
+        data_dir: impl AsRef<Path>,
+        config_path: impl AsRef<Path>,
+        notebook_path: impl AsRef<Path>,
+        hub_config: HubConfig,
+        backend: Arc<dyn DriverBackend>,
+        audit: Option<Arc<AuditLog>>,
+        clock: Clock,
+        ceremony_ui: Arc<dyn ListenerUi>,
     ) -> Result<Self, MimintError> {
         let data_dir = data_dir.as_ref().to_path_buf();
         let config_path = config_path.as_ref().to_path_buf();
@@ -405,7 +432,6 @@ impl FriendsContext {
             clock.clone(),
             audit.clone(),
         ));
-        let ceremony_ui: Arc<dyn ListenerUi> = Arc::new(TerminalListenerUi);
         let hub = Arc::new(Hub::new(
             hub_config,
             Arc::clone(&identity),
