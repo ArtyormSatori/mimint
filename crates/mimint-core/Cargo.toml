@@ -2,6 +2,7 @@
 name = "mimint-core"
 version = "0.1.0"
 edition = "2021"
+license = "Apache-2.0"
 description = "Mimint core: brain loop, guarded tools, notebook, provider registry (Phase 2)"
 
 [dependencies]

@@ -2,6 +2,7 @@
 name = "mimint-body"
 version = "0.1.0"
 edition = "2021"
+license = "Apache-2.0"
 description = "Mimint body contract (ACI): one action API per OS, conformance-tested (Phase 3)"
 
 [features]

@@ -3,7 +3,7 @@ name = "mimint-control"
 version = "0.1.0"
 edition = "2021"
 description = "Body actions as brain tools: the actor thread, frame store, tool surface, and verification hook (Phase 4, P4.1/P4.6)."
-license = "MIT OR Apache-2.0"
+license = "Apache-2.0"
 
 [dependencies]
 mimint-core = { path = "../mimint-core" }
