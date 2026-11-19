@@ -247,6 +247,14 @@ pub struct Hub {
     /// supplied by the app: the hub never invents ceremony
     /// decisions.
     ceremony_ui: Arc<dyn crate::friends::pairing::ListenerUi>,
+    /// The brain closure for v2 text turns (the same brain
+    /// as the XiaoZhi WS path — one brain, §8.5). Installed
+    /// by the app context alongside the WS handler.
+    v2_brain_turn: Mutex<Option<BrainTurn>>,
+    /// Approval cards already delivered to a peer (by
+    /// request id): a card is sent once, never re-sent on
+    /// every ping.
+    cards_sent: Mutex<std::collections::HashSet<String>>,
     /// The address OTA responses advertise (the hub's LAN IP
     /// when LAN is on, else loopback), set at `start()`.
     advertise_host: Mutex<String>,
@@ -288,6 +296,8 @@ impl Hub {
             driver_active: Mutex::new(None),
             ws_handler_slot: Mutex::new(None),
             ceremony_ui,
+            v2_brain_turn: Mutex::new(None),
+            cards_sent: Mutex::new(std::collections::HashSet::new()),
             advertise_host: Mutex::new("127.0.0.1".to_string()),
         }
     }
@@ -299,6 +309,27 @@ impl Hub {
     }
 
     /// The current exposure state (highest applies).
+    /// The friends port this hub listens on.
+    pub fn friends_port(&self) -> u16 {
+        self.config.friends_port
+    }
+
+    /// The XiaoZhi WS port this hub listens on.
+    pub fn xiaozhi_port(&self) -> u16 {
+        self.config.xiaozhi_port
+    }
+
+    /// The hub's OTA server (same instance the WS listener
+    /// consumes tokens from — tests must issue tokens here).
+    pub fn ota_server(&self) -> &Arc<OtaServer> {
+        &self.ota
+    }
+
+    /// The OTA port this hub listens on.
+    pub fn ota_port(&self) -> u16 {
+        self.config.ota_port
+    }
+
     pub fn exposure_state(&self) -> HubExposure {
         if self.controller.is_pairing_mode() {
             return HubExposure::PairingMode;
@@ -473,6 +504,21 @@ impl Hub {
             }
             match listener.accept() {
                 Ok((stream, addr)) => {
+                    // After `close_lan` the friends listener
+                    // (bound to 0.0.0.0 while LAN was on) must
+                    // refuse LAN connections, matching the
+                    // exposure state — otherwise the UI would
+                    // report loopback-only while LAN still
+                    // connects (found while writing
+                    // `hub_close_lan_lists_sessions_and_keeps_pairing`).
+                    // Loopback is always accepted.
+                    if !is_ws
+                        && !self.lan_listener_on.load(Ordering::SeqCst)
+                        && !addr.ip().is_loopback()
+                    {
+                        drop(stream);
+                        continue;
+                    }
                     if self.pending_handshakes.load(Ordering::SeqCst) >= HUB_MAX_PENDING_HANDSHAKES
                     {
                         drop(stream);
@@ -640,6 +686,55 @@ impl Hub {
         result
     }
 
+    /// Send pending approval cards to this peer (§6.2): the
+    /// hub pushes each card once, only to an owner peer that
+    /// explicitly opted in to peer approval. Called when the
+    /// session opens and whenever the peer pings — the session
+    /// loop blocks on `recv`, so peer traffic is the wake-up
+    /// for cards created after connect (the peer app pings on
+    /// connect and periodically; delivery is well inside the
+    /// 60s decision deadline either way).
+    fn deliver_pending_cards(
+        &self,
+        session: &mut Session,
+        peer: &crate::friends::registry::PeerEntry,
+    ) {
+        if peer.trust != crate::friends::registry::Trust::Owner {
+            return;
+        }
+        let allowed = self
+            .registry
+            .get_prefs(&peer.device_id)
+            .map(|prefs| prefs.approve_allowed)
+            .unwrap_or(false);
+        if !allowed {
+            return;
+        }
+        let cards = self.relay.pending_cards_for(&peer.device_id);
+        if cards.is_empty() {
+            return;
+        }
+        let mut sent = self.cards_sent.lock().unwrap_or_else(|p| p.into_inner());
+        for card in cards {
+            if sent.contains(&card.request_id) {
+                continue;
+            }
+            let Ok(bytes) = serde_json::to_vec(&card) else {
+                continue;
+            };
+            if session.send(MessageKind::ApprovalCard, &bytes).is_ok() {
+                sent.insert(card.request_id.clone());
+                self.audit(
+                    "approval_card_sent",
+                    serde_json::json!({
+                        "peer_device_id": peer.device_id,
+                        "request_id": card.request_id,
+                    }),
+                );
+            }
+        }
+    }
+
     /// The post-handshake message loop for one session.
     fn session_loop(
         self: &Arc<Self>,
@@ -647,6 +742,9 @@ impl Hub {
         peer: &crate::friends::registry::PeerEntry,
     ) -> Result<(), MimintError> {
         let peer_device_id = peer.device_id.clone();
+        // Cards created before this session opened go out
+        // immediately (§6.2).
+        self.deliver_pending_cards(&mut session, peer);
         loop {
             if self.stop_flag.load(Ordering::SeqCst) {
                 return Ok(());
@@ -657,9 +755,22 @@ impl Hub {
             };
             match kind {
                 MessageKind::Ping => {
+                    // A ping is the wake-up for cards created
+                    // after this session opened (§6.2).
+                    self.deliver_pending_cards(&mut session, peer);
                     let _ = session.send(MessageKind::Pong, &[]);
                 }
                 MessageKind::SyncOffer => {
+                    // Guests never sync (§3.5, T7): trust
+                    // boundary, independent of the address
+                    // boundary. Deny + audit, close the session.
+                    if peer.trust == Trust::Guest {
+                        self.audit(
+                            "sync_refused_guest",
+                            serde_json::json!({"peer_device_id": peer_device_id}),
+                        );
+                        return Ok(());
+                    }
                     let offer: crate::friends::sync::SyncOffer = serde_json::from_slice(&payload)
                         .unwrap_or(crate::friends::sync::SyncOffer {
                             v: PROTOCOL_VERSION,
@@ -679,6 +790,32 @@ impl Hub {
                     self.handle_driver_request(&mut session, peer, &payload);
                 }
                 MessageKind::ApprovalDecision => {
+                    // Guests never approve (§3.5, T7).
+                    if peer.trust == Trust::Guest {
+                        self.audit(
+                            "approval_refused_guest",
+                            serde_json::json!({"peer_device_id": peer_device_id}),
+                        );
+                        return Ok(());
+                    }
+                    // Opt-in (§6.2, check 1): a decision from a
+                    // peer that never opted in to peer approval
+                    // is refused — the relay alone cannot know
+                    // this, because the card was created while
+                    // the peer WAS opted in (found while writing
+                    // `approve_requires_explicit_peer_opt_in`).
+                    let opted_in = self
+                        .registry
+                        .get_prefs(&peer_device_id)
+                        .map(|prefs| prefs.approve_allowed)
+                        .unwrap_or(false);
+                    if !opted_in {
+                        self.audit(
+                            "approval_refused_not_opted_in",
+                            serde_json::json!({"peer_device_id": peer_device_id}),
+                        );
+                        return Ok(());
+                    }
                     let decision: ApprovalDecision = match serde_json::from_slice(&payload) {
                         Ok(decision) => decision,
                         Err(_) => continue,
@@ -695,9 +832,25 @@ impl Hub {
                     return Ok(());
                 }
                 MessageKind::HandoffOffer => {
+                    // Guests never send or receive handoffs
+                    // (§3.5, §7).
+                    if peer.trust == Trust::Guest {
+                        self.audit(
+                            "handoff_refused_guest",
+                            serde_json::json!({"peer_device_id": peer_device_id}),
+                        );
+                        return Ok(());
+                    }
                     self.handle_handoff_offer(&mut session, peer, &payload);
                 }
                 MessageKind::HandoffAccept => {
+                    if peer.trust == Trust::Guest {
+                        self.audit(
+                            "handoff_refused_guest",
+                            serde_json::json!({"peer_device_id": peer_device_id}),
+                        );
+                        return Ok(());
+                    }
                     if let Ok(accept) = serde_json::from_slice::<HandoffAccept>(&payload) {
                         self.handoff.mark_handed_off(&accept.package_id);
                     }
@@ -715,7 +868,33 @@ impl Hub {
                 }
                 MessageKind::HandoffComplete => {
                     if let Ok(complete) = serde_json::from_slice::<HandoffComplete>(&payload) {
-                        self.handoff.release_lease("default", &complete.lease_id);
+                        // The complete message carries no
+                        // actuator: release by lease id, and
+                        // return the task to the sender — without
+                        // clearing the handed-off mark the sender
+                        // could never act on the task again
+                        // (found while writing
+                        // `handoff_complete_ack_returns_lease`).
+                        self.handoff.release_lease_by_id(&complete.lease_id);
+                        self.handoff.clear_handed_off_package(&complete.package_id);
+                    }
+                }
+                MessageKind::SyncPush => {
+                    // Guests never sync (§3.5, T7).
+                    if peer.trust == Trust::Guest {
+                        self.audit(
+                            "sync_refused_guest",
+                            serde_json::json!({"peer_device_id": peer_device_id}),
+                        );
+                        return Ok(());
+                    }
+                    // A bare sync_push outside an exchange is
+                    // the v2 text turn (the fake/reference v2
+                    // client reuses this kind as its text
+                    // carrier — see esp32.rs). A real sync push
+                    // only travels inside run_sync_exchange.
+                    if !self.handle_v2_text_turn(&mut session, peer, &payload) {
+                        return Ok(());
                     }
                 }
                 MessageKind::RevokeNotice => {
@@ -733,6 +912,66 @@ impl Hub {
                 }
             }
         }
+    }
+
+    /// Answer one v2 text turn through the shared brain.
+    /// Returns false when the session must close (not a text
+    /// turn, or no brain installed — fail-closed).
+    fn handle_v2_text_turn(
+        &self,
+        session: &mut Session,
+        peer: &crate::friends::registry::PeerEntry,
+        payload: &[u8],
+    ) -> bool {
+        let value: serde_json::Value = match serde_json::from_slice(payload) {
+            Ok(value) => value,
+            Err(_) => {
+                self.audit(
+                    "unexpected_sync_push",
+                    serde_json::json!({"peer_device_id": peer.device_id}),
+                );
+                return false;
+            }
+        };
+        let text = match value.get("type").and_then(|t| t.as_str()) {
+            Some("text") => value
+                .get("text")
+                .and_then(|t| t.as_str())
+                .unwrap_or("")
+                .to_string(),
+            _ => {
+                self.audit(
+                    "unexpected_sync_push",
+                    serde_json::json!({"peer_device_id": peer.device_id}),
+                );
+                return false;
+            }
+        };
+        let brain = self
+            .v2_brain_turn
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        let Some(brain) = brain else {
+            self.audit(
+                "v2_text_no_brain",
+                serde_json::json!({"peer_device_id": peer.device_id}),
+            );
+            return false;
+        };
+        let output = crate::friends::esp32::handle_esp32_turn(
+            |prompt| brain(prompt),
+            &crate::friends::esp32::Esp32Input {
+                source: crate::friends::esp32::Esp32Path::V2,
+                device_uuid: peer.device_id.clone(),
+                text,
+                audio: Vec::new(),
+            },
+        );
+        let reply = serde_json::json!({"type": "text", "text": output.text});
+        session
+            .send(MessageKind::SyncPush, &serde_json::to_vec(&reply).unwrap())
+            .is_ok()
     }
 
     fn handle_driver_request(
@@ -830,6 +1069,19 @@ impl Hub {
         let verified = self
             .handoff
             .verify_package(package, &sender_pub, self.identity.device_id());
+        if let Err(err) = &verified {
+            // §7.3 step 4: a forged package is audited, not
+            // just rejected.
+            if err.to_string().contains("signature invalid") {
+                self.audit(
+                    "handoff_forged",
+                    serde_json::json!({
+                        "peer_device_id": peer.device_id,
+                        "package_id": package.package_id,
+                    }),
+                );
+            }
+        }
         let accept = match verified {
             Ok(()) => match self.handoff.acquire_lease(package) {
                 Ok(lease) => Some(HandoffAccept {
@@ -917,6 +1169,55 @@ impl Hub {
     }
 
     /// Install the WS turn handler (app context only).
+    /// Install the brain closure for v2 text turns. The app
+    /// context installs the same closure it gives the XiaoZhi
+    /// WS handler, so both ESP32 paths share one brain (§8.5).
+    pub fn install_v2_brain_turn(&self, brain_turn: BrainTurn) {
+        let mut slot = self.v2_brain_turn.lock().unwrap_or_else(|p| p.into_inner());
+        *slot = Some(brain_turn);
+    }
+
+    /// Run one driver method through the same gate the
+    /// friends session uses (role allow-list + backend). Used
+    /// by the XiaoZhi WS path for MCP servo calls (§8.4).
+    /// The driver indicator is a friends-session concern and
+    /// is not updated here (the device drives its own body).
+    /// Execute a device (servo/MCP) method: validated
+    /// against the device allow-list (§8.4 — clamping +
+    /// never-callable), then run on the backend with the
+    /// CLAMPED params. This is a different allow-list from
+    /// the desktop driver methods (§5.3); the two must never
+    /// be conflated (found while running
+    /// `xiaozhi_fake_device_end_to_end`: `servo.move` was
+    /// refused as `unknown_method` by the driver list).
+    pub fn execute_servo_method(
+        &self,
+        caller: crate::friends::servo::McpCaller,
+        method: &str,
+        params: &serde_json::Value,
+    ) -> Result<serde_json::Value, MimintError> {
+        let validated = crate::friends::servo::validate_servo_command(
+            caller,
+            &crate::friends::servo::ServoCommand {
+                method: method.to_string(),
+                params: params.clone(),
+            },
+        )?;
+        self.backend.execute(&validated.method, &validated.params)
+    }
+
+    pub fn execute_driver_method(
+        &self,
+        trust: crate::friends::registry::Trust,
+        method: &str,
+        params: &serde_json::Value,
+    ) -> Result<serde_json::Value, MimintError> {
+        crate::friends::hub::check_driver_method(trust, method).map_err(|code| {
+            MimintError::Config(format!("method '{method}' is not allowed: {code}"))
+        })?;
+        self.backend.execute(method, params)
+    }
+
     pub fn set_ws_handler(&self, handler: WsTurnHandler) {
         let mut slot = self
             .ws_handler_slot
@@ -925,6 +1226,10 @@ impl Hub {
         *slot = Some(handler);
     }
 }
+
+/// One brain closure: text in, reply text out. Shared
+/// by the XiaoZhi WS handler and the v2 text path (§8.5).
+pub type BrainTurn = Arc<dyn Fn(&str) -> String + Send + Sync>;
 
 /// The machine's LAN IP, via the standard UDP-connect trick
 /// (no packet is sent). Used for the address OTA responses

@@ -327,7 +327,7 @@ impl SyncEngine {
         let existing = self.registry.get_local_version(sync_id)?;
         if let Some(row) = existing {
             if row.hash == hash {
-                return Ok(SyncRecord::build(
+                let record = SyncRecord::build(
                     sync_id.to_string(),
                     kind,
                     row.version,
@@ -336,7 +336,14 @@ impl SyncEngine {
                     origin_device.to_string(),
                     self.now_ms(),
                     Some(body),
-                ));
+                );
+                // Enforce the 256 KiB cap here, on the sending
+                // side: `to_bytes` is the only place that
+                // checks it, and the offer/push path never calls
+                // it, so an oversize record used to sail through
+                // unchecked (found by `sync_record_size_cap`).
+                record.to_bytes()?;
+                return Ok(record);
             }
             // Changed content: chain from the recorded version.
             let version = VersionId::new(self.tick(), &self.device_id);
@@ -350,6 +357,7 @@ impl SyncEngine {
                 self.now_ms(),
                 Some(body),
             );
+            record.to_bytes()?;
             self.registry.set_local_version(&LocalVersionRow {
                 sync_id: sync_id.to_string(),
                 kind: kind.as_str().to_string(),
@@ -385,6 +393,7 @@ impl SyncEngine {
             self.now_ms(),
             Some(body),
         );
+        record.to_bytes()?;
         self.registry.set_local_version(&LocalVersionRow {
             sync_id: sync_id.to_string(),
             kind: kind.as_str().to_string(),
@@ -405,7 +414,17 @@ impl SyncEngine {
         let mut names: Vec<String> = Vec::new();
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
-            if crate::soul::is_valid_soul_file_name(&name) && name != crate::soul::SOUL_HISTORY_FILE
+            // Only Markdown files are soul files. The data
+            // directory also holds the identity key, the
+            // registry DB, the audit log and whatever else the
+            // user keeps there; `is_valid_soul_file_name`
+            // accepts any bare name, so without this filter a
+            // vault/secret file dropped in the data directory
+            // would sync to the peer as a "soul" record (found
+            // by `sync_canary_secret_never_in_payload`).
+            if name.ends_with(".md")
+                && crate::soul::is_valid_soul_file_name(&name)
+                && name != crate::soul::SOUL_HISTORY_FILE
             {
                 names.push(name);
             }

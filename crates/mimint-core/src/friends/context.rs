@@ -17,7 +17,7 @@ use crate::error::MimintError;
 use crate::friends::approval::ApprovalRelay;
 use crate::friends::esp32::{handle_esp32_turn, Esp32Input, Esp32Path};
 use crate::friends::handoff::HandoffManager;
-use crate::friends::hub::{DriverBackend, Hub, HubConfig};
+use crate::friends::hub::{BrainTurn, DriverBackend, Hub, HubConfig};
 use crate::friends::identity::{DeviceKeyStore, Identity};
 use crate::friends::ota::OtaServer;
 use crate::friends::pairing::{
@@ -25,6 +25,7 @@ use crate::friends::pairing::{
     ListenerUi, PairingController, SasFlow, SasOutcome,
 };
 use crate::friends::registry::{DeviceRegistry, Trust};
+use crate::friends::servo::McpCaller;
 use crate::friends::sync::{ProfileSyncSink, SyncEngine, SyncSources};
 use crate::friends::todos::TodoPlanStore;
 use crate::friends::util::Clock;
@@ -292,7 +293,11 @@ impl InitiatorUi for TerminalInitiatorUi {
 
 /// Demo-only auto-confirm UI: accepts everything without
 /// asking. NEVER used outside demos/tests — the CLI prints a
-/// warning whenever it is active.
+/// warning whenever it is active. In the Typing flow it types
+/// an empty string — it cannot know the SAS the user read on
+/// the initiator side — so the Typing flow needs a UI that
+/// carries the SAS (for example the channel UI used in the
+/// integration tests), never this one.
 pub struct AutoListenerUi {
     pub trust: Trust,
 }
@@ -367,7 +372,18 @@ impl FriendsContext {
         let identity = Arc::new(DeviceKeyStore::in_data_dir(&data_dir).ensure()?);
         let registry = Arc::new(DeviceRegistry::open(data_dir.join("peers.db"))?);
         let controller = Arc::new(PairingController::new(clock.clone()));
-        let relay = Arc::new(ApprovalRelay::new(clock.clone(), audit.clone()));
+        let relay_registry = Arc::clone(&registry);
+        let relay = Arc::new(ApprovalRelay::new_with_lookup(
+            clock.clone(),
+            audit.clone(),
+            Some(Arc::new(move |id: &str| {
+                relay_registry
+                    .get_peer(id)
+                    .ok()
+                    .flatten()
+                    .map(|peer| peer.name)
+            })),
+        ));
         let handoff = Arc::new(HandoffManager::new(clock.clone(), audit.clone()));
         let notebook = Arc::new(Notebook::open(notebook_path.as_ref())?);
         let sources = SyncSources {
@@ -425,61 +441,144 @@ impl FriendsContext {
     /// WS turn goes through the SAME brain adapter as the v2
     /// path (`handle_esp32_turn`). `brain_turn` is one turn
     /// of the body brain on the received text.
-    pub fn install_ws_handler(&self, brain_turn: Arc<dyn Fn(&str) -> String + Send + Sync>) {
-        let hub = Arc::clone(&self.hub);
-        let handler = Arc::new(
-            move |_hub: &Arc<Hub>, mut conn: WsConnection, uuid: String| loop {
-                match conn.read_frame() {
-                    Ok(WsFrame::Text(bytes)) => {
-                        let text = String::from_utf8_lossy(&bytes).into_owned();
-                        let value: serde_json::Value =
-                            serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
-                        let input_text = value
-                            .get("text")
-                            .and_then(serde_json::Value::as_str)
-                            .unwrap_or("")
-                            .to_string();
-                        let output = handle_esp32_turn(
-                            |prompt| brain_turn(prompt),
-                            &Esp32Input {
-                                source: Esp32Path::XiaoZhi,
-                                device_uuid: uuid.clone(),
-                                text: input_text,
-                                audio: Vec::new(),
-                            },
-                        );
-                        let reply = serde_json::json!({"type": "text", "text": output.text});
-                        let _ = conn.write_frame(&WsFrame::Text(
-                            serde_json::to_string(&reply).unwrap().into_bytes(),
-                        ));
-                    }
-                    Ok(WsFrame::Binary(audio)) => {
-                        let output = handle_esp32_turn(
-                            |prompt| brain_turn(prompt),
-                            &Esp32Input {
-                                source: Esp32Path::XiaoZhi,
-                                device_uuid: uuid.clone(),
-                                text: String::new(),
-                                audio,
-                            },
-                        );
-                        let reply = serde_json::json!({"type": "text", "text": output.text});
-                        let _ = conn.write_frame(&WsFrame::Text(
-                            serde_json::to_string(&reply).unwrap().into_bytes(),
-                        ));
-                    }
-                    Ok(WsFrame::Ping(payload)) => {
-                        let _ = conn.write_frame(&WsFrame::Pong(payload));
-                    }
-                    Ok(WsFrame::Pong(_)) => {}
-                    Ok(WsFrame::Close(_)) => {
-                        conn.close(1000, "bye");
-                        return;
-                    }
-                    Err(_) => return,
-                }
-            },
-        );
-        hub.set_ws_handler(handler);
+    pub fn install_ws_handler(&self, brain_turn: BrainTurn) {
+        // The v2 path shares this exact brain closure (one
+        // brain, §8.5): the hub answers v2 text turns with it.
+        self.hub.install_v2_brain_turn(Arc::clone(&brain_turn));
+        self.hub.set_ws_handler(make_ws_turn_handler(brain_turn));
     }
+}
+
+/// The XiaoZhi WS turn loop (§8.5 message table), built from
+/// one brain closure. Shared by the app context and the
+/// integration test so the fake device exercises the exact
+/// production handler — never a test-only copy.
+pub fn make_ws_turn_handler(brain_turn: BrainTurn) -> crate::friends::hub::WsTurnHandler {
+    Arc::new(
+        move |hub: &Arc<Hub>, mut conn: WsConnection, uuid: String| loop {
+            match conn.read_frame() {
+                Ok(WsFrame::Text(bytes)) => {
+                    let text = String::from_utf8_lossy(&bytes).into_owned();
+                    let value: serde_json::Value =
+                        serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
+                    let msg_type = value.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                    match msg_type {
+                        // Hello: answer with the audio
+                        // config ack (§8.5), no brain call.
+                        "hello" => {
+                            let ack = serde_json::json!({
+                                "type": "hello",
+                                "audio": {
+                                    "codec": "opus",
+                                    "sample_rate": 16000,
+                                    "channels": 1
+                                },
+                            });
+                            let _ = conn.write_frame(&WsFrame::Text(
+                                serde_json::to_string(&ack).unwrap().into_bytes(),
+                            ));
+                        }
+                        // MCP tools/call (§8.4/§8.5): the hub
+                        // is the MCP client — allow-list +
+                        // clamp first, never reboot/upgrade.
+                        "mcp" => {
+                            let method = value
+                                .get("method")
+                                .and_then(|m| m.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            let params = value
+                                .get("params")
+                                .cloned()
+                                .unwrap_or(serde_json::Value::Null);
+                            // Servo/MCP methods go through the
+                            // DEVICE allow-list (§8.4), not the
+                            // desktop driver list (§5.3).
+                            let result =
+                                hub.execute_servo_method(McpCaller::Device, &method, &params);
+                            let reply = match result {
+                                Ok(result) => serde_json::json!({
+                                    "type": "mcp_result",
+                                    "ok": true,
+                                    "result": result,
+                                }),
+                                Err(err) => serde_json::json!({
+                                    "type": "mcp_result",
+                                    "ok": false,
+                                    "error": err.to_string(),
+                                }),
+                            };
+                            let _ = conn.write_frame(&WsFrame::Text(
+                                serde_json::to_string(&reply).unwrap().into_bytes(),
+                            ));
+                        }
+                        // System messages (reboot/upgrade):
+                        // never executed by the hub (§8.4).
+                        "system" => {}
+                        // Text turn (or plain text without a
+                        // JSON envelope): one brain turn, then
+                        // the turn's emotion (§8.5).
+                        "text" | "" => {
+                            let input_text = if msg_type == "text" {
+                                value
+                                    .get("text")
+                                    .and_then(|t| t.as_str())
+                                    .unwrap_or("")
+                                    .to_string()
+                            } else {
+                                text.clone()
+                            };
+                            let output = handle_esp32_turn(
+                                |prompt| brain_turn(prompt),
+                                &Esp32Input {
+                                    source: Esp32Path::XiaoZhi,
+                                    device_uuid: uuid.clone(),
+                                    text: input_text,
+                                    audio: Vec::new(),
+                                },
+                            );
+                            let reply = serde_json::json!({"type": "text", "text": output.text});
+                            let _ = conn.write_frame(&WsFrame::Text(
+                                serde_json::to_string(&reply).unwrap().into_bytes(),
+                            ));
+                            let emotion = serde_json::json!({
+                                "type": "llm.emotion",
+                                "emotion": "neutral",
+                            });
+                            let _ = conn.write_frame(&WsFrame::Text(
+                                serde_json::to_string(&emotion).unwrap().into_bytes(),
+                            ));
+                        }
+                        // Unknown message: ignore, stay open
+                        // (§8.5) — never crash on it.
+                        _ => {}
+                    }
+                }
+                Ok(WsFrame::Binary(audio)) => {
+                    let output = handle_esp32_turn(
+                        |prompt| brain_turn(prompt),
+                        &Esp32Input {
+                            source: Esp32Path::XiaoZhi,
+                            device_uuid: uuid.clone(),
+                            text: String::new(),
+                            audio,
+                        },
+                    );
+                    let reply = serde_json::json!({"type": "text", "text": output.text});
+                    let _ = conn.write_frame(&WsFrame::Text(
+                        serde_json::to_string(&reply).unwrap().into_bytes(),
+                    ));
+                }
+                Ok(WsFrame::Ping(payload)) => {
+                    let _ = conn.write_frame(&WsFrame::Pong(payload));
+                }
+                Ok(WsFrame::Pong(_)) => {}
+                Ok(WsFrame::Close(_)) => {
+                    conn.close(1000, "bye");
+                    return;
+                }
+                Err(_) => return,
+            }
+        },
+    )
 }

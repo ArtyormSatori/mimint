@@ -85,19 +85,36 @@ struct PendingCard {
     consumed: bool,
 }
 
+/// Display-name lookup for a deciding peer, used only
+/// for the `deciding_device_name` audit field (§6.3).
+pub type PeerNameLookup = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
+
 /// The relay: pending cards + decision verification.
 pub struct ApprovalRelay {
     pending: Mutex<HashMap<String, PendingCard>>,
     clock: Clock,
     audit: Option<Arc<AuditLog>>,
+    /// Optional display-name lookup for the deciding peer
+    /// (registry-backed in production). Used only for the
+    /// `deciding_device_name` audit field (§6.3).
+    peer_name_lookup: Option<PeerNameLookup>,
 }
 
 impl ApprovalRelay {
     pub fn new(clock: Clock, audit: Option<Arc<AuditLog>>) -> Self {
+        Self::new_with_lookup(clock, audit, None)
+    }
+
+    pub fn new_with_lookup(
+        clock: Clock,
+        audit: Option<Arc<AuditLog>>,
+        peer_name_lookup: Option<PeerNameLookup>,
+    ) -> Self {
         Self {
             pending: Mutex::new(HashMap::new()),
             clock,
             audit,
+            peer_name_lookup,
         }
     }
 
@@ -218,6 +235,20 @@ impl ApprovalRelay {
         pending.remove(request_id).is_some()
     }
 
+    /// Pending (undecided, unexpired) cards for one peer, for
+    /// hub delivery (§6.2).
+    pub fn pending_cards_for(&self, target_peer: &str) -> Vec<ApprovalCard> {
+        let now = self.clock.now_ms();
+        let pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
+        pending
+            .values()
+            .filter(|entry| {
+                entry.target_peer == target_peer && !entry.consumed && now <= entry.card.expires_ms
+            })
+            .map(|entry| entry.card.clone())
+            .collect()
+    }
+
     /// Pending (undecided, unexpired) cards, for the UI.
     pub fn pending_cards(&self) -> Vec<ApprovalCard> {
         let now = self.clock.now_ms();
@@ -266,7 +297,16 @@ impl ApprovalRelay {
                     "origin_device_name": card.device_name,
                     "origin_agent_id": card.agent_id,
                     "origin_request_id": card.request_id,
-                    "deciding_peer": from_peer,
+                    // §6.3 attribution: who decided, by name,
+                    // and on which channel. The name falls back
+                    // to the device id when no lookup is set.
+                    "deciding_device_id": from_peer,
+                    "deciding_device_name": self
+                        .peer_name_lookup
+                        .as_ref()
+                        .and_then(|lookup| lookup(from_peer))
+                        .unwrap_or_else(|| from_peer.to_string()),
+                    "decision_channel": "peer",
                     "action": card.action,
                     "decision": decision,
                 }),

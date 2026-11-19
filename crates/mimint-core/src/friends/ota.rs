@@ -27,7 +27,7 @@
 
 use crate::audit::AuditLog;
 use crate::error::MimintError;
-use crate::friends::address::is_accepted_address;
+use crate::friends::address::{is_accepted_address, is_cgnat, is_unique_local};
 use crate::friends::registry::DeviceRegistry;
 use crate::friends::util::{hex_encode, random_bytes, Clock};
 use serde::{Deserialize, Serialize};
@@ -74,7 +74,17 @@ pub fn build_websocket_url(hub_addr: &str, lab_mode: bool) -> Result<String, Mim
             "OTA refuses hub address {hub_addr}: not a private/tailnet address"
         )));
     }
-    let scheme = if lab_mode { "ws" } else { "wss" };
+    // Lab mode lifts the TLS requirement ONLY for
+    // loopback/tailnet addresses (§8.2): a private LAN
+    // address still gets wss:// even in lab mode (the hub
+    // LAN certificate is BLOCKED work — XiaoZhi LAN outside
+    // the lab is not served in Phase 7).
+    let lab_plain = lab_mode
+        && match ip {
+            IpAddr::V4(v4) => v4.is_loopback() || is_cgnat(v4),
+            IpAddr::V6(v6) => v6.is_loopback() || is_unique_local(v6),
+        };
+    let scheme = if lab_plain { "ws" } else { "wss" };
     let _ = port;
     Ok(format!("{scheme}://{hub_addr}/xiaozhi"))
 }
@@ -325,10 +335,11 @@ mod tests {
         assert!(build_websocket_url("8.8.8.8:19121", true).is_err());
         // Production aimed at a public address: refused.
         assert!(build_websocket_url("8.8.8.8:19121", false).is_err());
-        // Lab mode on a LAN address is allowed (tailnet/LAN
-        // are the lab's trusted zone), but the scheme is ws.
+        // Lab mode on a LAN address: the address is
+        // accepted, but the lab ws:// exception covers only
+        // loopback/tailnet (§8.2) — LAN still gets wss://.
         let lab_lan = build_websocket_url("192.168.1.10:19121", true).unwrap();
-        assert!(lab_lan.starts_with("ws://"));
+        assert!(lab_lan.starts_with("wss://"), "got {lab_lan}");
     }
 
     #[test]

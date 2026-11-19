@@ -299,6 +299,28 @@ impl HandoffManager {
         }
     }
 
+    /// Release a lease by its id, without knowing the actuator
+    /// (the `handoff_complete` message carries no actuator).
+    /// Returns true when a matching lease was held.
+    pub fn release_lease_by_id(&self, lease_id: &str) -> bool {
+        let mut leases = self.leases.lock().unwrap_or_else(|p| p.into_inner());
+        let actuator = leases
+            .iter()
+            .find(|(_, lease)| lease.lease_id == lease_id)
+            .map(|(actuator, _)| actuator.clone());
+        match actuator {
+            Some(actuator) => {
+                leases.remove(&actuator);
+                self.audit(
+                    "handoff_lease_released",
+                    serde_json::json!({"actuator": actuator, "lease_id": lease_id}),
+                );
+                true
+            }
+            None => false,
+        }
+    }
+
     /// The current lease for an actuator (expired leases are
     /// dropped lazily and read as absent).
     pub fn lease_for(&self, actuator: &str) -> Option<Lease> {
@@ -333,6 +355,19 @@ impl HandoffManager {
 
     /// Forget handed-off state (e.g. after a restart — leases
     /// do not survive restarts, and neither does this).
+    /// Clear the handed-off mark for ONE package (the
+    /// `handoff_complete` ack returns the lease to the sender:
+    /// the sender may act on this task again). Unlike
+    /// `clear_handed_off`, this touches nothing else.
+    pub fn clear_handed_off_package(&self, package_id: &str) {
+        let mut handed = self.handed_off.lock().unwrap_or_else(|p| p.into_inner());
+        handed.remove(package_id);
+        self.audit(
+            "handoff_lease_returned",
+            serde_json::json!({"package_id": package_id}),
+        );
+    }
+
     pub fn clear_handed_off(&self) {
         let mut handed = self.handed_off.lock().unwrap_or_else(|p| p.into_inner());
         handed.clear();

@@ -169,6 +169,15 @@ impl FakeXiaoZhiDevice {
         self.send_json(&serde_json::json!({"type": "text", "text": text}))
     }
 
+    /// Send a binary (audio) frame, as the real firmware
+    /// would. The hub acknowledges it but never transcribes
+    /// it in Phase 7 (voice complete is out of scope).
+    pub fn send_binary(&mut self, audio: Vec<u8>) -> Result<(), MimintError> {
+        self.conn
+            .write_frame(&WsFrame::Binary(audio))
+            .map_err(MimintError::from)
+    }
+
     /// Read one text frame; ping frames are answered
     /// automatically.
     pub fn read_text(&mut self) -> Result<String, MimintError> {

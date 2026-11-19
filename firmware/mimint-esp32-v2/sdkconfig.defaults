@@ -1,0 +1,4 @@
+# Minimal defaults for the v2 skeleton (ESP-IDF v5.3).
+CONFIG_IDF_TARGET="esp32"
+CONFIG_BT_ENABLED=n
+CONFIG_ESP_WIFI_ENABLED=y
