@@ -21,7 +21,9 @@ use mimint_core::friends::context::{
     AutoInitiatorUi, AutoListenerUi, FriendsContext, TerminalInitiatorUi,
 };
 use mimint_core::friends::esp32::{FakeV2Device, FakeXiaoZhiDevice};
-use mimint_core::friends::handoff::{shared_notebook_context, HandoffOffer};
+use mimint_core::friends::handoff::{
+    shared_notebook_context, HandoffDecision, HandoffOffer, HandoffReject,
+};
 use mimint_core::friends::hub::{DriverBackend, HubConfig};
 use mimint_core::friends::identity::DeviceKeyStore;
 use mimint_core::friends::pairing::{
@@ -43,7 +45,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-pub const FRIENDS_USAGE: &str = "mimint-cli friends: Phase 7 paired-body operations.\n\nUsage:\n  mimint-cli friends [--data-dir DIR] [--config PATH] [--db PATH] [--audit PATH] <command> [args]\n\nCommands:\n  devices                              List paired devices (trust, pairing state)\n  pair <addr> [--typing] [--guest] [--auto-confirm]\n                                         Pair with the hub at <addr> (initiator side;\n                                         the peer runs `friends hub --allow-pairing`)\n  sync <device-id> --addr <addr>         Two-way sync with a paired peer\n  revoke <device-id>                     Revoke a peer (keeps the entry; access cut)\n  delete <device-id>                     Delete a peer entry entirely\n  rename <device-id> <name>             Rename a peer\n  trust <device-id> <owner|guest>        Change the trust granted to a peer\n  reset-identity                         Rotate this body's identity key (old key refused at once)\n  approve-opt-in <device-id> --on|--off  Let a peer approve actions (default off)\n  hub [--lan] [--lab] [--allow-pairing] [--auto-confirm]\n                                         Run the hub in the foreground (brain: Ollama qwen2.5:3b)\n  handoff --to <id> --addr <addr> --task <text> [--next <text>]\n                                         Offer a task handoff to a peer\n  conflicts                              List unresolved sync conflicts with diffs\n  resolve <id> --keep-local|--keep-remote|--keep-both\n                                         Resolve one conflict\n  fake-esp32 --path xiaozhi|v2 --addr <host:port> --uuid <uuid> [--text <text>] [--ota-addr <host:port>]\n                                         Run a fake ESP32 device against a hub\n  bench [--quick]                        Measure budgets B1–B8 for real (isolated temp dirs)\n  approve-wait --addr <host:port>       Wait for a peer approval card on this hub session, show its full origin, and decide\n  help                                   Show this help\n\nPairing mode is process-scoped: start the peer hub with --allow-pairing.\n--auto-confirm is demo-only (auto-answers the SAS prompts) and prints a warning.\nThe hub has no body attached: driver methods are refused until the GUI wires one.\n";
+pub const FRIENDS_USAGE: &str = "mimint-cli friends: Phase 7 paired-body operations.\n\nUsage:\n  mimint-cli friends [--data-dir DIR] [--config PATH] [--db PATH] [--audit PATH] <command> [args]\n\nCommands:\n  devices                              List paired devices (trust, pairing state)\n  pair <addr> [--typing] [--guest] [--auto-confirm]\n                                         Pair with the hub at <addr> (initiator side;\n                                         the peer runs `friends hub --allow-pairing`)\n  sync <device-id> --addr <addr>         Two-way sync with a paired peer\n  revoke <device-id>                     Revoke a peer (keeps the entry; access cut)\n  delete <device-id>                     Delete a peer entry entirely\n  rename <device-id> <name>             Rename a peer\n  trust <device-id> <owner|guest>        Change the trust granted to a peer\n  reset-identity                         Rotate this body's identity key (old key refused at once)\n  approve-opt-in <device-id> --on|--off  Let a peer approve actions (default off)\n  hub [--lan] [--lab] [--allow-pairing] [--auto-confirm]\n                                         Run the hub in the foreground (brain: Ollama qwen2.5:3b)\n  handoff --to <id> --addr <addr> --task <text> [--next <text>] [--wait-secs N]\n                                         Offer a task handoff to a peer (the receiver's user decides;\n                                         this waits up to the 10-minute lease TTL for the answer)\n  handoff list                           List handoff packages waiting for this body's user\n  handoff accept <package-id>            Accept a pending handoff (lease + handoff_accept)\n  handoff reject <package-id>            Decline a pending handoff (lease stays with the sender)\n  conflicts                              List unresolved sync conflicts with diffs\n  resolve <id> --keep-local|--keep-remote|--keep-both\n                                         Resolve one conflict\n  fake-esp32 --path xiaozhi|v2 --addr <host:port> --uuid <uuid> [--text <text>] [--ota-addr <host:port>]\n                                         Run a fake ESP32 device against a hub\n  bench [--quick]                        Measure budgets B1–B8 for real (isolated temp dirs)\n  approve-wait --addr <host:port>       Wait for a peer approval card on this hub session, show its full origin, and decide\n  help                                   Show this help\n\nPairing mode is process-scoped: start the peer hub with --allow-pairing.\n--auto-confirm is demo-only (auto-answers the SAS prompts) and prints a warning.\nThe hub has no body attached: driver methods are refused until the GUI wires one.\n";
 
 /// The CLI's driver backend: there is no body in this process,
 /// so every driver method is refused with a clear error rather
@@ -249,7 +251,7 @@ pub fn run_friends(argv: &[String]) -> Result<(), MimintError> {
         "reset-identity" => cmd_reset_identity(&args),
         "approve-opt-in" => cmd_approve_opt_in(&args, rest),
         "hub" => cmd_hub(&args, rest),
-        "handoff" => cmd_handoff(&args, rest),
+        "handoff" => cmd_handoff_dispatch(&args, rest),
         "conflicts" => cmd_conflicts(&args),
         "resolve" => cmd_resolve(&args, rest),
         "fake-esp32" => cmd_fake_esp32(&args, rest),
@@ -620,10 +622,20 @@ fn cmd_handoff(args: &FriendsArgs, rest: &[String]) -> Result<(), MimintError> {
         "Handoff offered to {} ({}): package {} lease {}",
         peer.name, peer.device_id, package.package_id, package.lease_id
     );
-    println!("Waiting for the peer's answer (the hub auto-accepts verified packages)...");
-    let (kind, payload) = session.recv()?;
-    match kind {
-        MessageKind::HandoffAccept => {
+    println!("Waiting for the receiver's user to decide (Continue here / Decline) — up to the 10-minute lease TTL...");
+    // The answer may take up to the lease TTL: wait on a
+    // thread so the wait is bounded by the lease, and a
+    // missing answer is reported as an expiry, not an error.
+    let wait_secs = value_of(rest, "--wait-secs")
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(11 * 60);
+    let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut session = session;
+        let _ = reply_tx.send(session.recv());
+    });
+    match reply_rx.recv_timeout(Duration::from_secs(wait_secs)) {
+        Ok(Ok((MessageKind::HandoffAccept, payload))) => {
             let value: serde_json::Value = serde_json::from_slice(&payload)
                 .map_err(|err| MimintError::Config(err.to_string()))?;
             println!(
@@ -635,12 +647,108 @@ fn cmd_handoff(args: &FriendsArgs, rest: &[String]) -> Result<(), MimintError> {
                 peer.name
             );
         }
-        MessageKind::HandoffReject => {
-            println!("REJECTED by the peer (lease returned).");
+        Ok(Ok((MessageKind::HandoffReject, payload))) => {
+            // The lease is back: this body may act again (§7.2).
+            ctx.handoff.clear_handed_off_package(&package.package_id);
+            let reason = serde_json::from_slice::<HandoffReject>(&payload)
+                .map(|r| r.reason)
+                .unwrap_or_default();
+            println!("REJECTED by the peer ({reason}) — B đã từ chối, bạn tiếp tục.");
         }
-        other => {
+        Ok(Ok((other, _))) => {
+            ctx.handoff.clear_handed_off_package(&package.package_id);
             println!("Unexpected reply: {}", other.as_str());
         }
+        Ok(Err(_)) => {
+            ctx.handoff.clear_handed_off_package(&package.package_id);
+            println!("No answer: the connection closed — the lease returns when its TTL expires, then you may continue or offer again.");
+        }
+        Err(_) => {
+            ctx.handoff.clear_handed_off_package(&package.package_id);
+            println!("No answer before the lease TTL ran out — the lease is back: you may continue the task or offer the handoff again.");
+        }
+    }
+    Ok(())
+}
+
+/// `friends handoff list|accept|reject`: the receiver side
+/// works headless (§7.3). The hub process writes the pending
+/// file into the shared data dir; these commands read it, and
+/// a decision is a file the hub sweeper picks up.
+fn cmd_handoff_dispatch(args: &FriendsArgs, rest: &[String]) -> Result<(), MimintError> {
+    match rest.first().map(String::as_str) {
+        Some("list") => cmd_handoff_list(args),
+        Some("accept") => {
+            let id = need_positional(rest, 1, "package id")?;
+            cmd_handoff_decide(args, &id, true)
+        }
+        Some("reject") => {
+            let id = need_positional(rest, 1, "package id")?;
+            cmd_handoff_decide(args, &id, false)
+        }
+        _ => cmd_handoff(args, rest),
+    }
+}
+
+fn cmd_handoff_list(args: &FriendsArgs) -> Result<(), MimintError> {
+    let (ctx, _) = open_context(args)?;
+    let pending = ctx.handoff.read_pending_file();
+    if pending.is_empty() {
+        println!("No pending handoffs.");
+        return Ok(());
+    }
+    let now = ctx.clock.now_ms();
+    for item in &pending {
+        let package = &item.package;
+        println!(
+            "Pending {}: {} (from {:.8}, {}s left)",
+            package.package_id,
+            package.task_text,
+            package.from_device_id,
+            item.remaining_ms(now) / 1000
+        );
+        if !package.done_steps.is_empty() {
+            println!("  done: {}", package.done_steps.join(" | "));
+        }
+        println!("  next: {}", package.next_step);
+        if !package.file_refs.is_empty() {
+            println!("  files: {}", package.file_refs.join(", "));
+        }
+        if !package.tab_refs.is_empty() {
+            println!("  tabs: {}", package.tab_refs.join(", "));
+        }
+    }
+    println!(
+        "Decide: `friends handoff accept <package-id>` or `friends handoff reject <package-id>`."
+    );
+    Ok(())
+}
+
+fn cmd_handoff_decide(
+    args: &FriendsArgs,
+    package_id: &str,
+    accept: bool,
+) -> Result<(), MimintError> {
+    let (ctx, _) = open_context(args)?;
+    let pending = ctx.handoff.read_pending_file();
+    if !pending
+        .iter()
+        .any(|item| item.package.package_id == package_id)
+    {
+        return Err(MimintError::Config(format!(
+            "no pending handoff {package_id} (see `friends handoff list`)"
+        )));
+    }
+    let decision = HandoffDecision {
+        package_id: package_id.to_string(),
+        accept,
+        decided_ms: ctx.clock.now_ms(),
+    };
+    ctx.handoff.write_decision(&decision)?;
+    if accept {
+        println!("Accepted {package_id}: the hub will send handoff_accept and start a new turn from the next step.");
+    } else {
+        println!("Rejected {package_id}: the hub will send handoff_reject and the lease stays with the sender.");
     }
     Ok(())
 }

@@ -2590,6 +2590,23 @@ fn offer_over_session(session: &mut Session, package: &HandoffPackage) {
         .unwrap();
 }
 
+/// True when a reply frame is already waiting on `session`
+/// (peek consumes nothing, so this never disturbs the
+/// session). Used to prove the hub sends no accept before the
+/// receiver's user decides (§7.3).
+fn reply_waiting(session: &Session, wait_ms: u64) -> bool {
+    let Ok(peek) = session.stream_clone() else {
+        return false;
+    };
+    let _ = peek.set_read_timeout(Some(std::time::Duration::from_millis(wait_ms)));
+    let mut buf = [0u8; 1];
+    match peek.peek(&mut buf) {
+        Ok(0) => false,
+        Ok(_) => true,
+        Err(_) => false,
+    }
+}
+
 /// A hub pair where `a` offers handoffs to `b`'s hub and `b`
 /// offers back to `a`'s hub (two-hub topology: every body runs
 /// a hub; a handoff and its completion travel on sessions in
@@ -3398,7 +3415,27 @@ fn handoff_two_instances_continues_next_step() {
     let package = make_package(&a, &b, "write the report");
     let mut session = handshake_to_hub(&a, &hub_b);
     offer_over_session(&mut session, &package);
-    // B verifies, takes the lease, and answers accept.
+    // B verifies and stores the package as PENDING (§7.3):
+    // no accept before the receiver's user decides, no lease
+    // taken yet.
+    assert!(
+        !reply_waiting(&session, 500),
+        "no accept before the user decides"
+    );
+    assert!(
+        hub_b
+            .pending_handoffs()
+            .iter()
+            .any(|item| item.package.package_id == package.package_id),
+        "verified offer must be listed as pending"
+    );
+    assert!(b.handoff.lease_for("default").is_none());
+    // The user presses "Tiếp tục ở đây": accept + lease.
+    hub_b.decide_handoff(&package.package_id, true).unwrap();
+    assert!(
+        reply_waiting(&session, 5_000),
+        "accept must arrive after the user decides"
+    );
     let (kind, payload) = session.recv().unwrap();
     assert_eq!(kind, MessageKind::HandoffAccept);
     let accept: HandoffAccept = serde_json::from_slice(&payload).unwrap();
@@ -3430,6 +3467,9 @@ fn handoff_lease_conflict_second_rejected() {
     let package_a = make_package(&a, &b, "task A");
     let mut session_a = handshake_to_hub(&a, &hub_b);
     offer_over_session(&mut session_a, &package_a);
+    assert!(!reply_waiting(&session_a, 500));
+    hub_b.decide_handoff(&package_a.package_id, true).unwrap();
+    assert!(reply_waiting(&session_a, 5_000));
     let (kind, _) = session_a.recv().unwrap();
     assert_eq!(kind, MessageKind::HandoffAccept);
     // C offers while B holds A's lease: lease_busy.
@@ -3445,6 +3485,11 @@ fn handoff_lease_conflict_second_rejected() {
     cell_c.fetch_add(11 * 60 * 1000, Ordering::SeqCst);
     let package_c2 = make_package(&c, &b, "task C retry");
     offer_over_session(&mut session_c, &package_c2);
+    // The retry is a fresh offer: pending until C's user
+    // decides (the lease is free again after expiry).
+    assert!(!reply_waiting(&session_c, 500));
+    hub_b.decide_handoff(&package_c2.package_id, true).unwrap();
+    assert!(reply_waiting(&session_c, 5_000));
     let (kind, _) = session_c.recv().unwrap();
     assert_eq!(kind, MessageKind::HandoffAccept);
     hub_b.stop();
@@ -3491,11 +3536,15 @@ fn handoff_wrong_recipient_rejected() {
         .handoff
         .verify_package(&package, a.identity.public_key(), &c.device_id())
         .is_err());
-    // And B's hub accepts the same package for B.
+    // And B's hub holds the same package as pending for B —
+    // accepted only after B's user decides.
     let backend = MockBackend::new();
     let hub_b = start_hub(&b, HubConfig::default(), backend);
     let mut session = handshake_to_hub(&a, &hub_b);
     offer_over_session(&mut session, &package);
+    assert!(!reply_waiting(&session, 500));
+    hub_b.decide_handoff(&package.package_id, true).unwrap();
+    assert!(reply_waiting(&session, 5_000));
     let (kind, _) = session.recv().unwrap();
     assert_eq!(kind, MessageKind::HandoffAccept);
     hub_b.stop();
@@ -3618,6 +3667,129 @@ fn handoff_reject_returns_lease() {
 }
 
 #[test]
+fn handoff_no_accept_before_user_decision() {
+    let a = Node::new("hnb-a");
+    let b = Node::new("hnb-b");
+    pair_nodes(&a, &b, SasFlow::Compare);
+    let backend = MockBackend::new();
+    let hub_b = start_hub(&b, HubConfig::default(), backend);
+    let package = make_package(&a, &b, "task");
+    let mut session = handshake_to_hub(&a, &hub_b);
+    offer_over_session(&mut session, &package);
+    // Half a second, no reply: the hub must not answer a
+    // verified offer before its user decides (§7.3).
+    assert!(
+        !reply_waiting(&session, 500),
+        "the hub answered before the user decided"
+    );
+    // The verified package is listed as pending on B, and no
+    // lease is held anywhere.
+    assert!(
+        hub_b
+            .pending_handoffs()
+            .iter()
+            .any(|item| item.package.package_id == package.package_id),
+        "verified offer must be pending on the receiver"
+    );
+    assert!(b.handoff.lease_for("default").is_none());
+    assert!(!a.handoff.is_handed_off(&package.package_id));
+    // A user reject also leaves the sender free to act.
+    hub_b.decide_handoff(&package.package_id, false).unwrap();
+    assert!(reply_waiting(&session, 5_000));
+    let (kind, payload) = session.recv().unwrap();
+    assert_eq!(kind, MessageKind::HandoffReject);
+    let reject: HandoffReject = serde_json::from_slice(&payload).unwrap();
+    assert_eq!(reject.reason, "rejected_by_user");
+    assert!(b.handoff.lease_for("default").is_none());
+    assert!(!a.handoff.is_handed_off(&package.package_id));
+    hub_b.stop();
+}
+
+#[test]
+fn handoff_accept_after_user_decision_sends_accept() {
+    let a = Node::new("haa-a");
+    let b = Node::new("haa-b");
+    pair_nodes(&a, &b, SasFlow::Compare);
+    let backend = MockBackend::new();
+    let hub_b = start_hub(&b, HubConfig::default(), backend);
+    let package = make_package(&a, &b, "task");
+    let mut session = handshake_to_hub(&a, &hub_b);
+    offer_over_session(&mut session, &package);
+    assert!(!reply_waiting(&session, 500));
+    // Only the user's decision produces the accept — and the
+    // lease moves to the receiver with it.
+    let decided = hub_b.decide_handoff(&package.package_id, true).unwrap();
+    assert_eq!(decided.task_text, "task");
+    assert!(reply_waiting(&session, 5_000));
+    let (kind, payload) = session.recv().unwrap();
+    assert_eq!(kind, MessageKind::HandoffAccept);
+    let accept: HandoffAccept = serde_json::from_slice(&payload).unwrap();
+    assert_eq!(accept.package_id, package.package_id);
+    let lease = b
+        .handoff
+        .lease_for("default")
+        .expect("B must hold the lease");
+    assert_eq!(lease.package_id, package.package_id);
+    // Deciding the same package twice fails: it is no longer
+    // pending.
+    assert!(hub_b.decide_handoff(&package.package_id, true).is_err());
+    hub_b.stop();
+}
+
+#[test]
+fn handoff_pending_expires_returns_lease() {
+    let (a, _cell_a) = Node::manual("hpe-a", 1_000_000);
+    let (b, cell_b) = Node::manual("hpe-b", 1_000_000);
+    pair_nodes(&a, &b, SasFlow::Compare);
+    let backend = MockBackend::new();
+    let hub_b = start_hub(&b, HubConfig::default(), backend);
+    let package = make_package(&a, &b, "task");
+    let mut session = handshake_to_hub(&a, &hub_b);
+    offer_over_session(&mut session, &package);
+    // The hub stores the offer as pending asynchronously: poll
+    // for it instead of asserting immediately after the send.
+    let mut waited = 0;
+    while !hub_b
+        .pending_handoffs()
+        .iter()
+        .any(|item| item.package.package_id == package.package_id)
+        && waited < 5_000
+    {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        waited += 100;
+    }
+    assert!(
+        hub_b
+            .pending_handoffs()
+            .iter()
+            .any(|item| item.package.package_id == package.package_id),
+        "offer must be pending before expiry"
+    );
+    // 8 minutes + 1 second pass on B: now + 2 minutes reaches
+    // the 10-minute lease expiry, so B treats the pending
+    // package as expired (§7.3 step 5, conservative).
+    cell_b.fetch_add(8 * 60 * 1000 + 1_000, Ordering::SeqCst);
+    // The sweeper (500 ms) sends the expiry reject on the
+    // live session: poll for it instead of sleeping blind.
+    let mut waited = 0;
+    while !reply_waiting(&session, 200) && waited < 5_000 {
+        waited += 200;
+    }
+    assert!(reply_waiting(&session, 200), "expiry reject must arrive");
+    let (kind, payload) = session.recv().unwrap();
+    assert_eq!(kind, MessageKind::HandoffReject);
+    let reject: HandoffReject = serde_json::from_slice(&payload).unwrap();
+    assert_eq!(reject.reason, "expired");
+    assert!(
+        hub_b.pending_handoffs().is_empty(),
+        "expired pending must be gone"
+    );
+    assert!(b.handoff.lease_for("default").is_none());
+    assert!(!a.handoff.is_handed_off(&package.package_id));
+    hub_b.stop();
+}
+
+#[test]
 fn handoff_sender_stops_after_offer() {
     let a = Node::new("hso-a");
     let b = Node::new("hso-b");
@@ -3627,6 +3799,10 @@ fn handoff_sender_stops_after_offer() {
     let package = make_package(&a, &b, "task");
     let mut session = handshake_to_hub(&a, &hub_b);
     offer_over_session(&mut session, &package);
+    // No answer before the receiver's user decides (§7.3).
+    assert!(!reply_waiting(&session, 500));
+    hub_b.decide_handoff(&package.package_id, true).unwrap();
+    assert!(reply_waiting(&session, 5_000));
     let (kind, payload) = session.recv().unwrap();
     assert_eq!(kind, MessageKind::HandoffAccept);
     let accept: HandoffAccept = serde_json::from_slice(&payload).unwrap();
@@ -3696,6 +3872,9 @@ fn handoff_complete_ack_returns_lease() {
     let package = make_package(&a, &b, "task");
     let mut session_ab = handshake_to_hub(&a, &hub_b);
     offer_over_session(&mut session_ab, &package);
+    assert!(!reply_waiting(&session_ab, 500));
+    hub_b.decide_handoff(&package.package_id, true).unwrap();
+    assert!(reply_waiting(&session_ab, 5_000));
     let (kind, payload) = session_ab.recv().unwrap();
     assert_eq!(kind, MessageKind::HandoffAccept);
     let accept: HandoffAccept = serde_json::from_slice(&payload).unwrap();

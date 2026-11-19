@@ -22,6 +22,7 @@ use crate::friends::wire::PROTOCOL_VERSION;
 use crate::notebook::Notebook;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 /// Handoff lease TTL (§7.2): 10 minutes.
@@ -122,6 +123,37 @@ pub struct HandoffComplete {
     pub lease_id: String,
 }
 
+/// A verified handoff package waiting for the receiver's user
+/// to press "Tiếp tục ở đây" / "Từ chối" (§7.3). No lease is
+/// held while a package is pending: the sender keeps the lease
+/// until the receiver accepts, rejects, or the lease TTL runs
+/// out.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingHandoff {
+    pub package: HandoffPackage,
+    /// When this body received the offer (receiver clock).
+    pub received_ms: u64,
+}
+
+impl PendingHandoff {
+    /// Milliseconds of lease life left on the receiver clock
+    /// (saturating; 0 once expired).
+    pub fn remaining_ms(&self, now_ms: u64) -> u64 {
+        self.package.expires_ms.saturating_sub(now_ms)
+    }
+}
+
+/// A user decision on a pending handoff, written by the CLI
+/// (`friends handoff accept|reject`) into the decisions
+/// directory for the hub sweeper to pick up (§7.3: the deciding
+/// user may run in a different process from the hub).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HandoffDecision {
+    pub package_id: String,
+    pub accept: bool,
+    pub decided_ms: u64,
+}
+
 /// One actuator lease (in memory only).
 #[derive(Debug, Clone)]
 pub struct Lease {
@@ -137,6 +169,12 @@ pub struct Lease {
 pub struct HandoffManager {
     leases: Mutex<HashMap<String, Lease>>,
     handed_off: Mutex<HashSet<String>>,
+    /// Verified packages waiting for the receiver's user (§7.3).
+    pending: Mutex<HashMap<String, PendingHandoff>>,
+    /// Package ids the sender side learned were rejected (§7.2).
+    rejected: Mutex<HashSet<String>>,
+    /// Data dir for the pending-file bridge (None in tests).
+    pending_dir: Mutex<Option<PathBuf>>,
     clock: Clock,
     audit: Option<Arc<AuditLog>>,
 }
@@ -146,6 +184,9 @@ impl HandoffManager {
         Self {
             leases: Mutex::new(HashMap::new()),
             handed_off: Mutex::new(HashSet::new()),
+            pending: Mutex::new(HashMap::new()),
+            rejected: Mutex::new(HashSet::new()),
+            pending_dir: Mutex::new(None),
             clock,
             audit,
         }
@@ -373,6 +414,246 @@ impl HandoffManager {
         handed.clear();
         let mut leases = self.leases.lock().unwrap_or_else(|p| p.into_inner());
         leases.clear();
+    }
+
+    /// Point the pending-handoff file bridge at a data dir
+    /// (§7.3): the hub process writes `pending-handoffs.json`
+    /// there, and the CLI decision commands write one file per
+    /// decision into `handoff-decisions/`. A separate CLI
+    /// process cannot see the hub's in-memory pending set, so
+    /// the files are the bridge. Nothing is deleted here: a
+    /// short-lived CLI process shares the dir with the running
+    /// hub and must never wipe its pending file — the hub
+    /// clears stale files when it starts instead.
+    pub fn set_pending_dir(&self, dir: PathBuf) {
+        let mut slot = self.pending_dir.lock().unwrap_or_else(|p| p.into_inner());
+        *slot = Some(dir);
+    }
+
+    /// Remove the pending file and any decision files left by
+    /// a previous process. Called by the hub at start: leases
+    /// do not survive a restart (§7.2), and neither does a
+    /// pending offer — the sender sees the TTL expire.
+    pub fn clear_stale_pending_files(&self) {
+        if let Some(path) = self.pending_file_path() {
+            let _ = std::fs::remove_file(path);
+        }
+        if let Some(dir) = self.decisions_dir() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    fn pending_dir_opt(&self) -> Option<PathBuf> {
+        self.pending_dir
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    /// `<data-dir>/pending-handoffs.json`, or None when no dir
+    /// is set (tests).
+    pub fn pending_file_path(&self) -> Option<PathBuf> {
+        self.pending_dir_opt()
+            .map(|dir| dir.join("pending-handoffs.json"))
+    }
+
+    /// `<data-dir>/handoff-decisions/`, or None when no dir is
+    /// set (tests).
+    pub fn decisions_dir(&self) -> Option<PathBuf> {
+        self.pending_dir_opt()
+            .map(|dir| dir.join("handoff-decisions"))
+    }
+
+    /// Store a verified package as pending (§7.3): no lease is
+    /// taken and no accept is sent until the receiver's user
+    /// decides. Re-offering the same package replaces the
+    /// stored copy.
+    pub fn store_pending(&self, package: &HandoffPackage) {
+        let received_ms = self.clock.now_ms();
+        {
+            let mut pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
+            pending.insert(
+                package.package_id.clone(),
+                PendingHandoff {
+                    package: package.clone(),
+                    received_ms,
+                },
+            );
+        }
+        self.audit(
+            "handoff_pending",
+            serde_json::json!({
+                "package_id": package.package_id,
+                "from_device_id": package.from_device_id,
+            }),
+        );
+        self.write_pending_file();
+    }
+
+    /// Snapshot of pending packages (oldest first).
+    pub fn pending_handoffs(&self) -> Vec<PendingHandoff> {
+        let mut out = self.pending_snapshot();
+        out.sort_by_key(|item| item.received_ms);
+        out
+    }
+
+    fn pending_snapshot(&self) -> Vec<PendingHandoff> {
+        self.pending
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    /// Take a pending package out of the queue (user decided).
+    pub fn take_pending(&self, package_id: &str) -> Option<PendingHandoff> {
+        let taken = self
+            .pending
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(package_id);
+        if taken.is_some() {
+            self.write_pending_file();
+        }
+        taken
+    }
+
+    /// Drop pending packages whose lease the receiver would
+    /// already consider expired (§7.3 step 5, conservative:
+    /// expired once now + 2 minutes reaches `expires_ms`).
+    /// Returns the dropped packages so the hub can tell the
+    /// sender with a `handoff_reject` (reason `expired`) when
+    /// its session is still live.
+    pub fn sweep_expired_pending(&self) -> Vec<PendingHandoff> {
+        let now = self.clock.now_ms();
+        let mut expired = Vec::new();
+        let changed = {
+            let mut pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
+            let before = pending.len();
+            pending.retain(|_, item| {
+                if now + HANDOFF_CLOCK_SKEW_MS >= item.package.expires_ms {
+                    expired.push(item.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+            pending.len() != before
+        };
+        for item in &expired {
+            self.audit(
+                "handoff_pending_expired",
+                serde_json::json!({"package_id": item.package.package_id}),
+            );
+        }
+        if changed {
+            self.write_pending_file();
+        }
+        expired
+    }
+
+    /// Remember that the sender's hub reported this package
+    /// rejected, so the sender side can tell the user the lease
+    /// is back (§7.2).
+    pub fn mark_rejected(&self, package_id: &str) {
+        self.rejected
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(package_id.to_string());
+    }
+
+    pub fn was_rejected(&self, package_id: &str) -> bool {
+        self.rejected
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains(package_id)
+    }
+
+    /// Mirror the pending set to `<data-dir>/pending-handoffs.json`
+    /// (temp file + rename, so a reader never sees a torn
+    /// file). Best-effort: a failed write must never break the
+    /// hub — the in-memory set is the truth.
+    fn write_pending_file(&self) {
+        let Some(path) = self.pending_file_path() else {
+            return;
+        };
+        let snapshot = self.pending_snapshot();
+        let Ok(bytes) = serde_json::to_vec(&snapshot) else {
+            return;
+        };
+        let tmp = path.with_extension("json.tmp");
+        if std::fs::write(&tmp, bytes).is_err() {
+            return;
+        }
+        let _ = std::fs::rename(&tmp, &path);
+    }
+
+    /// Read the pending file (the CLI `handoff list` command).
+    /// Missing or unparsable → empty.
+    pub fn read_pending_file(&self) -> Vec<PendingHandoff> {
+        let Some(path) = self.pending_file_path() else {
+            return Vec::new();
+        };
+        let Ok(bytes) = std::fs::read(path) else {
+            return Vec::new();
+        };
+        serde_json::from_slice(&bytes).unwrap_or_default()
+    }
+
+    /// Record a user decision for the hub sweeper to pick up
+    /// (the CLI `handoff accept|reject` commands). One file
+    /// per decision, temp + rename.
+    pub fn write_decision(&self, decision: &HandoffDecision) -> Result<(), MimintError> {
+        let Some(dir) = self.decisions_dir() else {
+            return Err(MimintError::Config(
+                "no pending dir configured for handoff decisions".to_string(),
+            ));
+        };
+        std::fs::create_dir_all(&dir).map_err(|err| {
+            MimintError::Io(format!("cannot create handoff decisions dir: {err}"))
+        })?;
+        let path = dir.join(format!("{}.json", decision.package_id));
+        let bytes = serde_json::to_vec(decision).map_err(|err| {
+            MimintError::Config(format!("cannot serialize handoff decision: {err}"))
+        })?;
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, &bytes)
+            .map_err(|err| MimintError::Io(format!("cannot write handoff decision: {err}")))?;
+        std::fs::rename(&tmp, &path)
+            .map_err(|err| MimintError::Io(format!("cannot store handoff decision: {err}")))?;
+        Ok(())
+    }
+
+    /// Take every decision file (parsed or not — an
+    /// unparsable file is dropped + audited so it cannot
+    /// poison the queue forever).
+    pub fn take_decision_files(&self) -> Vec<HandoffDecision> {
+        let Some(dir) = self.decisions_dir() else {
+            return Vec::new();
+        };
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let parsed: Option<HandoffDecision> = std::fs::read(&path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+            let _ = std::fs::remove_file(&path);
+            match parsed {
+                Some(decision) => out.push(decision),
+                None => self.audit(
+                    "handoff_decision_unparsable",
+                    serde_json::json!({"file": path.display().to_string()}),
+                ),
+            }
+        }
+        out
     }
 }
 

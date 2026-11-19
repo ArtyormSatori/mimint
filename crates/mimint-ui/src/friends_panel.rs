@@ -22,7 +22,7 @@ use mimint_core::friends::context::FriendsContext;
 use mimint_core::friends::esp32::esp32_status_label;
 use mimint_core::friends::esp32::Esp32Path;
 use mimint_core::friends::handoff::HandoffManager;
-use mimint_core::friends::handoff::{shared_notebook_context, HandoffOffer};
+use mimint_core::friends::handoff::{shared_notebook_context, HandoffOffer, HandoffReject};
 use mimint_core::friends::hub::Hub;
 use mimint_core::friends::identity::Identity;
 use mimint_core::friends::pairing::{
@@ -108,6 +108,14 @@ pub enum FriendsCommand {
         task: String,
         next: String,
     },
+    /// Decide a pending handoff this body received (§7.3):
+    /// the user pressed "Tiếp tục ở đây" (accept: lease +
+    /// handoff_accept + a new turn from the next step) or
+    /// "Từ chối" (reject: the lease stays with the sender).
+    HandoffDecide {
+        package_id: String,
+        accept: bool,
+    },
     /// Create a test approval card for a peer (demo hook for
     /// the G2 approval flow; the production path is the brain's
     /// approver creating the card in this same process). The
@@ -176,12 +184,23 @@ pub enum FriendsEvent {
     HandoffFailed {
         error: String,
     },
-    /// A handoff offer arrived and was auto-accepted after
-    /// verification (the human accept/reject gate is UI-layer
-    /// work; see the CROSS-CHECK deviation note).
+    /// A verified handoff offer arrived and is waiting for
+    /// this body's user to decide (§7.3): nothing runs before
+    /// the user presses "Tiếp tục ở đây" / "Từ chối".
     HandoffReceived {
         package_id: String,
         task: String,
+    },
+    /// The user accepted a pending handoff: the lease is held
+    /// and a new turn starts from the next step (§7.3).
+    HandoffAccepted {
+        package_id: String,
+        task: String,
+    },
+    /// The user declined a pending handoff: the lease returns
+    /// to the sender (§7.3).
+    HandoffDeclined {
+        package_id: String,
     },
     /// The peer decided on a card this device created.
     CardDecided {
@@ -543,26 +562,100 @@ fn handle_command(
                 MessageKind::HandoffOffer,
                 &serde_json::to_vec(&offer).map_err(|err| MimintError::Config(err.to_string()))?,
             )?;
-            let (kind, _payload) = session.recv()?;
-            match kind {
-                MessageKind::HandoffAccept => {
+            // The receiver's user decides (§7.3): the answer
+            // may take up to the lease TTL (10 minutes). Wait
+            // on a thread so the wait is bounded by the lease,
+            // and a missing answer is reported as an expiry,
+            // not a bare error.
+            let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let mut session = session;
+                let _ = reply_tx.send(session.recv());
+            });
+            let wait = Duration::from_secs(11 * 60);
+            match reply_rx.recv_timeout(wait) {
+                Ok(Ok((MessageKind::HandoffAccept, _))) => {
                     ctx.handoff.mark_handed_off(&package.package_id);
                     let _ = event_tx.send(FriendsEvent::HandoffDone { device_id: to });
                 }
-                MessageKind::HandoffReject => {
+                Ok(Ok((MessageKind::HandoffReject, payload))) => {
+                    // The lease is back with the sender: it may
+                    // act on the task again (§7.2). Clear any
+                    // handed-off mark defensively (none is set
+                    // before an accept, but a stale mark must
+                    // never block the sender).
+                    ctx.handoff.clear_handed_off_package(&package.package_id);
+                    let reason = serde_json::from_slice::<HandoffReject>(&payload)
+                        .map(|r| r.reason)
+                        .unwrap_or_default();
                     let _ = event_tx.send(FriendsEvent::HandoffFailed {
-                        error: "peer từ chối handoff".to_string(),
+                        error: handoff_reject_text(&reason),
                     });
                 }
-                _ => {
+                Ok(Ok((kind, _))) => {
+                    ctx.handoff.clear_handed_off_package(&package.package_id);
                     let _ = event_tx.send(FriendsEvent::HandoffFailed {
                         error: format!("peer trả về loại tin không mong đợi: {kind:?}"),
                     });
+                }
+                Ok(Err(_)) => {
+                    // The session died without an answer: the
+                    // lease returns on TTL expiry (§7.2).
+                    ctx.handoff.clear_handed_off_package(&package.package_id);
+                    let _ = event_tx.send(FriendsEvent::HandoffFailed {
+                        error: "Không nhận được trả lời từ peer (kết nối đã đóng) — lease hết hạn theo TTL rồi bạn tiếp tục.".to_string(),
+                    });
+                }
+                Err(_) => {
+                    // No answer before the lease TTL ran out.
+                    ctx.handoff.clear_handed_off_package(&package.package_id);
+                    let _ = event_tx.send(FriendsEvent::HandoffFailed {
+                        error: "Lease đã hết hạn mà peer chưa trả lời — bạn có thể tiếp tục hoặc handoff lại.".to_string(),
+                    });
+                }
+            }
+        }
+        FriendsCommand::HandoffDecide { package_id, accept } => {
+            match ctx.hub.decide_handoff(&package_id, accept) {
+                Ok(package) => {
+                    if accept {
+                        let _ = event_tx.send(FriendsEvent::HandoffAccepted {
+                            package_id: package.package_id,
+                            task: package.task_text,
+                        });
+                    } else {
+                        let _ = event_tx.send(FriendsEvent::HandoffDeclined {
+                            package_id: package.package_id,
+                        });
+                    }
+                }
+                Err(err) => {
+                    let _ = event_tx.send(FriendsEvent::Status(format!(
+                        "Không quyết định được handoff {package_id}: {err}"
+                    )));
                 }
             }
         }
     }
     Ok(())
+}
+
+/// Sender-side text for a handoff rejection (§7.2): the lease
+/// is back, the sender continues.
+fn handoff_reject_text(reason: &str) -> String {
+    match reason {
+        "rejected_by_user" => "B đã từ chối, bạn tiếp tục.".to_string(),
+        "expired" => {
+            "Lease đã hết hạn mà peer chưa trả lời — bạn có thể tiếp tục hoặc handoff lại."
+                .to_string()
+        }
+        "lease_busy" => {
+            "B đang giữ một lease khác (lease_busy) — bạn tiếp tục hoặc handoff lại sau."
+                .to_string()
+        }
+        "" => "B đã từ chối, bạn tiếp tục.".to_string(),
+        other => format!("B đã từ chối ({other}), bạn tiếp tục."),
+    }
 }
 
 /// One pending SAS confirmation (initiator side, started
@@ -614,6 +707,11 @@ pub struct FriendsPanel {
     handoff_task: String,
     handoff_next: String,
     handoff_notice: Option<String>,
+    /// A handoff this body accepted: (package id, task). The
+    /// panel polls the hub for the new turn's brain reply.
+    accepted_handoff: Option<(String, String)>,
+    /// The accepted handoff's brain-turn reply, once it lands.
+    handoff_turn_reply: Option<String>,
     card_target: String,
     card_action: String,
     rename_target: Option<String>,
@@ -652,6 +750,8 @@ impl FriendsPanel {
             handoff_task: String::new(),
             handoff_next: String::new(),
             handoff_notice: None,
+            accepted_handoff: None,
+            handoff_turn_reply: None,
             card_target: String::new(),
             card_action: "screenshot".to_string(),
             rename_target: None,
@@ -763,7 +863,18 @@ impl FriendsPanel {
                 }
                 FriendsEvent::HandoffReceived { package_id, task } => {
                     self.handoff_notice = Some(format!(
-                        "Nhận handoff {package_id:.8}: {task} (đã xác minh chữ ký, lease đã giữ)."
+                        "Nhận handoff {package_id:.8}: {task} (đã xác minh chữ ký, đang chờ bạn quyết định ở tab Handoff)."
+                    ));
+                }
+                FriendsEvent::HandoffAccepted { package_id, task } => {
+                    self.accepted_handoff = Some((package_id, task.clone()));
+                    self.handoff_notice = Some(format!(
+                        "Đã nhận handoff: {task} — lease đang giữ, đang tiếp tục từ bước tiếp theo."
+                    ));
+                }
+                FriendsEvent::HandoffDeclined { package_id } => {
+                    self.handoff_notice = Some(format!(
+                        "Đã từ chối handoff {package_id:.8} — lease trả về peer."
                     ));
                 }
                 FriendsEvent::Status(msg) => {
@@ -776,6 +887,11 @@ impl FriendsPanel {
     /// Render the whole panel into the central area.
     pub fn show(&mut self, ui: &mut egui::Ui) {
         self.drain_events();
+        if let Some((package_id, _)) = &self.accepted_handoff {
+            if let Some(reply) = self.hub.take_handoff_turn_reply(package_id) {
+                self.handoff_turn_reply = Some(reply);
+            }
+        }
         ui.heading("Bạn bè — thiết bị đã ghép đôi");
         ui.label(format!(
             "Thiết bị này: {} (fingerprint {})",
@@ -1295,6 +1411,65 @@ impl FriendsPanel {
                 lease.holder_device_id,
                 crate::audit_view::format_time_ms(lease.expires_ms)
             ));
+        }
+        // Pending handoffs waiting for THIS user's decision
+        // (§7.3): task, done steps, next step, references, and
+        // the two buttons. Nothing runs before the user
+        // decides.
+        let pending = self.hub.pending_handoffs();
+        if !pending.is_empty() {
+            ui.separator();
+            ui.heading("Handoff đang chờ bạn quyết định");
+            for item in &pending {
+                let package = &item.package;
+                ui.label(format!("Task: {}", package.task_text));
+                ui.label(format!(
+                    "Từ: {:.8} — còn lại {} giây",
+                    package.from_device_id,
+                    item.remaining_ms(self.hub.now_ms()) / 1000
+                ));
+                if !package.done_steps.is_empty() {
+                    ui.label(format!("Đã xong: {}", package.done_steps.join(" · ")));
+                }
+                ui.label(format!("Bước tiếp theo: {}", package.next_step));
+                if !package.file_refs.is_empty() {
+                    ui.label(format!("File: {}", package.file_refs.join(", ")));
+                }
+                if !package.tab_refs.is_empty() {
+                    ui.label(format!("Tab: {}", package.tab_refs.join(", ")));
+                }
+                if !package.notebook_context.is_empty() {
+                    let excerpt: String = package.notebook_context.chars().take(200).collect();
+                    ui.label(format!("Notebook (shared): {excerpt}"));
+                }
+                ui.horizontal(|ui| {
+                    if ui.button("Tiếp tục ở đây").clicked() {
+                        self.send(FriendsCommand::HandoffDecide {
+                            package_id: package.package_id.clone(),
+                            accept: true,
+                        });
+                        self.status =
+                            "Đang nhận handoff — tạo lượt mới từ bước tiếp theo.".to_string();
+                    }
+                    if ui.button("Từ chối").clicked() {
+                        self.send(FriendsCommand::HandoffDecide {
+                            package_id: package.package_id.clone(),
+                            accept: false,
+                        });
+                        self.status = "Đang từ chối handoff — lease trả về peer.".to_string();
+                    }
+                });
+                ui.separator();
+            }
+        }
+        if let Some((_, task)) = &self.accepted_handoff {
+            ui.separator();
+            ui.label(format!("Đang tiếp tục handoff: {task}"));
+            if let Some(reply) = &self.handoff_turn_reply {
+                ui.label(format!("Lượt mới (não): {reply}"));
+            } else {
+                ui.label("Lượt mới đang chạy qua não…");
+            }
         }
     }
 

@@ -27,7 +27,8 @@ use crate::audit::AuditLog;
 use crate::error::MimintError;
 use crate::friends::approval::{ApprovalDecision, ApprovalRelay};
 use crate::friends::handoff::{
-    HandoffAccept, HandoffComplete, HandoffManager, HandoffOffer, HandoffReject,
+    HandoffAccept, HandoffComplete, HandoffManager, HandoffOffer, HandoffPackage, HandoffReject,
+    PendingHandoff, HANDOFF_CLOCK_SKEW_MS,
 };
 use crate::friends::identity::Identity;
 use crate::friends::ota::{handle_ota_connection, OtaServer};
@@ -40,7 +41,7 @@ use crate::friends::util::Clock;
 use crate::friends::wire::{kind_of, read_frame, version_of, MessageKind, PROTOCOL_VERSION};
 use crate::friends::ws::WsConnection;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -255,9 +256,37 @@ pub struct Hub {
     /// request id): a card is sent once, never re-sent on
     /// every ping.
     cards_sent: Mutex<std::collections::HashSet<String>>,
+    /// Handoff replies waiting for the receiver's user
+    /// decision (§7.3): peer device id → accept/reject
+    /// frames, sent on the live session by the session loop.
+    /// The loop owns the session, so a decision made anywhere
+    /// else (panel, CLI decision file) is enqueued here
+    /// instead of sending from another thread.
+    handoff_outbox: Mutex<HashMap<String, VecDeque<HandoffReply>>>,
+    /// Completed handoff brain turns (package id → reply
+    /// text), drained by the panel. Capped at 8 entries.
+    handoff_turn_replies: Mutex<HashMap<String, String>>,
     /// The address OTA responses advertise (the hub's LAN IP
     /// when LAN is on, else loopback), set at `start()`.
     advertise_host: Mutex<String>,
+}
+
+/// One handoff reply waiting to be sent on the live session
+/// to the sender (§7.3).
+#[derive(Debug, Clone)]
+enum HandoffReply {
+    Accept(HandoffAccept),
+    Reject(HandoffReject),
+}
+
+/// What one poll of a session produced.
+enum SessionPoll {
+    /// One inbound message arrived.
+    Message((MessageKind, Vec<u8>)),
+    /// Nothing arrived within the poll window.
+    Waiting,
+    /// The peer closed the session (or recv failed).
+    Closed,
 }
 
 impl Hub {
@@ -298,6 +327,8 @@ impl Hub {
             ceremony_ui,
             v2_brain_turn: Mutex::new(None),
             cards_sent: Mutex::new(std::collections::HashSet::new()),
+            handoff_outbox: Mutex::new(HashMap::new()),
+            handoff_turn_replies: Mutex::new(HashMap::new()),
             advertise_host: Mutex::new("127.0.0.1".to_string()),
         }
     }
@@ -328,6 +359,299 @@ impl Hub {
     /// The OTA port this hub listens on.
     pub fn ota_port(&self) -> u16 {
         self.config.ota_port
+    }
+
+    /// Current time on this hub's clock (display only: the
+    /// panel uses it to show how long a pending handoff has
+    /// left).
+    pub fn now_ms(&self) -> u64 {
+        self.clock.now_ms()
+    }
+
+    /// Verified handoff packages waiting for this body's user
+    /// (§7.3). The panel and the CLI list command read this.
+    pub fn pending_handoffs(&self) -> Vec<PendingHandoff> {
+        self.handoff.pending_handoffs()
+    }
+
+    /// Take a completed handoff brain-turn reply for the panel
+    /// (None until the turn finishes).
+    pub fn take_handoff_turn_reply(&self, package_id: &str) -> Option<String> {
+        self.handoff_turn_replies
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(package_id)
+    }
+
+    /// Decide a pending handoff as this body's user (§7.3).
+    /// Accept acquires the 1-actuator lease and queues
+    /// `handoff_accept` on the live session to the sender; a
+    /// brain turn for the next step is started in the
+    /// background. Reject queues `handoff_reject` and the lease
+    /// stays with the sender. Returns the decided package.
+    pub fn decide_handoff(
+        self: &Arc<Self>,
+        package_id: &str,
+        accept: bool,
+    ) -> Result<HandoffPackage, MimintError> {
+        let pending = match self.handoff.take_pending(package_id) {
+            Some(pending) => pending,
+            None => {
+                return Err(MimintError::Config(format!(
+                    "no pending handoff {package_id}"
+                )))
+            }
+        };
+        let package = pending.package;
+        if self.clock.now_ms() + HANDOFF_CLOCK_SKEW_MS >= package.expires_ms {
+            self.audit(
+                "handoff_pending_expired",
+                serde_json::json!({"package_id": package.package_id}),
+            );
+            return Err(MimintError::Config("handoff package expired".to_string()));
+        }
+        if accept {
+            match self.handoff.acquire_lease(&package) {
+                Ok(lease) => {
+                    self.enqueue_handoff_reply(
+                        &package.from_device_id,
+                        HandoffReply::Accept(HandoffAccept {
+                            v: PROTOCOL_VERSION,
+                            kind: MessageKind::HandoffAccept.as_str().to_string(),
+                            package_id: package.package_id.clone(),
+                            lease_id: lease.lease_id,
+                        }),
+                    );
+                    self.audit(
+                        "handoff_accepted_by_user",
+                        serde_json::json!({"package_id": package.package_id}),
+                    );
+                    self.start_handoff_turn(&package);
+                    Ok(package)
+                }
+                Err(err) => {
+                    let reason = if err.to_string().contains("lease_busy") {
+                        "lease_busy"
+                    } else {
+                        "error"
+                    };
+                    self.enqueue_handoff_reply(
+                        &package.from_device_id,
+                        HandoffReply::Reject(HandoffReject {
+                            v: PROTOCOL_VERSION,
+                            kind: MessageKind::HandoffReject.as_str().to_string(),
+                            package_id: package.package_id.clone(),
+                            reason: reason.to_string(),
+                        }),
+                    );
+                    self.audit(
+                        "handoff_rejected_lease_busy",
+                        serde_json::json!({"package_id": package.package_id}),
+                    );
+                    Err(MimintError::Config(format!(
+                        "handoff cannot be accepted: {err}"
+                    )))
+                }
+            }
+        } else {
+            self.enqueue_handoff_reply(
+                &package.from_device_id,
+                HandoffReply::Reject(HandoffReject {
+                    v: PROTOCOL_VERSION,
+                    kind: MessageKind::HandoffReject.as_str().to_string(),
+                    package_id: package.package_id.clone(),
+                    reason: "rejected_by_user".to_string(),
+                }),
+            );
+            self.audit(
+                "handoff_rejected_by_user",
+                serde_json::json!({"package_id": package.package_id}),
+            );
+            Ok(package)
+        }
+    }
+
+    fn enqueue_handoff_reply(&self, peer_device_id: &str, reply: HandoffReply) {
+        let mut outbox = self
+            .handoff_outbox
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        outbox
+            .entry(peer_device_id.to_string())
+            .or_default()
+            .push_back(reply);
+    }
+
+    /// Send every queued handoff reply for this peer on its
+    /// live session (§7.3). The session loop owns the session,
+    /// so this is the only place replies go out.
+    fn drain_handoff_outbox(&self, session: &mut Session, peer_device_id: &str) {
+        let replies: Vec<HandoffReply> = {
+            let mut outbox = self
+                .handoff_outbox
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            match outbox.get_mut(peer_device_id) {
+                Some(queue) => queue.drain(..).collect(),
+                None => return,
+            }
+        };
+        for reply in replies {
+            let (kind, bytes) = match &reply {
+                HandoffReply::Accept(accept) => (
+                    MessageKind::HandoffAccept,
+                    serde_json::to_vec(accept).unwrap(),
+                ),
+                HandoffReply::Reject(reject) => (
+                    MessageKind::HandoffReject,
+                    serde_json::to_vec(reject).unwrap(),
+                ),
+            };
+            if session.send(kind, &bytes).is_err() {
+                // The sender is gone: the lease returns on TTL
+                // expiry (§7.2). Audit and drop the reply.
+                self.audit(
+                    "handoff_reply_undelivered",
+                    serde_json::json!({"peer_device_id": peer_device_id}),
+                );
+            }
+        }
+    }
+
+    /// Start the new turn for an accepted handoff (§7.3): one
+    /// brain turn on the next step, through the same brain the
+    /// ESP32 paths use. The turn only produces text — it never
+    /// drives the body directly, so no guard is bypassed; any
+    /// action it wants goes through the normal approval path.
+    /// The reply is stored for the panel to show.
+    fn start_handoff_turn(self: &Arc<Self>, package: &HandoffPackage) {
+        let brain = self
+            .v2_brain_turn
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        let Some(brain) = brain else {
+            // No brain installed (tests, a hub without Ollama):
+            // the lease + accept still stand; the turn starts
+            // when a brain is installed.
+            return;
+        };
+        let package = package.clone();
+        let hub = Arc::clone(self);
+        std::thread::spawn(move || {
+            let prompt = format!(
+                "Tiếp tục task handoff.\nTask: {}\nĐã xong:\n{}\nBước tiếp theo: {}\nNgữ cảnh notebook (chỉ dòng shared):\n{}",
+                package.task_text,
+                package.done_steps.join("\n"),
+                package.next_step,
+                package.notebook_context
+            );
+            let reply = brain(&prompt);
+            let mut replies = hub
+                .handoff_turn_replies
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if replies.len() >= 8 {
+                replies.clear();
+            }
+            replies.insert(package.package_id.clone(), reply);
+            hub.audit(
+                "handoff_turn_started",
+                serde_json::json!({"package_id": package.package_id}),
+            );
+        });
+    }
+
+    /// Background handoff sweeper (§7.3): applies CLI decisions
+    /// from the decisions directory, expires pending packages
+    /// past the lease TTL (sending `handoff_reject` with reason
+    /// `expired` when the sender's session is still live), and
+    /// drops replies for peers with no live session. Runs until
+    /// `stop()`.
+    fn handoff_sweeper_loop(self: &Arc<Self>) {
+        loop {
+            if self.stop_flag.load(Ordering::SeqCst) {
+                return;
+            }
+            self.sweep_handoff_once();
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    }
+
+    fn sweep_handoff_once(self: &Arc<Self>) {
+        // CLI decisions (another process writes the files).
+        for decision in self.handoff.take_decision_files() {
+            let package_id = decision.package_id.clone();
+            if let Err(err) = self.decide_handoff(&package_id, decision.accept) {
+                self.audit(
+                    "handoff_decision_failed",
+                    serde_json::json!({
+                        "package_id": package_id,
+                        "error": err.to_string(),
+                    }),
+                );
+            }
+        }
+        // Expired pending packages: the lease returns to the
+        // sender (§7.2). Tell the sender when its session is
+        // still live, so it can continue right away instead of
+        // waiting out the TTL.
+        for expired in self.handoff.sweep_expired_pending() {
+            self.enqueue_handoff_reply(
+                &expired.package.from_device_id,
+                HandoffReply::Reject(HandoffReject {
+                    v: PROTOCOL_VERSION,
+                    kind: MessageKind::HandoffReject.as_str().to_string(),
+                    package_id: expired.package.package_id.clone(),
+                    reason: "expired".to_string(),
+                }),
+            );
+        }
+        // Replies for peers with no live session can never be
+        // delivered: drop them (the lease returns on TTL).
+        let live: Vec<String> = self
+            .sessions
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .keys()
+            .cloned()
+            .collect();
+        let mut outbox = self
+            .handoff_outbox
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        outbox.retain(|peer, _| live.contains(peer));
+    }
+
+    /// Wait briefly for one inbound message on a session:
+    /// returns Waiting when nothing arrived within the poll
+    /// window (the caller drains the handoff outbox and tries
+    /// again). Peek consumes nothing, so a timeout can never
+    /// misalign a frame; a real message is read by the normal
+    /// `Session::recv` path.
+    fn poll_session(&self, session: &mut Session, peek_stream: Option<&TcpStream>) -> SessionPoll {
+        let Some(peek_stream) = peek_stream else {
+            return match session.recv() {
+                Ok(pair) => SessionPoll::Message(pair),
+                Err(_) => SessionPoll::Closed,
+            };
+        };
+        let _ = peek_stream.set_read_timeout(Some(Duration::from_millis(200)));
+        let mut buf = [0u8; 1];
+        match peek_stream.peek(&mut buf) {
+            Ok(0) => SessionPoll::Closed,
+            Ok(_) => match session.recv() {
+                Ok(pair) => SessionPoll::Message(pair),
+                Err(_) => SessionPoll::Closed,
+            },
+            Err(err)
+                if err.kind() == std::io::ErrorKind::TimedOut
+                    || err.kind() == std::io::ErrorKind::WouldBlock =>
+            {
+                SessionPoll::Waiting
+            }
+            Err(_) => SessionPoll::Closed,
+        }
     }
 
     /// Whether the hub runs in lab mode (plain `ws://` on
@@ -487,6 +811,13 @@ impl Hub {
             .map_err(|err| MimintError::Io(err.to_string()))?;
         let hub = Arc::clone(self);
         std::thread::spawn(move || hub.ota_accept_loop(ota_listener));
+        // The handoff sweeper (§7.3): CLI decisions + pending
+        // expiry. Also clears stale pending files: a fresh hub
+        // holds nothing from a previous process (leases do not
+        // survive a restart, §7.2).
+        self.handoff.clear_stale_pending_files();
+        let hub = Arc::clone(self);
+        std::thread::spawn(move || hub.handoff_sweeper_loop());
         Ok(())
     }
 
@@ -747,14 +1078,38 @@ impl Hub {
         // Cards created before this session opened go out
         // immediately (§6.2).
         self.deliver_pending_cards(&mut session, peer);
+        // The loop polls instead of blocking in `recv`: the
+        // receiver's user may decide a pending handoff at any
+        // moment (§7.3), and the reply must go out on THIS
+        // session — but `Session::recv` blocks up to the idle
+        // timeout holding the session, so no other thread can
+        // send on it. The poll peeks (peek consumes nothing,
+        // so a timeout can never misalign a frame) and drains
+        // the handoff outbox on every iteration.
+        let peek_stream = session.stream_clone().ok();
+        // Idle deadline (§5.4): a session with no traffic for
+        // the idle timeout closes, as before. Real time, not
+        // the injectable clock: a test that advances the manual
+        // clock past the lease TTL must not kill a live session.
+        let mut last_activity = std::time::Instant::now();
         loop {
             if self.stop_flag.load(Ordering::SeqCst) {
                 return Ok(());
             }
-            let (kind, payload) = match session.recv() {
-                Ok(pair) => pair,
-                Err(_) => return Ok(()), // Closed / idle timeout.
+            self.drain_handoff_outbox(&mut session, &peer_device_id);
+            if session.is_closed() {
+                return Ok(());
+            }
+            if last_activity.elapsed() > Duration::from_millis(self.session_config.idle_timeout_ms)
+            {
+                return Ok(());
+            }
+            let (kind, payload) = match self.poll_session(&mut session, peek_stream.as_ref()) {
+                SessionPoll::Message(pair) => pair,
+                SessionPoll::Waiting => continue,
+                SessionPoll::Closed => return Ok(()),
             };
+            last_activity = std::time::Instant::now();
             match kind {
                 MessageKind::Ping => {
                     // A ping is the wake-up for cards created
@@ -866,6 +1221,10 @@ impl Hub {
                                 "reason": reject.reason,
                             }),
                         );
+                        // The lease is back with the sender: it
+                        // may act on the task again (§7.2).
+                        self.handoff.clear_handed_off_package(&reject.package_id);
+                        self.handoff.mark_rejected(&reject.package_id);
                     }
                 }
                 MessageKind::HandoffComplete => {
@@ -1084,33 +1443,7 @@ impl Hub {
                 );
             }
         }
-        let accept = match verified {
-            Ok(()) => match self.handoff.acquire_lease(package) {
-                Ok(lease) => Some(HandoffAccept {
-                    v: PROTOCOL_VERSION,
-                    kind: MessageKind::HandoffAccept.as_str().to_string(),
-                    package_id: package.package_id.clone(),
-                    lease_id: lease.lease_id,
-                }),
-                Err(err) => {
-                    let reason = if err.to_string().contains("lease_busy") {
-                        "lease_busy"
-                    } else {
-                        "error"
-                    };
-                    let _ = session.send(
-                        MessageKind::HandoffReject,
-                        &serde_json::to_vec(&HandoffReject {
-                            v: PROTOCOL_VERSION,
-                            kind: MessageKind::HandoffReject.as_str().to_string(),
-                            package_id: package.package_id.clone(),
-                            reason: reason.to_string(),
-                        })
-                        .unwrap(),
-                    );
-                    return;
-                }
-            },
+        match verified {
             Err(err) => {
                 let _ = session.send(
                     MessageKind::HandoffReject,
@@ -1122,14 +1455,31 @@ impl Hub {
                     })
                     .unwrap(),
                 );
-                return;
             }
-        };
-        if let Some(accept) = accept {
-            let _ = session.send(
-                MessageKind::HandoffAccept,
-                &serde_json::to_vec(&accept).unwrap(),
-            );
+            Ok(()) => {
+                // §7.3 step 5: B holds at most one active lease.
+                // A busy actuator is refused at once (as before);
+                // a free actuator does NOT mean auto-accept: the
+                // verified package waits for the user's decision
+                // ("Tiếp tục ở đây" / "Từ chối"), and no lease
+                // is taken until then. Handoff never runs by
+                // itself on receipt — human-present, like every
+                // computer use.
+                if self.handoff.lease_for(&package.actuator).is_some() {
+                    let _ = session.send(
+                        MessageKind::HandoffReject,
+                        &serde_json::to_vec(&HandoffReject {
+                            v: PROTOCOL_VERSION,
+                            kind: MessageKind::HandoffReject.as_str().to_string(),
+                            package_id: package.package_id.clone(),
+                            reason: "lease_busy".to_string(),
+                        })
+                        .unwrap(),
+                    );
+                    return;
+                }
+                self.handoff.store_pending(package);
+            }
         }
     }
 

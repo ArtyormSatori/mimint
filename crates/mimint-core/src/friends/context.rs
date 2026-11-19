@@ -412,6 +412,11 @@ impl FriendsContext {
             })),
         ));
         let handoff = Arc::new(HandoffManager::new(clock.clone(), audit.clone()));
+        // Pending handoffs + CLI decisions are bridged through
+        // the data dir (§7.3): the hub process writes the
+        // pending file, a separate CLI process reads it and
+        // writes decision files the hub sweeper picks up.
+        handoff.set_pending_dir(data_dir.clone());
         let notebook = Arc::new(Notebook::open(notebook_path.as_ref())?);
         let sources = SyncSources {
             soul: SoulStore::new(&data_dir),
