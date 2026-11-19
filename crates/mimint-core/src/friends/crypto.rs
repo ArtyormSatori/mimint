@@ -451,6 +451,24 @@ mod tests {
         );
     }
 
+    /// AEAD isolation: only the right key + right AAD opens a
+    /// sealed message. Wrong key, tampered ciphertext, and
+    /// wrong AAD all fail closed with no detail.
+    #[test]
+    fn session_key_wrong_key_tamper_and_aad_fail() {
+        let key_a = SessionKey::from_bytes([0x11; SESSION_KEY_LEN]);
+        let key_b = SessionKey::from_bytes([0x22; SESSION_KEY_LEN]);
+        let nonce = [0x33; NONCE_LEN];
+        let aad = b"header";
+        let sealed = key_a.seal(&nonce, aad, b"secret");
+        assert!(key_b.open(&nonce, aad, &sealed).is_none());
+        let mut tampered = sealed.clone();
+        tampered[0] ^= 0x01;
+        assert!(key_a.open(&nonce, aad, &tampered).is_none());
+        assert!(key_a.open(&nonce, b"other", &sealed).is_none());
+        assert_eq!(key_a.open(&nonce, aad, &sealed).unwrap(), b"secret");
+    }
+
     #[test]
     fn identity_sign_verify_round_trip_and_wrong_key_fails() {
         let der = generate_identity_pkcs8();

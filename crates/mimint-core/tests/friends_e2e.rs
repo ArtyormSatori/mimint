@@ -43,7 +43,7 @@ use mimint_core::friends::sync::{
 };
 use mimint_core::friends::todos::{Todo, TodoPlanStore};
 use mimint_core::friends::util::{hex_encode, Clock};
-use mimint_core::friends::wire::{read_frame, write_frame, MessageKind, PROTOCOL_VERSION};
+use mimint_core::friends::wire::{kind_of, read_frame, write_frame, MessageKind, PROTOCOL_VERSION};
 use mimint_core::friends::ws::{WsConnection, WsFrame};
 use mimint_core::MimintError;
 use mimint_core::{Notebook, SkillDef, SkillStatus, SkillStore, SoulStore};
@@ -670,6 +670,34 @@ fn friends_wrong_pin_rejected() {
     );
     assert!(ra.is_err(), "wrong pin must be rejected");
     let _ = handle.join().unwrap();
+}
+
+/// Pin-before-sign isolation (§2.2): the pin is checked
+/// BEFORE the initiator signs, so no AUTH frame (which
+/// carries A's signature) may leave A toward a peer whose
+/// pin does not match. The plain wrong-pin test cannot tell
+/// the pin check apart from the signature check — this one
+/// can, by watching the wire through the proxy.
+#[test]
+fn friends_pin_checked_before_signing() {
+    let a = Node::new("pin-a");
+    let b = Node::new("pin-b");
+    pair_nodes(&a, &b, SasFlow::Compare);
+    // Corrupt the pinned key A holds for B.
+    let mut entry = a.registry.get_peer(&b.device_id()).unwrap().unwrap();
+    entry.identity_pub_hex = hex_encode(a.identity.public_key());
+    a.registry.upsert_peer(&entry).unwrap();
+    let record: FrameRecord = Arc::new(Mutex::new(Vec::new()));
+    let (ra, _rb) = handshake_via_proxy(&a, &b, ProxyMode::Passthrough, Arc::clone(&record));
+    assert!(ra.is_err(), "handshake with a wrong pin must fail");
+    let frames = record.lock().unwrap();
+    for (json, _payload) in frames.iter() {
+        assert_ne!(
+            kind_of(json).unwrap(),
+            MessageKind::Auth,
+            "no AUTH frame may be sent before the pin check passes"
+        );
+    }
 }
 
 #[test]
