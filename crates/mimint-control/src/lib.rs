@@ -16,12 +16,14 @@
 //!   body-level stop aborts the driving turn.
 
 pub mod actor;
+pub mod driver;
 pub mod frames;
 pub mod slots;
 pub mod tools;
 pub mod verify;
 
 pub use actor::{bridge, ActorConfig, BodyActor, DEFAULT_ACTION_TIMEOUT, PROBE_QUEUE_SLA};
+pub use driver::ActorDriverBackend;
 pub use frames::{encode_png, hex_encode, sha256_hex, FrameMeta, FrameStore};
 pub use slots::AgentSnapshotSlots;
 pub use tools::{
