@@ -297,7 +297,7 @@ impl DeviceRegistry {
             -- have received: one this body sent TO IT, or one
             -- it demonstrably knew when it sent an earlier
             -- ACCEPTED record (see `peer_knowledge`). The
-            -- "sent to anyone" and "received before" legs were
+            -- sent-to-anyone and received-before legs were
             -- removed: they made the gate vacuous — any version
             -- this body ever received would have provenance for
             -- every peer, including one that never saw it
