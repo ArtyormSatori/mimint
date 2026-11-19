@@ -4910,13 +4910,13 @@ fn sync_multihop_forward_and_return_applies() {
 fn sync_soul_never_auto_applies_awaits_approval() {
     let a = Node::new("sna-a");
     let b = Node::new("sna-b");
-    a.soul
+    SoulStore::new(&a.dir)
         .save("agent-001", "SOUL.md", "You are a careful helper.")
         .unwrap();
     let (sa, sb) = paired_synced(&a, &b);
     let (_ra, rb) = sync_both(&a, &b, sa, sb, &SyncKinds::all());
     assert!(
-        b.soul.load("SOUL.md").is_err(),
+        SoulStore::new(&b.dir).load("SOUL.md").is_err(),
         "SOUL must not arrive unapproved"
     );
     let pending = b.engine.pending_sync_approvals().unwrap();
@@ -4927,7 +4927,7 @@ fn sync_soul_never_auto_applies_awaits_approval() {
         b.engine.approve_pending_sync("soul:SOUL.md").unwrap(),
         "approval must apply the held record"
     );
-    let doc = b.soul.load("SOUL.md").unwrap();
+    let doc = SoulStore::new(&b.dir).load("SOUL.md").unwrap();
     assert_eq!(doc.body, "You are a careful helper.");
     assert!(b.engine.pending_sync_approvals().unwrap().is_empty());
 }
@@ -5169,7 +5169,7 @@ fn session_rekey_flood_rate_limited_receiver_stays_open() {
         None,
     )
     .unwrap();
-    let mut sb = handle.join().unwrap();
+    let sb = handle.join().unwrap();
     sa.initiate_rekey().unwrap();
     assert_eq!(sb.rekey_count(), 1);
     // Second rekey 0 s later: under the 5 s cooldown, the
@@ -5361,12 +5361,23 @@ fn soul_symlink_never_syncs_and_load_refuses() {
     )
     .unwrap();
     std::os::unix::fs::symlink(&target, a.dir.join("EVIL.md")).unwrap();
-    assert!(a.soul.load("EVIL.md").is_err(), "load must refuse symlinks");
-    a.soul.save("agent-001", "SOUL.md", "You are the real soul.").unwrap();
+    assert!(
+        SoulStore::new(&a.dir).load("EVIL.md").is_err(),
+        "load must refuse symlinks"
+    );
+    SoulStore::new(&a.dir)
+        .save("agent-001", "SOUL.md", "You are the real soul.")
+        .unwrap();
     let (sa, sb) = paired_synced(&a, &b);
     sync_both(&a, &b, sa, sb, &SyncKinds::all());
-    assert!(b.soul.load("EVIL.md").is_err(), "symlink must not arrive");
-    assert!(b.soul.load("SOUL.md").is_ok(), "real soul still syncs");
+    assert!(
+        SoulStore::new(&b.dir).load("EVIL.md").is_err(),
+        "symlink must not arrive"
+    );
+    assert!(
+        SoulStore::new(&b.dir).load("SOUL.md").is_ok(),
+        "real soul still syncs"
+    );
 }
 
 /// F7-18: cross-agent notebook isolation — a private note
@@ -5378,7 +5389,7 @@ fn notebook_cross_agent_private_never_leaves() {
     let b = Node::new("xan-b");
     let _ = a
         .notebook
-        .add_for("agent-002", "other agent private", "do not sync this line")
+        .add_for("agent-002", "other agent private", "do not sync this line", false)
         .unwrap();
     let (_, shared_id) = add_shared_note(&a, "shared", "sync me");
     let (sa, sb) = paired_synced(&a, &b);
