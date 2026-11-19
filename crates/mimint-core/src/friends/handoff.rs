@@ -659,12 +659,10 @@ impl HandoffManager {
             }
             .map_err(|err| MimintError::Io(format!("cannot write handoff decision: {err}")))?;
             #[cfg(not(unix))]
-            let mut file = std::fs::File::create(&tmp).map_err(|err| {
-                MimintError::Io(format!("cannot write handoff decision: {err}"))
-            })?;
-            file.write_all(&bytes).map_err(|err| {
-                MimintError::Io(format!("cannot write handoff decision: {err}"))
-            })?;
+            let mut file = std::fs::File::create(&tmp)
+                .map_err(|err| MimintError::Io(format!("cannot write handoff decision: {err}")))?;
+            file.write_all(&bytes)
+                .map_err(|err| MimintError::Io(format!("cannot write handoff decision: {err}")))?;
         }
         std::fs::rename(&tmp, &path)
             .map_err(|err| MimintError::Io(format!("cannot store handoff decision: {err}")))?;
@@ -799,10 +797,8 @@ mod tests {
     #[test]
     fn handoff_decision_file_is_owner_only() {
         // F7-17: decisions dir 0700, decision file 0600.
-        let dir = std::env::temp_dir().join(format!(
-            "mimint-p7-decision-perms-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("mimint-p7-decision-perms-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let manager = HandoffManager::new(Clock::fixed(5000), None);

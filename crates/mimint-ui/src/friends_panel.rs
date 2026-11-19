@@ -1154,10 +1154,8 @@ impl FriendsPanel {
                     // registry alone — the hub also cuts the
                     // peer's live session at once.
                     if self.hub.revoke_peer(&peer.device_id) {
-                        self.status = format!(
-                            "Đã thu hồi {} (phiên đang chạy đã bị ngắt).",
-                            peer.name
-                        );
+                        self.status =
+                            format!("Đã thu hồi {} (phiên đang chạy đã bị ngắt).", peer.name);
                     } else {
                         self.status = format!("Không thu hồi được {}.", peer.name);
                     }
@@ -1203,8 +1201,7 @@ impl FriendsPanel {
         // F7-25: the "[Xem danh sách thiết bị đã ghép đôi]"
         // inside PRIVACY_MODE_TEXT was plain text — render it
         // as a real button that switches to this tab.
-        let privacy = texts::PRIVACY_MODE_TEXT
-            .replace(" [Xem danh sách thiết bị đã ghép đôi]", "");
+        let privacy = texts::PRIVACY_MODE_TEXT.replace(" [Xem danh sách thiết bị đã ghép đôi]", "");
         ui.label(privacy);
         if ui.button("Xem danh sách thiết bị đã ghép đôi").clicked() {
             self.view = FriendsView::Devices;
@@ -1364,15 +1361,16 @@ impl FriendsPanel {
         // F7-02: SoulFile / naming_profile records held for
         // this user's approval are listed here next to the
         // conflicts, with approve / reject buttons.
-        let pending = self.sync_engine.pending_sync_approvals().unwrap_or_default();
+        let pending = self
+            .sync_engine
+            .pending_sync_approvals()
+            .unwrap_or_default();
         if !pending.is_empty() {
             ui.heading("Chờ bạn duyệt (SOUL / profile từ peer)");
             ui.label("Các record này KHÔNG tự áp dụng — chỉ bạn mới được duyệt. Từ chối thì record bị bỏ, không áp dụng.");
             for (sync_id, kind, peer_device_id, _record_json, _received_ms) in pending {
                 ui.separator();
-                ui.label(format!(
-                    "{kind} {sync_id} — từ {peer_device_id:.8}"
-                ));
+                ui.label(format!("{kind} {sync_id} — từ {peer_device_id:.8}"));
                 ui.horizontal(|ui| {
                     if ui.button("Duyệt và áp dụng").clicked() {
                         match self.sync_engine.approve_pending_sync(&sync_id) {
@@ -1619,10 +1617,7 @@ impl FriendsPanel {
             // F7-04: the holder is the RECEIVING device (this
             // body, when it accepted) — and the panel shows a
             // live countdown, not just the expiry clock time.
-            let remaining = lease
-                .expires_ms
-                .saturating_sub(self.hub.now_ms())
-                / 1000;
+            let remaining = lease.expires_ms.saturating_sub(self.hub.now_ms()) / 1000;
             ui.label(format!(
                 "Lease đang giữ: actuator {} — holder là máy nhận ({:.8}) — còn lại {remaining} giây (hết hạn {})",
                 lease.actuator,

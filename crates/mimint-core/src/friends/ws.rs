@@ -706,10 +706,7 @@ mod tests {
         client
             .write_all(&raw_client_frame(0x9, true, &boundary, [1, 2, 3, 4]))
             .unwrap();
-        assert_eq!(
-            server.read_frame().unwrap(),
-            WsFrame::Ping(boundary)
-        );
+        assert_eq!(server.read_frame().unwrap(), WsFrame::Ping(boundary));
     }
 
     /// F7-19 vector 3: unusual close codes are accepted as
@@ -727,7 +724,12 @@ mod tests {
         let mut server = handle.join().unwrap();
         for code in [1005u16, 1006, 999, 4000, 1011] {
             client
-                .write_all(&raw_client_frame(0x8, true, &code.to_be_bytes(), [1, 1, 1, 1]))
+                .write_all(&raw_client_frame(
+                    0x8,
+                    true,
+                    &code.to_be_bytes(),
+                    [1, 1, 1, 1],
+                ))
                 .unwrap();
             assert_eq!(
                 server.read_frame().unwrap(),

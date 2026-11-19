@@ -519,7 +519,8 @@ impl DeviceRegistry {
 
     /// Clear the "pairing incomplete" flag after the first
     /// successful ordinary session handshake.
-    pub fn mark_pairing_complete(&self, device_id: &str) -> Result<(), MimintError> {        let conn = self.connection();
+    pub fn mark_pairing_complete(&self, device_id: &str) -> Result<(), MimintError> {
+        let conn = self.connection();
         conn.execute(
             "UPDATE devices SET pairing_incomplete = 0 WHERE device_id = ?1",
             params![device_id],
@@ -888,15 +889,19 @@ impl DeviceRegistry {
                 peer_device_id = excluded.peer_device_id,
                 record_json = excluded.record_json,
                 received_ms = excluded.received_ms",
-            params![sync_id, kind, peer_device_id, record_json, received_ms as i64],
+            params![
+                sync_id,
+                kind,
+                peer_device_id,
+                record_json,
+                received_ms as i64
+            ],
         )?;
         Ok(())
     }
 
     /// Pending approvals, oldest first.
-    pub fn list_pending_approvals(
-        &self,
-    ) -> Result<Vec<PendingApprovalRow>, MimintError> {
+    pub fn list_pending_approvals(&self) -> Result<Vec<PendingApprovalRow>, MimintError> {
         let conn = self.connection();
         let mut stmt = conn.prepare(
             "SELECT sync_id, kind, peer_device_id, record_json, received_ms

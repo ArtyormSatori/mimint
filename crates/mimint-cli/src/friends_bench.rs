@@ -88,10 +88,10 @@ fn print_results(results: &[BudgetMeasurement]) {
     // F7-26: B7's scope, stated on the output itself.
     println!("B7 scope: RSS delta of THIS process only (context open + hub start).");
     match ollama_rss_mib() {
-        Some(rss) => println!(
-            "Ollama RSS (separate process, OUTSIDE the B7 budget): {rss:.1} MiB"
+        Some(rss) => println!("Ollama RSS (separate process, OUTSIDE the B7 budget): {rss:.1} MiB"),
+        None => println!(
+            "Ollama RSS: Ollama is not running right now (outside the B7 budget either way)."
         ),
-        None => println!("Ollama RSS: Ollama is not running right now (outside the B7 budget either way)."),
     }
 }
 

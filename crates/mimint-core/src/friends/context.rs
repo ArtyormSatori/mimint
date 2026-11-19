@@ -409,7 +409,9 @@ impl FriendsContext {
         // F7-23: peers.db missing while the identity key
         // already exists means the registry was deleted and
         // recreated (not a first run).
-        let peers_db_restored = !data_dir.join(crate::friends::registry::PEERS_DB_FILE).exists()
+        let peers_db_restored = !data_dir
+            .join(crate::friends::registry::PEERS_DB_FILE)
+            .exists()
             && data_dir
                 .join(crate::friends::identity::IDENTITY_KEY_FILE)
                 .exists();

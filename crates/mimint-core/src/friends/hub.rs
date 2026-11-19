@@ -591,10 +591,7 @@ impl Hub {
             flags.insert(package.package_id.clone(), Arc::clone(&cancel_flag));
         }
         {
-            let mut turns = self
-                .handoff_turns
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
+            let mut turns = self.handoff_turns.lock().unwrap_or_else(|p| p.into_inner());
             turns.insert(
                 package.package_id.clone(),
                 HandoffTurnState {
@@ -622,10 +619,7 @@ impl Hub {
             let cancelled = cancel_flag.load(Ordering::SeqCst);
             let finished_ms = hub.clock.now_ms();
             {
-                let mut turns = hub
-                    .handoff_turns
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner());
+                let mut turns = hub.handoff_turns.lock().unwrap_or_else(|p| p.into_inner());
                 if let Some(state) = turns.get_mut(&package.package_id) {
                     state.status = if cancelled {
                         HandoffTurnStatus::Cancelled
@@ -684,10 +678,7 @@ impl Hub {
     /// takes effect when it returns.
     pub fn cancel_handoff_turn(&self, package_id: &str) -> bool {
         let running = {
-            let turns = self
-                .handoff_turns
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
+            let turns = self.handoff_turns.lock().unwrap_or_else(|p| p.into_inner());
             turns
                 .get(package_id)
                 .is_some_and(|state| state.status == HandoffTurnStatus::Running)
@@ -935,10 +926,7 @@ impl Hub {
     /// down. Returns false when the peer did not exist.
     pub fn revoke_peer(&self, device_id: &str) -> bool {
         let now = self.clock.now_ms();
-        let revoked = self
-            .registry
-            .revoke_peer(device_id, now)
-            .unwrap_or(false);
+        let revoked = self.registry.revoke_peer(device_id, now).unwrap_or(false);
         if !revoked {
             return false;
         }

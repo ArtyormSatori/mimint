@@ -23,8 +23,8 @@ use crate::friends::conflict::{
 };
 use crate::friends::records::{body_hash, RecordKind, SyncRecord, EMPTY_BODY_SHA256};
 use crate::friends::registry::{
-    ConflictRow, DeviceRegistry, LocalVersionRow, PeerPrefs, SeenVersion, TombstoneRow,
-    VersionId, TOMBSTONE_RETENTION_MS,
+    ConflictRow, DeviceRegistry, LocalVersionRow, PeerPrefs, SeenVersion, TombstoneRow, VersionId,
+    TOMBSTONE_RETENTION_MS,
 };
 use crate::friends::session::Session;
 use crate::friends::texts;
@@ -864,9 +864,9 @@ impl SyncEngine {
         // apply, no conflict screen, distinct audit event.
         let local = self.local_version_for(&record.sync_id, kind)?;
         if let Some(claimed) = successor_claim(record, &local.version) {
-            let proven = self
-                .registry
-                .version_has_provenance(peer_device_id, &record.sync_id, claimed)?;
+            let proven =
+                self.registry
+                    .version_has_provenance(peer_device_id, &record.sync_id, claimed)?;
             if !proven {
                 self.audit(
                     "sync_successor_rejected",
@@ -1811,7 +1811,9 @@ pub fn run_sync_exchange(
                 applied.push(sync_id);
                 applied_count += 1;
             }
-            ApplyOutcome::Conflicted | ApplyOutcome::TombstonePending | ApplyOutcome::PendingApproval => {
+            ApplyOutcome::Conflicted
+            | ApplyOutcome::TombstonePending
+            | ApplyOutcome::PendingApproval => {
                 conflicts.push(sync_id);
                 conflict_count += 1;
             }

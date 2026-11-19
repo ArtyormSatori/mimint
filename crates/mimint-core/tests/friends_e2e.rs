@@ -2262,7 +2262,10 @@ fn sync_canary_secret_never_in_payload() {
         .engine
         .handle_offer(&a.device_id(), &offer, &kinds)
         .unwrap();
-    let push = a.engine.build_push(&b.device_id(), &request, &kinds).unwrap();
+    let push = a
+        .engine
+        .build_push(&b.device_id(), &request, &kinds)
+        .unwrap();
     assert!(!push.records.is_empty(), "push must carry the shared note");
     let push_json = serde_json::to_string(&push).unwrap();
     for sentinel in [
@@ -2319,7 +2322,10 @@ fn sync_unpaired_peer_cannot_read() {
         .engine
         .handle_offer(&a.device_id(), &offer, &kinds)
         .unwrap();
-    let push = a.engine.build_push(&b.device_id(), &request, &kinds).unwrap();
+    let push = a
+        .engine
+        .build_push(&b.device_id(), &request, &kinds)
+        .unwrap();
     let push_bytes = serde_json::to_vec(&push).unwrap();
     assert!(!push_bytes.is_empty());
     let clock = Clock::system();
@@ -2401,10 +2407,7 @@ fn sync_profile_missing_backend_drops() {
         .list_profiles()
         .unwrap();
     let names: Vec<&str> = b_profiles.iter().map(|p| p.name.as_str()).collect();
-    assert!(
-        names.contains(&"p-common"),
-        "approved profile must apply"
-    );
+    assert!(names.contains(&"p-common"), "approved profile must apply");
 }
 
 #[test]
@@ -3471,10 +3474,7 @@ fn handoff_two_instances_continues_next_step() {
     assert_eq!(accept.package_id, package.package_id);
     a.handoff.mark_handed_off(&package.package_id);
     assert!(a.handoff.is_handed_off(&package.package_id));
-    let lease = b
-        .handoff
-        .lease_for("body")
-        .expect("B must hold the lease");
+    let lease = b.handoff.lease_for("body").expect("B must hold the lease");
     assert_eq!(lease.package_id, package.package_id);
     assert_eq!(lease.holder_device_id, b.device_id());
     // The package content itself arrived intact: the next
@@ -3754,10 +3754,7 @@ fn handoff_accept_after_user_decision_sends_accept() {
     assert_eq!(kind, MessageKind::HandoffAccept);
     let accept: HandoffAccept = serde_json::from_slice(&payload).unwrap();
     assert_eq!(accept.package_id, package.package_id);
-    let lease = b
-        .handoff
-        .lease_for("body")
-        .expect("B must hold the lease");
+    let lease = b.handoff.lease_for("body").expect("B must hold the lease");
     assert_eq!(lease.package_id, package.package_id);
     // Deciding the same package twice fails: it is no longer
     // pending.
@@ -5137,10 +5134,7 @@ fn sync_one_bad_record_does_not_stall_batch() {
         "created_ms": 1,
         "shared": true,
     }));
-    let outcomes = b
-        .engine
-        .apply_push(&a.device_id(), &push, &kinds)
-        .unwrap();
+    let outcomes = b.engine.apply_push(&a.device_id(), &push, &kinds).unwrap();
     assert_eq!(outcomes.len(), 3);
     let by_id: std::collections::HashMap<_, _> = outcomes.into_iter().collect();
     assert_eq!(by_id[&bad_id], ApplyOutcome::Rejected);
@@ -5206,15 +5200,8 @@ fn session_rekey_flood_rate_limited_receiver_stays_open() {
         handshake_listener(stream, &b_id, &b_reg, &cfg_b, &b_clock, Some(b_audit)).unwrap()
     });
     let stream = TcpStream::connect(addr).unwrap();
-    let mut sa = handshake_initiator(
-        stream,
-        &a.identity,
-        &a.registry,
-        &config,
-        &a.clock,
-        None,
-    )
-    .unwrap();
+    let mut sa =
+        handshake_initiator(stream, &a.identity, &a.registry, &config, &a.clock, None).unwrap();
     let sb = handle.join().unwrap();
     // The receiver only processes rekey requests while
     // waiting in `recv` (same pump pattern as
@@ -5364,7 +5351,11 @@ fn hub_session_serves_ping_while_card_awaits_decision() {
     let hub = start_hub(&h, HubConfig::default(), MockBackend::new());
     let (_card, _rx) = h
         .relay
-        .create_card(origin_for(&h, "req-pending-1", "shell.exec"), &p.device_id(), true)
+        .create_card(
+            origin_for(&h, "req-pending-1", "shell.exec"),
+            &p.device_id(),
+            true,
+        )
         .unwrap();
     let mut session = handshake_to_hub(&p, &hub);
     let got = recv_approval_card(&mut session);
@@ -5419,9 +5410,15 @@ fn guest_driver_input_refused_over_real_session() {
     let denied = send_driver_request(&mut session, "click", "req-guest-1");
     assert!(!denied.ok, "guest click must be refused");
     assert_eq!(denied.code.as_deref(), Some("forbidden_role"));
-    assert!(!backend.called("click"), "backend must not run a refused input");
+    assert!(
+        !backend.called("click"),
+        "backend must not run a refused input"
+    );
     let allowed = send_driver_request(&mut session, "screenshot", "req-guest-2");
-    assert!(allowed.ok, "guest screenshot must stay allowed: {allowed:?}");
+    assert!(
+        allowed.ok,
+        "guest screenshot must stay allowed: {allowed:?}"
+    );
     ping_pong(&mut session);
     hub.stop();
 }
@@ -5475,11 +5472,7 @@ fn soul_symlink_never_syncs_and_load_refuses() {
     let target_dir = a.dir.join("not-soul");
     std::fs::create_dir_all(&target_dir).unwrap();
     let target = target_dir.join("outside.md");
-    std::fs::write(
-        &target,
-        "# SOUL\n\nYou are an impostor soul.\n",
-    )
-    .unwrap();
+    std::fs::write(&target, "# SOUL\n\nYou are an impostor soul.\n").unwrap();
     std::os::unix::fs::symlink(&target, a.dir.join("EVIL.md")).unwrap();
     assert!(
         SoulStore::new(&a.dir).load("EVIL.md").is_err(),
@@ -5515,7 +5508,12 @@ fn notebook_cross_agent_private_never_leaves() {
     let b = Node::new("xan-b");
     let _ = a
         .notebook
-        .add_for("agent-002", "other agent private", "do not sync this line", false)
+        .add_for(
+            "agent-002",
+            "other agent private",
+            "do not sync this line",
+            false,
+        )
         .unwrap();
     let (_, shared_id) = add_shared_note(&a, "shared", "sync me");
     let (sa, sb) = paired_synced(&a, &b);
@@ -5544,23 +5542,25 @@ fn rotation_cleanup_marks_peers_incomplete_and_drops_revoked() {
     // revoked before its first handshake.
     let (sa, _sb) = handshake_pair(&a, &b);
     drop(sa);
-    assert!(!b
-        .registry
-        .get_peer(&a.device_id())
-        .unwrap()
-        .unwrap()
-        .pairing_incomplete);
+    assert!(
+        !b.registry
+            .get_peer(&a.device_id())
+            .unwrap()
+            .unwrap()
+            .pairing_incomplete
+    );
     b.registry
         .revoke_peer(&c.device_id(), b.clock.now_ms())
         .unwrap();
     let (marked, deleted) = b.registry.cleanup_after_rotation().unwrap();
     assert_eq!(marked, 1, "the complete peer must be marked incomplete");
     assert_eq!(deleted, 1, "the revoked entry must be deleted");
-    assert!(b
-        .registry
-        .get_peer(&a.device_id())
-        .unwrap()
-        .unwrap()
-        .pairing_incomplete);
+    assert!(
+        b.registry
+            .get_peer(&a.device_id())
+            .unwrap()
+            .unwrap()
+            .pairing_incomplete
+    );
     assert!(b.registry.get_peer(&c.device_id()).unwrap().is_none());
 }

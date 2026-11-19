@@ -591,7 +591,15 @@ fn cmd_hub(args: &FriendsArgs, rest: &[String]) -> Result<(), MimintError> {
         ctx.hub.exposure_state()
     );
     println!("  xiaozhi  port {}", ctx.hub.xiaozhi_port());
-    println!("  ota      port {} ({})", ctx.hub.ota_port(), if ctx.hub.ota_open() { "đang mở" } else { "đã đóng" });
+    println!(
+        "  ota      port {} ({})",
+        ctx.hub.ota_port(),
+        if ctx.hub.ota_open() {
+            "đang mở"
+        } else {
+            "đã đóng"
+        }
+    );
     println!("  {}", mimint_core::friends::texts::HUB_EXPOSURE_OTA_OPEN);
     println!("  brain    Ollama qwen2.5:3b @ 127.0.0.1:11434 (one brain for both ESP32 paths)");
     println!("  driver   none (no body attached to this CLI process)");
