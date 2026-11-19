@@ -118,7 +118,11 @@ impl Node {
                 Arc::clone(&registry),
                 sources,
                 identity.device_id().to_string(),
-                None,
+                // Fix pass 7: the engine's audit events
+                // (sync_successor_rejected, sync_record_rejected,
+                // sync_soul_pending_approval, ...) must be
+                // observable in the node's audit log.
+                Some(Arc::clone(&audit)),
                 clock.clone(),
             )
             .unwrap(),
@@ -1023,7 +1027,10 @@ impl Node {
                 Arc::clone(&registry),
                 sources,
                 identity.device_id().to_string(),
-                None,
+                // Fix pass 7: the engine's audit events must be
+                // observable in the node's audit log (as in
+                // `Node::new` above).
+                Some(Arc::clone(&audit)),
                 clock.clone(),
             )
             .unwrap(),
@@ -2363,20 +2370,40 @@ fn sync_profile_missing_backend_drops() {
     .unwrap();
     let (sa, sb) = paired_synced(&a, &b);
     sync_both(&a, &b, sa, sb, &SyncKinds::all());
-    // B keeps the profile whose backend it has, and drops the
-    // one naming an unknown backend — without creating the
-    // backend and without failing the sync.
+    // F7-02 changed this: a naming_profile NEVER auto-applies
+    // any more, even when its backend is known — it waits for
+    // the local user's approval. The unknown-backend profile
+    // is still DROPPED outright (never held, never applied).
+    let b_profiles = ConfigFileProfileSink::new(&b.config_path)
+        .list_profiles()
+        .unwrap();
+    let names: Vec<&str> = b_profiles.iter().map(|p| p.name.as_str()).collect();
+    assert!(
+        !names.contains(&"p-common"),
+        "known-backend profile must wait for approval, not auto-apply"
+    );
+    assert!(
+        !names.contains(&"p-ollama"),
+        "unknown-backend profile must drop"
+    );
+    let pending = b.engine.pending_sync_approvals().unwrap();
+    let held: Vec<&str> = pending.iter().map(|row| row.0.as_str()).collect();
+    assert!(
+        held.contains(&"profile:p-common"),
+        "known-backend profile must be held: {held:?}"
+    );
+    assert!(
+        !held.contains(&"profile:p-ollama"),
+        "unknown-backend profile must not be held"
+    );
+    assert!(b.engine.approve_pending_sync("profile:p-common").unwrap());
     let b_profiles = ConfigFileProfileSink::new(&b.config_path)
         .list_profiles()
         .unwrap();
     let names: Vec<&str> = b_profiles.iter().map(|p| p.name.as_str()).collect();
     assert!(
         names.contains(&"p-common"),
-        "known-backend profile must apply"
-    );
-    assert!(
-        !names.contains(&"p-ollama"),
-        "unknown-backend profile must drop"
+        "approved profile must apply"
     );
 }
 
@@ -4957,7 +4984,10 @@ fn pairing_lockout_by_ip_survives_device_rotation() {
             &auto_initiator(),
             &list_ui,
             None,
-            None,
+            // The listener's audit must be wired: the
+            // `pairing_locked` event is what proves the IP
+            // bucket fired.
+            Some(Arc::clone(&b.audit)),
         );
         assert!(ra.is_err() && rb.is_err(), "attempt {i} must fail");
     }
@@ -4987,7 +5017,7 @@ fn pairing_lockout_by_ip_survives_device_rotation() {
         &auto_initiator(),
         &list_ui,
         None,
-        None,
+        Some(Arc::clone(&b.audit)),
     );
     assert!(ra.is_err() && rb.is_err(), "6th fresh identity refused");
     assert!(audit_contains(&b, "pairing_locked"));
@@ -5006,8 +5036,8 @@ fn hub_close_lan_stops_ota_and_revokes_tokens() {
     assert!(hub.ota_open());
     let addr = format!("127.0.0.1:{}", hub.ota_port());
     assert!(wait_for_tcp(addr.parse().unwrap(), 20), "OTA must listen");
-    let token = hub.ota_server().issue_token("test-uuid-0002").unwrap();
-    assert!(hub.ota_server().consume_token(&token).is_some());
+    // One token issued before the close (a second issue
+    // within 60 s would hit the OTA per-device rate limit).
     let token2 = hub.ota_server().issue_token("test-uuid-0002").unwrap();
     hub.close_lan();
     assert!(!hub.ota_open());
@@ -5027,8 +5057,22 @@ fn hub_close_lan_stops_ota_and_revokes_tokens() {
     assert!(audit_contains(&b, "hub_lan_closed"));
     hub.open_lan();
     assert!(hub.ota_open());
-    let token3 = hub.ota_server().issue_token("test-uuid-0002").unwrap();
-    assert!(hub.ota_server().consume_token(&token3).is_some());
+    // Re-enabled: a fresh OTA connection is NOT dropped at
+    // once (the loop now waits for the request instead of
+    // closing — a read times out rather than returning EOF).
+    // (No new token is issued here: the OTA per-device rate
+    // limit allows one check per 60 s.)
+    let mut stream = TcpStream::connect(&addr).unwrap();
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+        .unwrap();
+    let mut buf = [0u8; 1];
+    use std::io::Read as _;
+    let read = stream.read(&mut buf);
+    assert!(
+        read.is_err(),
+        "OTA must serve again after open_lan (read must time out, not EOF): {read:?}"
+    );
     hub.stop();
 }
 
@@ -5170,8 +5214,15 @@ fn session_rekey_flood_rate_limited_receiver_stays_open() {
     )
     .unwrap();
     let sb = handle.join().unwrap();
+    // The receiver only processes rekey requests while
+    // waiting in `recv` (same pump pattern as
+    // `friends_rekey_works`): run it on a thread.
+    let pump = std::thread::spawn(move || {
+        let mut sb = sb;
+        let _ = sb.recv();
+        (sb.rekey_count(), sb.is_closed())
+    });
     sa.initiate_rekey().unwrap();
-    assert_eq!(sb.rekey_count(), 1);
     // Second rekey 0 s later: under the 5 s cooldown, the
     // receiver drops it; the sender times out on its side.
     assert!(sa.initiate_rekey().is_err());
@@ -5179,15 +5230,12 @@ fn session_rekey_flood_rate_limited_receiver_stays_open() {
         poll_audit_contains(&b, "rekey_rate_limited", 20),
         "excess rekey must be audited"
     );
-    assert_eq!(sb.rekey_count(), 1, "receiver rekey count bounded");
-    assert!(!sb.is_closed(), "receiver session must stay open");
-    // The receiver still serves: a ping from the sender side
-    // would need the sender, so prove liveness by re-keying
-    // after the cooldown instead — the session is usable.
-    std::thread::sleep(std::time::Duration::from_millis(200));
-    assert!(!sb.is_closed());
+    // Dropping the sender closes the socket, so the pump's
+    // recv returns and the thread can be joined.
     drop(sa);
-    drop(sb);
+    let (sb_rekeys, sb_closed) = pump.join().unwrap();
+    assert_eq!(sb_rekeys, 1, "receiver rekey count bounded");
+    assert!(!sb_closed, "receiver session must stay open");
 }
 
 /// F7-11: a handoff turn is visible while Running, its
@@ -5209,10 +5257,21 @@ fn handoff_turn_cancel_releases_lease_early() {
     let package = make_package(&a, &b, "slow task");
     let mut session = handshake_to_hub(&a, &hub_b);
     offer_over_session(&mut session, &package);
-    assert!(hub_b
-        .pending_handoffs()
-        .iter()
-        .any(|item| item.package.package_id == package.package_id));
+    // The hub verifies the offer on its session loop: poll
+    // until it is listed as pending before deciding.
+    let mut pending = false;
+    for _ in 0..50 {
+        if hub_b
+            .pending_handoffs()
+            .iter()
+            .any(|item| item.package.package_id == package.package_id)
+        {
+            pending = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(pending, "offer must become pending");
     hub_b.decide_handoff(&package.package_id, true).unwrap();
     // Turn is Running and the started audit is already there
     // while the brain is still sleeping.
@@ -5301,10 +5360,31 @@ fn hub_session_serves_ping_while_card_awaits_decision() {
 fn guest_driver_input_refused_over_real_session() {
     let h = Node::new("gdi-h");
     let p = Node::new("gdi-p");
-    pair_nodes(&h, &p, SasFlow::Compare);
-    h.registry
-        .set_trust_granted(&p.device_id(), Trust::Guest)
-        .unwrap();
+    // Pair with the HUB granting Guest to the peer (a
+    // downgrade after pairing would break the handshake's
+    // trust claim by design — trust changes need re-pairing).
+    let guest_ui = ScriptedListenerUi {
+        decision: ListenerDecision {
+            sas_outcome: SasOutcome::Matched,
+            trust_granted: Trust::Guest,
+            fingerprint_confirmed: true,
+            fingerprint_skipped_with_warning: false,
+        },
+    };
+    let (ra, rb) = ceremony_with(
+        &p,
+        &h,
+        SasFlow::Compare,
+        &auto_initiator(),
+        &guest_ui,
+        None,
+        None,
+    );
+    assert!(ra.is_ok() && rb.is_ok(), "guest pairing must succeed");
+    assert_eq!(
+        h.registry.get_peer(&p.device_id()).unwrap().unwrap().trust,
+        Trust::Guest
+    );
     let backend = MockBackend::new();
     let hub = start_hub(&h, HubConfig::default(), backend.clone());
     let mut session = handshake_to_hub(&p, &hub);
@@ -5332,9 +5412,16 @@ fn handoff_strange_actuator_rejected_over_session() {
     evil.actuator = "evil-actuator".to_string();
     let mut session = handshake_to_hub(&a, &hub_b);
     offer_over_session(&mut session, &evil);
+    // The hub answers with a HandoffReject naming the bad
+    // actuator — never an accept, never a pending package.
+    let (kind, payload) = session.recv().unwrap();
+    assert_eq!(kind, MessageKind::HandoffReject);
+    let reject: HandoffReject = serde_json::from_slice(&payload).unwrap();
+    assert_eq!(reject.package_id, evil.package_id);
     assert!(
-        !reply_waiting(&session, 500),
-        "no accept for a strange actuator"
+        reject.reason.contains("evil-actuator"),
+        "reject must name the strange actuator: {}",
+        reject.reason
     );
     assert!(
         !hub_b
@@ -5374,9 +5461,15 @@ fn soul_symlink_never_syncs_and_load_refuses() {
         SoulStore::new(&b.dir).load("EVIL.md").is_err(),
         "symlink must not arrive"
     );
+    // The real soul is held for approval (F7-02), never
+    // auto-applied — and the symlink is not held either.
+    let pending = b.engine.pending_sync_approvals().unwrap();
+    assert_eq!(pending.len(), 1, "only the real soul is held: {pending:?}");
+    assert_eq!(pending[0].0, "soul:SOUL.md");
+    assert!(b.engine.approve_pending_sync("soul:SOUL.md").unwrap());
     assert!(
         SoulStore::new(&b.dir).load("SOUL.md").is_ok(),
-        "real soul still syncs"
+        "real soul applies after approval"
     );
 }
 

@@ -841,7 +841,7 @@ impl SyncEngine {
                     hash: record.body_sha256.clone(),
                 },
             )?;
-            self.note_accepted_lineage(record)?;
+            self.note_accepted_lineage(peer_device_id, record)?;
             if let Some((_kind, deleted_by_device, deleted_ms)) = receipt {
                 self.audit(
                     "sync_resurrection_noticed",
@@ -895,7 +895,7 @@ impl SyncEngine {
                         hash: record.body_sha256.clone(),
                     },
                 )?;
-                self.note_accepted_lineage(record)?;
+                self.note_accepted_lineage(peer_device_id, record)?;
                 Ok(ApplyOutcome::Ignored)
             }
             ConflictDecision::Apply => {
@@ -912,7 +912,7 @@ impl SyncEngine {
                             "peer_device_id": peer_device_id,
                         }),
                     );
-                    self.note_accepted_lineage(record)?;
+                    self.note_accepted_lineage(peer_device_id, record)?;
                     return Ok(ApplyOutcome::Conflicted);
                 }
                 self.apply_record_to_store(record, kind)?;
@@ -931,35 +931,63 @@ impl SyncEngine {
                         hash: record.body_sha256.clone(),
                     },
                 )?;
-                self.note_accepted_lineage(record)?;
+                self.note_accepted_lineage(peer_device_id, record)?;
                 Ok(ApplyOutcome::Applied)
             }
             ConflictDecision::KeepLocal => Ok(ApplyOutcome::KeptLocal),
             ConflictDecision::Conflict => {
                 self.record_conflict(peer_device_id, record, kind)?;
-                self.note_accepted_lineage(record)?;
+                self.note_accepted_lineage(peer_device_id, record)?;
                 Ok(ApplyOutcome::Conflicted)
             }
         }
     }
 
     /// Record an accepted record's version and its causality
-    /// lineage as circulating versions (F7-01/F7-27). Only
-    /// called for accepted records — a rejected forgery must
-    /// never launder provenance for its claimed base.
-    fn note_accepted_lineage(&self, record: &SyncRecord) -> Result<(), MimintError> {
+    /// lineage as circulating versions (F7-01/F7-27), and
+    /// record what the SENDING peer demonstrably knew — the
+    /// second leg of the provenance gate. Only called for
+    /// accepted records — a rejected forgery must never
+    /// launder provenance for its claimed base.
+    fn note_accepted_lineage(
+        &self,
+        peer_device_id: &str,
+        record: &SyncRecord,
+    ) -> Result<(), MimintError> {
         self.registry.record_known_version(
             &record.sync_id,
             &record.version(),
             &record.body_sha256,
         )?;
+        let now = self.now_ms();
+        self.registry.record_peer_knowledge(
+            peer_device_id,
+            &record.sync_id,
+            &record.version(),
+            &record.body_sha256,
+            now,
+        )?;
         if let Some(based_on) = &record.based_on {
             self.registry
                 .record_known_version(&record.sync_id, based_on, &record.body_sha256)?;
+            self.registry.record_peer_knowledge(
+                peer_device_id,
+                &record.sync_id,
+                based_on,
+                &record.body_sha256,
+                now,
+            )?;
         }
         if let Some(supersedes) = &record.supersedes_version {
             self.registry
                 .record_known_version(&record.sync_id, supersedes, &record.body_sha256)?;
+            self.registry.record_peer_knowledge(
+                peer_device_id,
+                &record.sync_id,
+                supersedes,
+                &record.body_sha256,
+                now,
+            )?;
         }
         Ok(())
     }
@@ -1001,7 +1029,7 @@ impl SyncEngine {
                 hash: record.body_sha256.clone(),
             },
         )?;
-        self.note_accepted_lineage(&record)?;
+        self.note_accepted_lineage(&peer_device_id, &record)?;
         self.audit(
             "sync_pending_approved",
             serde_json::json!({"sync_id": record.sync_id, "kind": record.kind}),

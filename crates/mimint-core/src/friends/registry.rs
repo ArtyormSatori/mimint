@@ -294,9 +294,14 @@ impl DeviceRegistry {
             -- record version this body SENT to a peer, per
             -- peer. A peer may only claim `based_on` /
             -- `supersedes_version` for a version it could
-            -- have received: one this body sent to it, one
-            -- this body sent to anyone (multi-hop A->B->C),
-            -- or one this body received before (known).
+            -- have received: one this body sent TO IT, or one
+            -- it demonstrably knew when it sent an earlier
+            -- ACCEPTED record (see `peer_knowledge`). The
+            -- "sent to anyone" and "received before" legs were
+            -- removed: they made the gate vacuous — any version
+            -- this body ever received would have provenance for
+            -- every peer, including one that never saw it
+            -- (found by `sync_forged_successor_without_...`).
             CREATE TABLE IF NOT EXISTS sent_versions (
                 peer_device_id TEXT NOT NULL,
                 sync_id TEXT NOT NULL,
@@ -304,6 +309,21 @@ impl DeviceRegistry {
                 version_device TEXT NOT NULL,
                 hash TEXT NOT NULL,
                 sent_ms INTEGER NOT NULL,
+                PRIMARY KEY (peer_device_id, sync_id, version_lamport, version_device)
+            );
+            -- Versions a peer demonstrably knew: the version
+            -- of an ACCEPTED record it sent, plus the
+            -- based_on/supersedes_version that record
+            -- referenced. Recorded only for accepted records —
+            -- a rejected forgery must never launder provenance
+            -- for its claimed base.
+            CREATE TABLE IF NOT EXISTS peer_knowledge (
+                peer_device_id TEXT NOT NULL,
+                sync_id TEXT NOT NULL,
+                version_lamport INTEGER NOT NULL,
+                version_device TEXT NOT NULL,
+                hash TEXT NOT NULL,
+                received_ms INTEGER NOT NULL,
                 PRIMARY KEY (peer_device_id, sync_id, version_lamport, version_device)
             );
             -- Versions received from a peer (or referenced as
@@ -753,13 +773,43 @@ impl DeviceRegistry {
         Ok(())
     }
 
+    /// Record that a peer demonstrably knew `version` of
+    /// `sync_id`: it sent an accepted record carrying that
+    /// version (or referencing it as based_on/supersedes).
+    /// Called only for accepted records (see the table
+    /// comment): a rejected forgery never launders provenance.
+    pub fn record_peer_knowledge(
+        &self,
+        peer_device_id: &str,
+        sync_id: &str,
+        version: &VersionId,
+        hash: &str,
+        received_ms: u64,
+    ) -> Result<(), MimintError> {
+        let conn = self.connection();
+        conn.execute(
+            "INSERT OR IGNORE INTO peer_knowledge
+                (peer_device_id, sync_id, version_lamport, version_device, hash, received_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                peer_device_id,
+                sync_id,
+                version.lamport as i64,
+                version.device,
+                hash,
+                received_ms as i64,
+            ],
+        )?;
+        Ok(())
+    }
+
     /// Provenance for a claimed base version (F7-01/F7-27):
-    /// true when the peer could plausibly have seen it —
-    /// this body sent it to this peer, sent it to ANY peer
-    /// (multi-hop: the peer may have received it via a third
-    /// body), or this body received it (or its lineage) from
-    /// a peer before. A version this body created locally and
-    /// never sent to anyone has NO provenance for any peer.
+    /// true when the peer could plausibly have seen it — this
+    /// body sent it TO THIS PEER, or this peer demonstrably
+    /// knew it when it sent an earlier accepted record. A
+    /// locally-created version never sent to anyone has NO
+    /// provenance for any peer; neither does a version this
+    /// body received from a DIFFERENT peer.
     pub fn version_has_provenance(
         &self,
         peer_device_id: &str,
@@ -783,26 +833,20 @@ impl DeviceRegistry {
         if sent_to_peer.is_some() {
             return Ok(true);
         }
-        let sent_to_any: Option<i64> = conn
+        let known_by_peer: Option<i64> = conn
             .query_row(
-                "SELECT 1 FROM sent_versions WHERE sync_id = ?1
-                 AND version_lamport = ?2 AND version_device = ?3",
-                params![sync_id, version.lamport as i64, version.device],
+                "SELECT 1 FROM peer_knowledge WHERE peer_device_id = ?1 AND sync_id = ?2
+                 AND version_lamport = ?3 AND version_device = ?4",
+                params![
+                    peer_device_id,
+                    sync_id,
+                    version.lamport as i64,
+                    version.device
+                ],
                 |row| row.get(0),
             )
             .optional()?;
-        if sent_to_any.is_some() {
-            return Ok(true);
-        }
-        let known: Option<i64> = conn
-            .query_row(
-                "SELECT 1 FROM known_versions WHERE sync_id = ?1
-                 AND version_lamport = ?2 AND version_device = ?3",
-                params![sync_id, version.lamport as i64, version.device],
-                |row| row.get(0),
-            )
-            .optional()?;
-        Ok(known.is_some())
+        Ok(known_by_peer.is_some())
     }
 
     /// Drop sent-version rows older than `keep_ms` (called
