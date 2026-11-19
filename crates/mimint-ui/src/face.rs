@@ -1,5 +1,13 @@
-//! The ball avatar's face: 9 states mapped from the 9 core looks,
-//! with parameters the renderer turns into shapes.
+//! The ball avatar's face: 9 states mapped from the 9 core face
+//! states, with parameters the renderer turns into shapes.
+//!
+//! The per-state parameters are NOT in this file: they live in the
+//! face design data file (`assets/mint-face.json`, a character
+//! asset under the Mimint Character Licence) and are loaded at
+//! runtime by [`FaceDesign`](crate::face_design::FaceDesign). Only
+//! the generic rendering code is here (Apache 2.0). When the design
+//! file is missing or invalid, the face falls back to a neutral,
+//! generic face — never to Mint's face by accident.
 //!
 //! State selection comes from two sources: turn-phase events
 //! (thinking while a turn runs, happy/celebrating on finish,
@@ -15,10 +23,11 @@
 //! machines) draws a static face with only the blink, and the UI
 //! labels it visibly.
 
+use crate::face_design::FaceDesign;
 use mimint_core::EmotionCode;
 use std::time::{Duration, Instant};
 
-/// The 9 avatar states, in design order (core looks 1–9).
+/// The 9 avatar states, in design order (9 core face states).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FaceState {
     Neutral,
@@ -33,6 +42,70 @@ pub enum FaceState {
 }
 
 impl FaceState {
+    /// All 9 states, in design order.
+    pub const ALL: [FaceState; 9] = [
+        FaceState::Neutral,
+        FaceState::Happy,
+        FaceState::Listening,
+        FaceState::Thinking,
+        FaceState::Speaking,
+        FaceState::Surprised,
+        FaceState::Confused,
+        FaceState::Sleepy,
+        FaceState::Celebrating,
+    ];
+
+    /// Wire name: the exact string used as the key for this state
+    /// in the face design file (`assets/mint-face.json`). Same
+    /// strings as [`EmotionCode::wire_name`]: the design file, the
+    /// emotion channel, and the face share one vocabulary.
+    pub fn wire_name(self) -> &'static str {
+        match self {
+            FaceState::Neutral => "neutral",
+            FaceState::Happy => "happy",
+            FaceState::Listening => "listening",
+            FaceState::Thinking => "thinking",
+            FaceState::Speaking => "speaking",
+            FaceState::Surprised => "surprised",
+            FaceState::Confused => "confused",
+            FaceState::Sleepy => "sleepy",
+            FaceState::Celebrating => "celebrating",
+        }
+    }
+
+    /// Parse a wire name. Exact match, case-sensitive; anything
+    /// else is not a state.
+    pub fn parse_wire(name: &str) -> Option<Self> {
+        match name {
+            "neutral" => Some(FaceState::Neutral),
+            "happy" => Some(FaceState::Happy),
+            "listening" => Some(FaceState::Listening),
+            "thinking" => Some(FaceState::Thinking),
+            "speaking" => Some(FaceState::Speaking),
+            "surprised" => Some(FaceState::Surprised),
+            "confused" => Some(FaceState::Confused),
+            "sleepy" => Some(FaceState::Sleepy),
+            "celebrating" => Some(FaceState::Celebrating),
+            _ => None,
+        }
+    }
+
+    /// Index into the design's per-state parameter table, in
+    /// design order.
+    pub fn index(self) -> usize {
+        match self {
+            FaceState::Neutral => 0,
+            FaceState::Happy => 1,
+            FaceState::Listening => 2,
+            FaceState::Thinking => 3,
+            FaceState::Speaking => 4,
+            FaceState::Surprised => 5,
+            FaceState::Confused => 6,
+            FaceState::Sleepy => 7,
+            FaceState::Celebrating => 8,
+        }
+    }
+
     /// The face state for one emotion code (Phase 5, P5.6). The
     /// mapping is 1:1, in design order; the labels match the
     /// codes' Vietnamese labels.
@@ -114,83 +187,13 @@ pub struct FaceParams {
     pub star_burst: bool,
 }
 
-/// Pure mapping from state to drawing parameters.
-pub fn params_for(state: FaceState) -> FaceParams {
-    match state {
-        FaceState::Neutral => FaceParams {
-            eyes: EyeShape::Oval,
-            mouth: MouthShape::Smile,
-            blush: true,
-            tilt_degrees: 0.0,
-            bounce: false,
-            star_burst: false,
-        },
-        FaceState::Happy => FaceParams {
-            eyes: EyeShape::HappyArc,
-            mouth: MouthShape::OpenSmile,
-            blush: true,
-            tilt_degrees: 0.0,
-            bounce: true,
-            star_burst: false,
-        },
-        FaceState::Listening => FaceParams {
-            eyes: EyeShape::Oval,
-            mouth: MouthShape::Smile,
-            blush: true,
-            tilt_degrees: 0.0,
-            bounce: false,
-            star_burst: false,
-        },
-        FaceState::Thinking => FaceParams {
-            eyes: EyeShape::Dot,
-            mouth: MouthShape::Flat,
-            blush: false,
-            tilt_degrees: 8.0,
-            bounce: false,
-            star_burst: false,
-        },
-        FaceState::Speaking => FaceParams {
-            eyes: EyeShape::Oval,
-            mouth: MouthShape::OpenSmile,
-            blush: true,
-            tilt_degrees: 0.0,
-            bounce: false,
-            star_burst: false,
-        },
-        FaceState::Surprised => FaceParams {
-            eyes: EyeShape::Wide,
-            mouth: MouthShape::SmallO,
-            blush: false,
-            tilt_degrees: 0.0,
-            bounce: true,
-            star_burst: false,
-        },
-        FaceState::Confused => FaceParams {
-            eyes: EyeShape::Dot,
-            mouth: MouthShape::Wavy,
-            blush: false,
-            tilt_degrees: -8.0,
-            bounce: false,
-            star_burst: false,
-        },
-        FaceState::Sleepy => FaceParams {
-            eyes: EyeShape::Closed,
-            mouth: MouthShape::Yawn,
-            blush: false,
-            tilt_degrees: 0.0,
-            bounce: false,
-            star_burst: false,
-        },
-        FaceState::Celebrating => FaceParams {
-            eyes: EyeShape::HappyArc,
-            mouth: MouthShape::OpenSmile,
-            blush: true,
-            tilt_degrees: 0.0,
-            bounce: true,
-            star_burst: true,
-        },
-    }
-}
+// The per-state parameters used to live here as a hardcoded
+// `params_for` match (Phase 3–7). Since Phase 8 (F8-12) they live
+// in the face design data file (`assets/mint-face.json`) and are
+// loaded by [`FaceDesign`](crate::face_design::FaceDesign): the
+// design is a character asset, the code that renders it is Apache
+// 2.0, and the two no longer share one file. See
+// `FaceDesign::load_default` and `FaceMachine::params`.
 
 /// Breathing scale for the body: a 4-second sine cycle, 1.0 ± 2%.
 pub fn breath_scale(elapsed: Duration) -> f32 {
@@ -241,17 +244,35 @@ pub struct FaceMachine {
     /// pending) always overrides model codes; turn-phase events
     /// clear it.
     system_override: Option<FaceState>,
+    /// The face design this machine renders (Phase 8, F8-12):
+    /// per-state parameters loaded from `assets/mint-face.json`,
+    /// or the neutral design when the file is missing or invalid.
+    /// The design is data, not code — editing it never means
+    /// editing this file.
+    design: FaceDesign,
 }
 
 impl FaceMachine {
     pub fn new(now: Instant) -> Self {
+        Self::with_design(now, FaceDesign::load_default())
+    }
+
+    /// Build a machine with an explicit design (tests, and any
+    /// caller that already resolved the design file itself).
+    pub fn with_design(now: Instant, design: FaceDesign) -> Self {
         Self {
             state: FaceState::Neutral,
             state_since: now,
             last_activity: now,
             emotion_held: false,
             system_override: None,
+            design,
         }
+    }
+
+    /// The design this machine renders.
+    pub fn design(&self) -> &FaceDesign {
+        &self.design
     }
 
     /// The DISPLAYED state: the system override when one is set,
@@ -272,7 +293,7 @@ impl FaceMachine {
     }
 
     pub fn params(&self) -> FaceParams {
-        params_for(self.state())
+        self.design.params_for(self.state())
     }
 
     /// Set a system override (F5-10): the displayed face becomes
@@ -394,29 +415,45 @@ mod tests {
 
     #[test]
     fn all_nine_states_have_distinct_params() {
-        let states = [
-            FaceState::Neutral,
-            FaceState::Happy,
-            FaceState::Listening,
-            FaceState::Thinking,
-            FaceState::Speaking,
-            FaceState::Surprised,
-            FaceState::Confused,
-            FaceState::Sleepy,
-            FaceState::Celebrating,
-        ];
-        for state in states {
-            let params = params_for(state);
+        // The Mint design file, loaded the same way the app loads
+        // it — the parameters now come from data, not from a
+        // hardcoded match (Phase 8, F8-12).
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("assets")
+            .join(crate::face_design::FACE_DESIGN_FILE);
+        let design = FaceDesign::load(&path)
+            .unwrap_or_else(|e| panic!("shipped design file {} must load: {e}", path.display()));
+        for state in FaceState::ALL {
+            let params = design.params_for(state);
             // Every state has a label and a defined mouth.
             assert!(!state.label().is_empty());
             let _ = params;
         }
         // The two most similar states still differ.
-        assert_ne!(params_for(FaceState::Neutral), params_for(FaceState::Happy));
         assert_ne!(
-            params_for(FaceState::Happy),
-            params_for(FaceState::Celebrating)
+            design.params_for(FaceState::Neutral),
+            design.params_for(FaceState::Happy)
         );
+        assert_ne!(
+            design.params_for(FaceState::Happy),
+            design.params_for(FaceState::Celebrating)
+        );
+    }
+
+    #[test]
+    fn face_machine_renders_its_injected_design() {
+        use crate::face_design::neutral_params;
+        let now = Instant::now();
+        let neutral_machine = FaceMachine::with_design(now, FaceDesign::neutral());
+        // A neutral machine shows the neutral face for every state,
+        // including Happy (which in Mint's design smiles + bounces).
+        assert_eq!(neutral_machine.params(), neutral_params());
+        let mut m = neutral_machine;
+        m.on_turn_finished(now, false);
+        assert_eq!(m.state(), FaceState::Happy);
+        assert_eq!(m.params(), neutral_params());
     }
 
     #[test]

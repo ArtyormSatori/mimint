@@ -26,6 +26,7 @@ pub mod coordinator;
 pub mod delegate;
 pub mod error_messages;
 pub mod face;
+pub mod face_design;
 pub mod friends_panel;
 pub mod motion;
 pub mod worker;
@@ -38,6 +39,7 @@ pub use approver::{
 pub use audit_view::{format_time_ms, parse_audit_line, read_audit_tail, AuditRow};
 pub use chat::{ApprovalRequest, ChatRole, ChatState, ControlState, TurnStatus, UiMessage};
 pub use face::{FaceMachine, FaceParams, FaceState};
+pub use face_design::{FaceDesign, FACE_DESIGN_ENV, FACE_DESIGN_FILE};
 pub use friends_panel::{
     ollama_turn, spawn_friends_worker, FriendsPanel, FriendsView, NullDriverBackend,
     PanelListenerUi,

@@ -1,0 +1,93 @@
+Mimint
+Copyright 2026 ArtyormSatori
+
+This repository is distributed under "Apache License 2.0 with
+additional conditions": the code is under the Apache License,
+Version 2.0 (see the LICENSE file), and the character assets of
+Mint listed in section 2 below are NOT under the Apache License —
+they are governed by the additional conditions in
+docs/character-license.md. The two parts are separate: taking the
+code under Apache 2.0 does not grant any right over the character
+assets, and the conditions on the character assets do not restrict
+the code.
+
+WARNING: the code is Apache 2.0, but the character design is under
+separate conditions — the Apache License 2.0 does NOT cover Mint's
+images, face design, or name. Read section 2 before reusing
+anything that shows Mint.
+
+1. Code — Apache License, Version 2.0
+--------------------------------------
+All Rust source code, technical documentation, tests, build scripts,
+and configuration files in this repository are licensed under the
+Apache License, Version 2.0 (the "License"); you may not use them
+except in compliance with the License. You may obtain a copy of the
+License at http://www.apache.org/licenses/LICENSE-2.0 — the full
+text is also in the LICENSE file at the root of this repository.
+
+SPDX: the code is `Apache-2.0`. The additional conditions for the
+character have no SPDX identifier (recorded as
+`LicenseRef-Mimint-Character-1.0`).
+
+2. Character assets of Mint — additional conditions (NOT Apache 2.0)
+---------------------------------------------------------------------
+The following are the character assets of Mint. They are NOT covered
+by the Apache License 2.0. Without prior written permission from
+the repository owner, you may NOT modify, reuse (including embedding
+in another product), redistribute, or create derivative works from
+any of them. Full conditions, including what is allowed and how to
+ask for permission, are in docs/character-license.md.
+
+Assets present in this repository (verified at commit dd883e0):
+
+  a. Thinking image and video — the files that show Mint thinking:
+       assets/mint-thinking.gif
+       assets/mint-thinking.jpg
+       assets/mimint-thinking.mp4
+  b. Avatar face — the 9 face states of Mint (Neutral, Happy,
+     Listening, Thinking, Speaking, Surprised, Confused, Sleepy,
+     Celebrating). The face design (eye and mouth shapes, colours,
+     and the 9 core face states) lives in the data file
+     assets/mint-face.json. The generic code that reads the file
+     and renders the face (crates/mimint-ui/src/face.rs,
+     face_design.rs) is Apache 2.0; the 9 emotion codes in
+     crates/mimint-core/src/emotion.rs (EmotionCode) are generic
+     identifiers, not the design. A neutral default face (generic
+     parameters in code, FaceDesign::neutral, Apache 2.0) is used
+     when the design file is missing, so a fork can remove the
+     character asset by deleting one file.
+  c. The character name "Mint" as the name of this character.
+
+NOT in this repository (same conditions apply when they are
+published; do not mistake them for repo contents): the 20 looks
+(assets/looks/ does not exist in this repository) and the design
+sources (design/). They are local materials only at this commit.
+The character's TTS voice files are NOT character assets under
+these conditions: the current voice is a machine TTS voice, not a
+personal voice, so it needs no protection here; this will be
+revisited only if a personal voice exists.
+
+3. How to ask for permission
+----------------------------
+Open an issue on https://github.com/ArtyormSatori/mimint with a
+title starting with `[character-permission]`, stating clearly:
+which assets you want to use, for what (product / purpose), for
+how long, whether you will modify them, and whether the use is
+commercial. Permission, when granted, is given in writing (in
+the issue or by a written reply from the repository owner), and
+only within the scope stated in that written permission; anything
+outside it remains prohibited. Permission, when granted, is
+non-exclusive, non-transferable, and revocable — unless the
+written permission states otherwise. There is no implied
+permission: the code being under Apache 2.0, the repository being
+public, or the owner not replying, is NOT permission.
+
+4. Third-party software
+-----------------------
+This project depends on third-party software listed in
+THIRD-PARTY-NOTICES.md, each under its own license. In particular,
+binary distributions of the desktop app must keep the font license
+notices for the fonts bundled through epaint_default_fonts
+(SIL Open Font License 1.1 and Ubuntu Font Licence 1.0) — see
+THIRD-PARTY-NOTICES.md section 2 for the full obligation and the
+license texts.
