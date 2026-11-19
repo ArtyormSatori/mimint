@@ -330,6 +330,12 @@ impl Hub {
         self.config.ota_port
     }
 
+    /// Whether the hub runs in lab mode (plain `ws://` on
+    /// loopback/tailnet only, with a continuous warning).
+    pub fn lab_mode(&self) -> bool {
+        self.config.lab_mode
+    }
+
     pub fn exposure_state(&self) -> HubExposure {
         if self.controller.is_pairing_mode() {
             return HubExposure::PairingMode;

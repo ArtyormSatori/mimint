@@ -38,7 +38,9 @@
 //!   screenshots at 125%/150%).
 
 use mimint_body::ScreenRect;
-use mimint_control::{ActorConfig, DEFAULT_MAX_OBSERVATION_AGE};
+use mimint_control::{ActorConfig, ActorDriverBackend, DEFAULT_MAX_OBSERVATION_AGE};
+use mimint_core::friends::context::FriendsContext;
+use mimint_core::friends::util::Clock;
 use mimint_core::{
     build_chain, config_path_outside_workdirs, default_config_path, default_data_dir,
     default_vault, egress::url_is_loopback, evaluate_finetune, load_config_file_hashed,
@@ -47,6 +49,10 @@ use mimint_core::{
 };
 use mimint_ui::app::{AppOptions, BackendInfo};
 use mimint_ui::approver::{approval_channel, RepaintSignal, TokenSlot, DEFAULT_APPROVAL_TIMEOUT};
+use mimint_ui::friends_panel::{
+    ollama_turn, spawn_friends_worker, FriendsPanel, FriendsView, NullDriverBackend,
+    PanelListenerUi,
+};
 use mimint_ui::worker::{BodyFactory, BodyStack, RebuildConfig, WorkerDeps};
 use mimint_ui::MimintApp;
 use serde_json::json;
@@ -57,7 +63,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-const USAGE: &str = "mimint-app: the Mimint desktop app.\n\nUsage:\n  mimint-app [--config PATH] [--db PATH] [--audit PATH] [--max-steps N] [--degraded] [--body] [--profile NAME] [--data-dir PATH]\n\n  --config PATH     Config file (default: $XDG_CONFIG_HOME/mimint/config.toml or ~/.config/mimint/config.toml)\n  --db PATH         Notebook SQLite path (default: mimint.db)\n  --audit PATH      Audit JSONL path (default: mimint-audit.jsonl)\n  --max-steps N     Max brain steps per turn (default: 5)\n  --degraded        Static face + visible simple-mode label (weak machines)\n  --body            Wire the real body (Linux/X11 only): brain gets body_* tools + STOP hotkey\n  --profile NAME    Named profile from the config file (default: the configured default profile)\n  --data-dir PATH   User data directory for SOUL.md, skills/, experience.db (default: platform data dir)\n  --help            Show this help\n";
+const USAGE: &str = "mimint-app: the Mimint desktop app.\n\nUsage:\n  mimint-app [--config PATH] [--db PATH] [--audit PATH] [--max-steps N] [--degraded] [--body] [--profile NAME] [--data-dir PATH]\n\n  --config PATH     Config file (default: $XDG_CONFIG_HOME/mimint/config.toml or ~/.config/mimint/config.toml)\n  --db PATH         Notebook SQLite path (default: mimint.db)\n  --audit PATH      Audit JSONL path (default: mimint-audit.jsonl)\n  --max-steps N     Max brain steps per turn (default: 5)\n  --degraded        Static face + visible simple-mode label (weak machines)\n  --body            Wire the real body (Linux/X11 only): brain gets body_* tools + STOP hotkey\n  --profile NAME    Named profile from the config file (default: the configured default profile)\n  --data-dir PATH   User data directory for SOUL.md, skills/, experience.db (default: platform data dir)\n  --show-friends    Open straight into the friends view (paired bodies)\n  --friends-view NAME  Open the friends view at this tab (devices|pair|conflicts|hub|handoff|esp32)\n  --help            Show this help\n";
 
 struct Args {
     config: Option<PathBuf>,
@@ -68,6 +74,8 @@ struct Args {
     body: bool,
     profile: Option<String>,
     data_dir: Option<PathBuf>,
+    show_friends: bool,
+    friends_view: Option<String>,
 }
 
 fn parse_args(argv: &[String]) -> Result<Args, String> {
@@ -79,6 +87,8 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
     let mut body = false;
     let mut profile = None;
     let mut data_dir = None;
+    let mut show_friends = false;
+    let mut friends_view = None;
     let mut i = 1;
     while i < argv.len() {
         let arg = &argv[i];
@@ -108,6 +118,8 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
             "--body" => body = true,
             "--profile" => profile = Some(value(&mut i)?),
             "--data-dir" => data_dir = Some(PathBuf::from(value(&mut i)?)),
+            "--show-friends" => show_friends = true,
+            "--friends-view" => friends_view = Some(value(&mut i)?),
             other => return Err(format!("unknown argument: {other}\n{USAGE}")),
         }
         i += 1;
@@ -121,6 +133,8 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
         body,
         profile,
         data_dir,
+        show_friends,
+        friends_view,
     })
 }
 
@@ -190,6 +204,69 @@ fn build_body_stack(
     Err(MimintError::Config(
         "--body is only available on Linux (X11) in this build: no real body exists for this platform yet".to_string(),
     ))
+}
+
+/// Build the Phase 7 friends panel (context + worker thread),
+/// or return (None, false) with a stderr note when friends is
+/// disabled or the state cannot be opened. The panel never
+/// blocks the app start.
+fn build_friends_panel(
+    args: &Args,
+    resolved: &ResolvedConfig,
+    data_dir: &PathBuf,
+    config_path: Option<&PathBuf>,
+    audit: &Arc<AuditLog>,
+    body_actor: Option<mimint_control::BodyActor>,
+) -> (Option<FriendsPanel>, bool) {
+    if !resolved.friends_enabled {
+        eprintln!("mimint-app: friends disabled in the config file ([friends] enabled = false)");
+        return (None, false);
+    }
+    let initial_view = match args.friends_view.as_deref() {
+        Some(name) => match FriendsView::parse(name) {
+            Some(view) => view,
+            None => {
+                eprintln!("mimint-app: unknown --friends-view '{name}', opening the devices tab");
+                FriendsView::Devices
+            }
+        },
+        None => FriendsView::Devices,
+    };
+    let show_friends = args.show_friends || args.friends_view.is_some();
+    let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+    let (event_tx, event_rx) = std::sync::mpsc::channel();
+    let friends_config_path = config_path
+        .cloned()
+        .or_else(default_config_path)
+        .unwrap_or_else(|| data_dir.join("config.toml"));
+    let backend: Arc<dyn mimint_core::friends::hub::DriverBackend> = match body_actor {
+        Some(actor) => Arc::new(ActorDriverBackend::from_actor(actor)),
+        None => Arc::new(NullDriverBackend),
+    };
+    let ctx = match FriendsContext::open_with_ui(
+        data_dir,
+        &friends_config_path,
+        &args.db,
+        resolved.hub.clone(),
+        backend,
+        Some(Arc::clone(audit)),
+        Clock::system(),
+        Arc::new(PanelListenerUi::new(event_tx.clone())),
+    ) {
+        Ok(ctx) => ctx,
+        Err(err) => {
+            eprintln!(
+                "mimint-app: cannot open friends state, running without the friends view: {err}"
+            );
+            return (None, false);
+        }
+    };
+    // One brain for both ESP32 paths (§8.5): the local Ollama
+    // endpoint, never the app's (possibly remote) backends.
+    ctx.install_ws_handler(Arc::new(ollama_turn));
+    let panel = FriendsPanel::new(&ctx, cmd_tx, event_rx, initial_view);
+    spawn_friends_worker(ctx, cmd_rx, event_tx);
+    (Some(panel), show_friends)
 }
 
 fn main() {
@@ -419,6 +496,22 @@ fn run() -> Result<(), MimintError> {
     // the app options below.
     let profile_warnings = resolved.profiles.warnings.clone();
     let fallback_active = resolved.profiles.fallback_active;
+    // Phase 7 friends: the context + panel. A failure to open
+    // the friends state never stops the window (like the
+    // backend-chain failure above): the app opens without the
+    // friends view and says why on stderr. Friends disabled in
+    // the config ([friends] enabled = false) also means no
+    // panel. The hub does NOT auto-start: the panel's Start
+    // button starts it. With --body the hub drives the app's
+    // own body actor; without it driver methods are refused.
+    let (friends_panel, show_friends) = build_friends_panel(
+        &args,
+        &resolved,
+        &data_dir,
+        config_path.as_ref(),
+        &audit,
+        body_stack.as_ref().map(|stack| stack.actor.clone()),
+    );
     let deps = WorkerDeps {
         initial_providers,
         retry: resolved.retry,
@@ -484,6 +577,8 @@ fn run() -> Result<(), MimintError> {
         parallelism_enabled,
         max_agents,
         can_rebuild_body,
+        friends_panel,
+        show_friends,
     };
     let app = MimintApp::new(worker, approval_rx, options);
     let pixels_per_point = env::var("MIMINT_UI_PIXELS_PER_POINT")

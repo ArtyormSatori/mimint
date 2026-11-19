@@ -35,6 +35,14 @@ impl ActorDriverBackend {
             actor: BodyActor::spawn(body, stop),
         }
     }
+
+    /// Wrap an EXISTING actor (the app's body actor): the hub
+    /// drives the same single body thread the worker uses, so
+    /// the timeout + broken-latch guarantees hold for driver
+    /// requests too. `BodyActor` is cheaply clonable.
+    pub fn from_actor(actor: BodyActor) -> Self {
+        Self { actor }
+    }
 }
 
 fn param_i(params: &serde_json::Value, key: &str) -> Result<i32, MimintError> {

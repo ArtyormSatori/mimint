@@ -134,6 +134,12 @@ pub struct AppOptions {
     /// Phase 6: a body factory exists, so a body rebuild is
     /// possible after a stop/fault (the header offers it).
     pub can_rebuild_body: bool,
+    /// Phase 7: the friends panel (None when friends is
+    /// disabled in the config or the context failed to open).
+    pub friends_panel: Option<crate::friends_panel::FriendsPanel>,
+    /// Phase 7: open straight into the friends view
+    /// (`--show-friends`).
+    pub show_friends: bool,
 }
 
 /// One row of the agents panel (§15.1): the agent's identity,
@@ -225,6 +231,11 @@ pub struct MimintApp {
     /// Backend answering the current/last turn, when known.
     backend_in_use: Option<String>,
     show_audit: bool,
+    /// Phase 7 friends panel (None when friends is disabled).
+    friends_panel: Option<crate::friends_panel::FriendsPanel>,
+    /// Phase 7: the central panel shows the friends panel
+    /// instead of the face/chat.
+    show_friends: bool,
     audit_technical: bool,
     audit_rows: Vec<AuditRow>,
     audit_path: PathBuf,
@@ -390,6 +401,8 @@ impl MimintApp {
             max_agents: options.max_agents,
             hierarchy_enabled: options.hierarchy_enabled,
             can_rebuild_body: options.can_rebuild_body,
+            show_friends: options.show_friends,
+            friends_panel: options.friends_panel,
             profiles: options.profiles,
             active_profile: options.active_profile,
             profile_warnings: options.profile_warnings,
@@ -1401,6 +1414,16 @@ impl eframe::App for MimintApp {
                     ui.heading("Cuộc trò chuyện");
                     ui.label("• Phiên hiện tại");
                     ui.separator();
+                    if self.friends_panel.is_some() {
+                        ui.heading("Bạn bè");
+                        if ui
+                            .selectable_label(self.show_friends, "Thiết bị, hub, handoff")
+                            .clicked()
+                        {
+                            self.show_friends = !self.show_friends;
+                        }
+                        ui.separator();
+                    }
                     self.agents_panel_ui(ui);
                     ui.heading("Hồ sơ");
                     // Forced-safe fallback (F5-03): persistent
@@ -1937,6 +1960,14 @@ impl eframe::App for MimintApp {
 
         // ---- Main area: face + chat ----
         egui::CentralPanel::default().show(ui, |ui| {
+            // Phase 7: the friends panel replaces the face/chat
+            // while it is open.
+            if self.show_friends {
+                if let Some(panel) = &mut self.friends_panel {
+                    panel.show(ui);
+                    return;
+                }
+            }
             // Face.
             let params = self.face.params();
             let elapsed = now.duration_since(self.started);
