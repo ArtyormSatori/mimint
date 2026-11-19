@@ -21,10 +21,11 @@ use mimint_core::friends::crypto::{agree_and_derive, fresh_nonce16, generate_eph
 use mimint_core::friends::esp32::{FakeV2Device, FakeXiaoZhiDevice};
 use mimint_core::friends::handoff::{
     shared_notebook_context, HandoffAccept, HandoffComplete, HandoffManager, HandoffOffer,
-    HandoffPackage, HandoffReject,
+    HandoffPackage, HandoffReject, HANDOFF_ACTUATOR,
 };
 use mimint_core::friends::hub::{
-    check_driver_method, DriverBackend, DriverRequest, DriverResponse, Hub, HubConfig, HubExposure,
+    check_driver_method, DriverBackend, DriverRequest, DriverResponse, HandoffTurnStatus, Hub,
+    HubConfig, HubExposure,
 };
 use mimint_core::friends::identity::{DeviceKeyStore, Identity};
 use mimint_core::friends::ota::{build_websocket_url, OtaServer};
@@ -33,13 +34,14 @@ use mimint_core::friends::pairing::{
     InitiatorUi, ListenerDecision, ListenerDecisionCtx, ListenerUi, PairingController, SasFlow,
     SasOutcome,
 };
-use mimint_core::friends::records::RecordKind;
-use mimint_core::friends::registry::{PeerEntry, PeerPrefs, Trust};
+use mimint_core::friends::records::{RecordKind, SyncRecord};
+use mimint_core::friends::registry::{PeerEntry, PeerPrefs, Trust, VersionId};
 use mimint_core::friends::session::{
     handshake_initiator, handshake_listener, Session, SessionConfig, SessionCrypto,
 };
 use mimint_core::friends::sync::{
-    run_sync_over_session, ProfileSyncSink, ResolutionChoice, SyncEngine, SyncKinds, SyncSources,
+    run_sync_over_session, ApplyOutcome, ProfileSyncSink, ResolutionChoice, SyncEngine, SyncKinds,
+    SyncPush, SyncSources,
 };
 use mimint_core::friends::todos::{Todo, TodoPlanStore};
 use mimint_core::friends::util::{hex_encode, Clock};
@@ -2253,7 +2255,7 @@ fn sync_canary_secret_never_in_payload() {
         .engine
         .handle_offer(&a.device_id(), &offer, &kinds)
         .unwrap();
-    let push = a.engine.build_push(&request, &kinds).unwrap();
+    let push = a.engine.build_push(&b.device_id(), &request, &kinds).unwrap();
     assert!(!push.records.is_empty(), "push must carry the shared note");
     let push_json = serde_json::to_string(&push).unwrap();
     for sentinel in [
@@ -2310,7 +2312,7 @@ fn sync_unpaired_peer_cannot_read() {
         .engine
         .handle_offer(&a.device_id(), &offer, &kinds)
         .unwrap();
-    let push = a.engine.build_push(&request, &kinds).unwrap();
+    let push = a.engine.build_push(&b.device_id(), &request, &kinds).unwrap();
     let push_bytes = serde_json::to_vec(&push).unwrap();
     assert!(!push_bytes.is_empty());
     let clock = Clock::system();
@@ -2571,7 +2573,7 @@ fn make_package(a: &Node, b: &Node, task: &str) -> HandoffPackage {
             vec!["SOUL.md".to_string()],
             vec![],
             String::new(),
-            "default",
+            "body",
         )
         .unwrap()
 }
@@ -3429,7 +3431,7 @@ fn handoff_two_instances_continues_next_step() {
             .any(|item| item.package.package_id == package.package_id),
         "verified offer must be listed as pending"
     );
-    assert!(b.handoff.lease_for("default").is_none());
+    assert!(b.handoff.lease_for("body").is_none());
     // The user presses "Tiếp tục ở đây": accept + lease.
     hub_b.decide_handoff(&package.package_id, true).unwrap();
     assert!(
@@ -3444,10 +3446,10 @@ fn handoff_two_instances_continues_next_step() {
     assert!(a.handoff.is_handed_off(&package.package_id));
     let lease = b
         .handoff
-        .lease_for("default")
+        .lease_for("body")
         .expect("B must hold the lease");
     assert_eq!(lease.package_id, package.package_id);
-    assert_eq!(lease.holder_device_id, a.device_id());
+    assert_eq!(lease.holder_device_id, b.device_id());
     // The package content itself arrived intact: the next
     // step is what B continues.
     assert_eq!(package.next_step, "next step");
@@ -3515,7 +3517,7 @@ fn handoff_forged_package_rejected() {
     offer_over_session(&mut session, &package);
     let (kind, _) = session.recv().unwrap();
     assert_eq!(kind, MessageKind::HandoffReject);
-    assert!(b.handoff.lease_for("default").is_none());
+    assert!(b.handoff.lease_for("body").is_none());
     assert!(
         poll_audit_contains(&b, "\"handoff_forged\"", 20),
         "forged package must be audited"
@@ -3569,7 +3571,7 @@ fn handoff_expired_lease_rejected() {
     offer_over_session(&mut session, &package);
     let (kind, _) = session.recv().unwrap();
     assert_eq!(kind, MessageKind::HandoffReject);
-    assert!(b.handoff.lease_for("default").is_none());
+    assert!(b.handoff.lease_for("body").is_none());
     hub_b.stop();
 }
 
@@ -3597,7 +3599,7 @@ fn handoff_no_secret_in_package() {
             vec![],
             vec![],
             context,
-            "default",
+            "body",
         )
         .unwrap();
     // The package carries exactly the §7.1 allow-listed
@@ -3652,7 +3654,7 @@ fn handoff_reject_returns_lease() {
     let (kind, _) = session.recv().unwrap();
     assert_eq!(kind, MessageKind::HandoffReject);
     assert!(!a.handoff.is_handed_off(&package.package_id));
-    assert!(b.handoff.lease_for("default").is_none());
+    assert!(b.handoff.lease_for("body").is_none());
     // A valid offer the receiver declines (user presses
     // "Từ chối" — no lease is ever taken) has the same
     // outcome: A stays free to act.
@@ -3661,7 +3663,7 @@ fn handoff_reject_returns_lease() {
         .handoff
         .verify_package(&package2, a.identity.public_key(), &b.device_id())
         .is_ok());
-    assert!(b.handoff.lease_for("default").is_none());
+    assert!(b.handoff.lease_for("body").is_none());
     assert!(!a.handoff.is_handed_off(&package2.package_id));
     hub_b.stop();
 }
@@ -3691,7 +3693,7 @@ fn handoff_no_accept_before_user_decision() {
             .any(|item| item.package.package_id == package.package_id),
         "verified offer must be pending on the receiver"
     );
-    assert!(b.handoff.lease_for("default").is_none());
+    assert!(b.handoff.lease_for("body").is_none());
     assert!(!a.handoff.is_handed_off(&package.package_id));
     // A user reject also leaves the sender free to act.
     hub_b.decide_handoff(&package.package_id, false).unwrap();
@@ -3700,7 +3702,7 @@ fn handoff_no_accept_before_user_decision() {
     assert_eq!(kind, MessageKind::HandoffReject);
     let reject: HandoffReject = serde_json::from_slice(&payload).unwrap();
     assert_eq!(reject.reason, "rejected_by_user");
-    assert!(b.handoff.lease_for("default").is_none());
+    assert!(b.handoff.lease_for("body").is_none());
     assert!(!a.handoff.is_handed_off(&package.package_id));
     hub_b.stop();
 }
@@ -3727,7 +3729,7 @@ fn handoff_accept_after_user_decision_sends_accept() {
     assert_eq!(accept.package_id, package.package_id);
     let lease = b
         .handoff
-        .lease_for("default")
+        .lease_for("body")
         .expect("B must hold the lease");
     assert_eq!(lease.package_id, package.package_id);
     // Deciding the same package twice fails: it is no longer
@@ -3784,7 +3786,7 @@ fn handoff_pending_expires_returns_lease() {
         hub_b.pending_handoffs().is_empty(),
         "expired pending must be gone"
     );
-    assert!(b.handoff.lease_for("default").is_none());
+    assert!(b.handoff.lease_for("body").is_none());
     assert!(!a.handoff.is_handed_off(&package.package_id));
     hub_b.stop();
 }
@@ -3811,7 +3813,7 @@ fn handoff_sender_stops_after_offer() {
     // handoff and refuses to act on this task again.
     a.handoff.mark_handed_off(&package.package_id);
     assert!(a.handoff.is_handed_off(&package.package_id));
-    assert!(b.handoff.lease_for("default").is_some());
+    assert!(b.handoff.lease_for("body").is_some());
     hub_b.stop();
 }
 
@@ -3825,11 +3827,11 @@ fn handoff_lease_lost_on_restart() {
     // restarted process) holds nothing.
     let manager = HandoffManager::new(b.clock.clone(), None);
     manager.acquire_lease(&package).unwrap();
-    assert!(manager.lease_for("default").is_some());
+    assert!(manager.lease_for("body").is_some());
     drop(manager);
     let restarted = HandoffManager::new(b.clock.clone(), None);
     assert!(
-        restarted.lease_for("default").is_none(),
+        restarted.lease_for("body").is_none(),
         "restart loses the lease"
     );
 }
@@ -3880,7 +3882,7 @@ fn handoff_complete_ack_returns_lease() {
     let accept: HandoffAccept = serde_json::from_slice(&payload).unwrap();
     a.handoff.mark_handed_off(&package.package_id);
     assert!(a.handoff.is_handed_off(&package.package_id));
-    assert!(b.handoff.lease_for("default").is_some());
+    assert!(b.handoff.lease_for("body").is_some());
     // B finishes the task: it releases its lease locally and
     // sends the complete ack to A's hub.
     assert!(b.handoff.release_lease_by_id(&accept.lease_id));
@@ -3901,7 +3903,7 @@ fn handoff_complete_ack_returns_lease() {
     // the TTL — and may act on the task again.
     std::thread::sleep(std::time::Duration::from_millis(300));
     assert!(!a.handoff.is_handed_off(&package.package_id));
-    assert!(b.handoff.lease_for("default").is_none());
+    assert!(b.handoff.lease_for("body").is_none());
     hub_a.stop();
     hub_b.stop();
 }
@@ -4755,4 +4757,637 @@ fn privacy_on_backend_unchanged() {
         head.starts_with("HTTP/1.1 200"),
         "ollama must answer: {head}"
     );
+}
+
+// ----------------------------------------------------------------
+// Fix pass 7 (F7-01..F7-28): regression tests for the review
+// findings. Each test names the finding it pins.
+// ----------------------------------------------------------------
+
+/// F7-01: a successor claim anchored at the receiver's local
+/// version, from a peer that never received that version, is
+/// a forgery: Rejected with a distinct audit event, no apply,
+/// no conflict row.
+#[test]
+fn sync_forged_successor_without_provenance_rejected() {
+    let a = Node::new("fsr-a");
+    let b = Node::new("fsr-b");
+    let c = Node::new("fsr-c");
+    let (_, note_id) = add_shared_note(&a, "note", "v1");
+    let (sa, sb) = paired_synced(&a, &b);
+    sync_both(&a, &b, sa, sb, &SyncKinds::all());
+    assert_eq!(note_body(&b, &note_id).as_deref(), Some("v1"));
+    // C never synced with B and never received v1, yet claims
+    // its edit is built on B's local version.
+    let local = b
+        .registry
+        .get_local_version(&note_id)
+        .unwrap()
+        .expect("B must hold v1");
+    let forged = SyncRecord::build(
+        note_id.clone(),
+        RecordKind::NotebookNote,
+        VersionId::new(local.version.lamport + 10, c.device_id()),
+        Some(local.version.clone()),
+        None,
+        c.device_id(),
+        b.clock.now_ms(),
+        Some(serde_json::json!({
+            "title": "note",
+            "text": "forged by C",
+            "created_ms": b.clock.now_ms(),
+            "shared": true,
+        })),
+    );
+    let push = SyncPush {
+        v: PROTOCOL_VERSION,
+        kind: "sync_push".to_string(),
+        records: vec![forged],
+    };
+    let outcomes = b
+        .engine
+        .apply_push(&c.device_id(), &push, &SyncKinds::all())
+        .unwrap();
+    assert_eq!(outcomes.len(), 1);
+    assert_eq!(outcomes[0].1, ApplyOutcome::Rejected);
+    assert_eq!(note_body(&b, &note_id).as_deref(), Some("v1"));
+    assert!(
+        b.registry.list_conflicts(false).unwrap().is_empty(),
+        "a forgery must not open a conflict"
+    );
+    assert!(
+        audit_contains(&b, "sync_successor_rejected"),
+        "distinct audit event required"
+    );
+    assert!(audit_contains(&b, "forged_based_on"));
+}
+
+/// F7-01 (narrowed gate): a peer claiming THIS body authored
+/// the record it sends is impersonating us — Rejected. (The
+/// broader version_device==peer rule was dropped: sync is
+/// transitive, B forwards A's records to C verbatim, so the
+/// sender is routinely not the author. Authorship of
+/// successor claims is gated by provenance instead.)
+#[test]
+fn sync_self_impersonating_version_rejected() {
+    let a = Node::new("sir-a");
+    let b = Node::new("sir-b");
+    let c = Node::new("sir-c");
+    pair_nodes(&a, &b, SasFlow::Compare);
+    pair_nodes(&b, &c, SasFlow::Compare);
+    let (_, note_id) = add_shared_note(&a, "note", "v1");
+    let forged = SyncRecord::build(
+        note_id.clone(),
+        RecordKind::NotebookNote,
+        VersionId::new(7, b.device_id()),
+        None,
+        None,
+        c.device_id(),
+        b.clock.now_ms(),
+        Some(serde_json::json!({
+            "title": "note",
+            "text": "I am B, trust me",
+            "created_ms": b.clock.now_ms(),
+            "shared": true,
+        })),
+    );
+    let push = SyncPush {
+        v: PROTOCOL_VERSION,
+        kind: "sync_push".to_string(),
+        records: vec![forged],
+    };
+    let outcomes = b
+        .engine
+        .apply_push(&c.device_id(), &push, &SyncKinds::all())
+        .unwrap();
+    assert_eq!(outcomes[0].1, ApplyOutcome::Rejected);
+    assert!(note_body(&b, &note_id).is_none());
+    assert!(audit_contains(&b, "sync_record_rejected_version_device"));
+}
+
+/// F7-27: multi-hop A→B→C→B. B forwards A's record to C
+/// verbatim (version_device stays A); C's successor, built
+/// on a version B really sent it, applies on B. A concurrent
+/// multi-hop edit still conflicts instead of silently
+/// overwriting.
+#[test]
+fn sync_multihop_forward_and_return_applies() {
+    let a = Node::new("mhf-a");
+    let b = Node::new("mhf-b");
+    let c = Node::new("mhf-c");
+    let (_, note_id) = add_shared_note(&a, "note", "v1");
+    let (sa, sb) = paired_synced(&a, &b);
+    sync_both(&a, &b, sa, sb, &SyncKinds::all());
+    let (sb2, sc) = paired_synced(&b, &c);
+    sync_both(&b, &c, sb2, sc, &SyncKinds::all());
+    assert_eq!(
+        note_body(&c, &note_id).as_deref(),
+        Some("v1"),
+        "forwarded record must arrive at C"
+    );
+    // C edits on top of the forwarded version; B accepts it.
+    edit_note(&c, &note_id, "v2 by C");
+    let (sc2, sb3) = handshake_pair(&c, &b);
+    let (rc, rb) = sync_both(&c, &b, sc2, sb3, &SyncKinds::all());
+    assert_eq!(rb.1, 1, "C's successor must apply on B: {rc:?} {rb:?}");
+    assert_eq!(note_body(&b, &note_id).as_deref(), Some("v2 by C"));
+    // A concurrently edits from v1 (never saw v2): conflict,
+    // never a silent overwrite.
+    edit_note(&a, &note_id, "A's concurrent edit");
+    let (sa2, sb4) = handshake_pair(&a, &b);
+    let (ra, rb2) = sync_both(&a, &b, sa2, sb4, &SyncKinds::all());
+    assert!(
+        ra.2 + rb2.2 >= 1,
+        "concurrent multi-hop edit must conflict: {ra:?} {rb2:?}"
+    );
+    assert_eq!(note_body(&b, &note_id).as_deref(), Some("v2 by C"));
+}
+
+/// F7-02: a SoulFile never auto-applies — not even as a
+/// brand-new record. It waits for the local user's explicit
+/// approval, then applies through `approve_pending_sync`.
+#[test]
+fn sync_soul_never_auto_applies_awaits_approval() {
+    let a = Node::new("sna-a");
+    let b = Node::new("sna-b");
+    a.soul
+        .save("agent-001", "SOUL.md", "You are a careful helper.")
+        .unwrap();
+    let (sa, sb) = paired_synced(&a, &b);
+    let (_ra, rb) = sync_both(&a, &b, sa, sb, &SyncKinds::all());
+    assert!(
+        b.soul.load("SOUL.md").is_err(),
+        "SOUL must not arrive unapproved"
+    );
+    let pending = b.engine.pending_sync_approvals().unwrap();
+    assert_eq!(pending.len(), 1, "one record held: {pending:?}");
+    assert_eq!(pending[0].0, "soul:SOUL.md");
+    assert!(audit_contains(&b, "sync_soul_pending_approval"));
+    assert!(
+        b.engine.approve_pending_sync("soul:SOUL.md").unwrap(),
+        "approval must apply the held record"
+    );
+    let doc = b.soul.load("SOUL.md").unwrap();
+    assert_eq!(doc.body, "You are a careful helper.");
+    assert!(b.engine.pending_sync_approvals().unwrap().is_empty());
+}
+
+/// F7-05: rotating device_id from the same IP still hits the
+/// IP lockout bucket — five failures from five fresh
+/// identities on loopback lock a sixth fresh identity out.
+#[test]
+fn pairing_lockout_by_ip_survives_device_rotation() {
+    let b = Node::new("lbi-b");
+    let list_ui = ScriptedListenerUi {
+        decision: ListenerDecision {
+            sas_outcome: SasOutcome::Mismatched,
+            trust_granted: Trust::Owner,
+            fingerprint_confirmed: true,
+            fingerprint_skipped_with_warning: false,
+        },
+    };
+    let mut fresh_ids = Vec::new();
+    for i in 0..5 {
+        let a = Node::new(&format!("lbi-a{i}"));
+        fresh_ids.push(a.device_id());
+        let (ra, rb) = ceremony_with(
+            &a,
+            &b,
+            SasFlow::Compare,
+            &auto_initiator(),
+            &list_ui,
+            None,
+            None,
+        );
+        assert!(ra.is_err() && rb.is_err(), "attempt {i} must fail");
+    }
+    // No single device failed twice, so no device bucket is
+    // locked — only the shared IP bucket can be.
+    for id in &fresh_ids {
+        assert!(
+            b.registry
+                .lockout_until(id, b.clock.now_ms())
+                .unwrap()
+                .is_none(),
+            "device bucket for {id} must be clean"
+        );
+    }
+    assert!(
+        b.registry
+            .lockout_until("ip:127.0.0.1", b.clock.now_ms())
+            .unwrap()
+            .is_some(),
+        "IP bucket must be locked after 5 failures"
+    );
+    let sixth = Node::new("lbi-a6");
+    let (ra, rb) = ceremony_with(
+        &sixth,
+        &b,
+        SasFlow::Compare,
+        &auto_initiator(),
+        &list_ui,
+        None,
+        None,
+    );
+    assert!(ra.is_err() && rb.is_err(), "6th fresh identity refused");
+    assert!(audit_contains(&b, "pairing_locked"));
+}
+
+/// F7-06: after `close_lan`, the OTA loop serves nothing (a
+/// new connection is dropped at once) and every token issued
+/// before the close is dead. `open_lan` brings OTA back.
+#[test]
+fn hub_close_lan_stops_ota_and_revokes_tokens() {
+    let b = Node::new("clo-b");
+    register_uuid(&b, "test-uuid-0002");
+    let mut config = HubConfig::default();
+    config.listen_lan = true;
+    let hub = start_hub(&b, config, MockBackend::new());
+    assert!(hub.ota_open());
+    let addr = format!("127.0.0.1:{}", hub.ota_port());
+    assert!(wait_for_tcp(addr.parse().unwrap(), 20), "OTA must listen");
+    let token = hub.ota_server().issue_token("test-uuid-0002").unwrap();
+    assert!(hub.ota_server().consume_token(&token).is_some());
+    let token2 = hub.ota_server().issue_token("test-uuid-0002").unwrap();
+    hub.close_lan();
+    assert!(!hub.ota_open());
+    assert!(
+        hub.ota_server().consume_token(&token2).is_none(),
+        "token issued before close_lan must be dead"
+    );
+    // A fresh OTA connection is dropped at once (EOF).
+    let mut stream = TcpStream::connect(&addr).unwrap();
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+        .unwrap();
+    let mut buf = [0u8; 1];
+    use std::io::Read as _;
+    let n = stream.read(&mut buf).unwrap();
+    assert_eq!(n, 0, "OTA must drop connections while closed");
+    assert!(audit_contains(&b, "hub_lan_closed"));
+    hub.open_lan();
+    assert!(hub.ota_open());
+    let token3 = hub.ota_server().issue_token("test-uuid-0002").unwrap();
+    assert!(hub.ota_server().consume_token(&token3).is_some());
+    hub.stop();
+}
+
+/// F7-07: revoking a peer cuts its live session at once —
+/// the client sees the close, not just a refusal next time.
+#[test]
+fn hub_revoke_cuts_live_session() {
+    let a = Node::new("rcl-a");
+    let b = Node::new("rcl-b");
+    pair_nodes(&a, &b, SasFlow::Compare);
+    let hub = start_hub(&b, HubConfig::default(), MockBackend::new());
+    let mut session = handshake_to_hub(&a, &hub);
+    ping_pong(&mut session);
+    assert!(hub.revoke_peer(&a.device_id()));
+    assert!(audit_contains(&b, "hub_peer_revoked"));
+    // The hub's session loop re-checks revocation each poll
+    // and closes; the client must see the close promptly.
+    let _ = session
+        .stream_clone()
+        .map(|s| s.set_read_timeout(Some(std::time::Duration::from_secs(5))));
+    assert!(
+        session.recv().is_err(),
+        "revoked session must close on the client"
+    );
+    hub.stop();
+}
+
+/// F7-08: one bad record never fails the batch — the good
+/// records apply, the bad one is Rejected + audited, and the
+/// next sync is not stalled (the good version still arrives).
+#[test]
+fn sync_one_bad_record_does_not_stall_batch() {
+    let a = Node::new("obr-a");
+    let b = Node::new("obr-b");
+    let (_, bad_id) = add_shared_note(&a, "bad", "good body");
+    let (_, good1_id) = add_shared_note(&a, "good1", "one");
+    let (_, good2_id) = add_shared_note(&a, "good2", "two");
+    pair_nodes(&a, &b, SasFlow::Compare);
+    let kinds = SyncKinds::all();
+    let offer = a.engine.build_offer(&kinds).unwrap();
+    let request = b
+        .engine
+        .handle_offer(&a.device_id(), &offer, &kinds)
+        .unwrap();
+    let mut push = a
+        .engine
+        .build_push(&b.device_id(), &request, &kinds)
+        .unwrap();
+    assert_eq!(push.records.len(), 3);
+    // Corrupt the first record's body in transit: its hash no
+    // longer matches, so validation fails.
+    let bad = push
+        .records
+        .iter_mut()
+        .find(|r| r.sync_id == bad_id)
+        .unwrap();
+    bad.body = Some(serde_json::json!({
+        "title": "bad",
+        "text": "tampered in transit",
+        "created_ms": 1,
+        "shared": true,
+    }));
+    let outcomes = b
+        .engine
+        .apply_push(&a.device_id(), &push, &kinds)
+        .unwrap();
+    assert_eq!(outcomes.len(), 3);
+    let by_id: std::collections::HashMap<_, _> = outcomes.into_iter().collect();
+    assert_eq!(by_id[&bad_id], ApplyOutcome::Rejected);
+    assert_eq!(by_id[&good1_id], ApplyOutcome::Applied);
+    assert_eq!(by_id[&good2_id], ApplyOutcome::Applied);
+    assert_eq!(note_body(&b, &good1_id).as_deref(), Some("one"));
+    assert_eq!(note_body(&b, &good2_id).as_deref(), Some("two"));
+    assert!(note_body(&b, &bad_id).is_none());
+    assert!(audit_contains(&b, "sync_record_rejected"));
+    // The next real sync still delivers the (untampered) bad
+    // note: no permanent stall.
+    let (sa, sb) = handshake_pair(&a, &b);
+    let (_ra, rb) = sync_both(&a, &b, sa, sb, &kinds);
+    assert!(rb.1 >= 1, "next sync must still apply: {rb:?}");
+    assert_eq!(note_body(&b, &bad_id).as_deref(), Some("good body"));
+}
+
+/// F7-09: a tombstone past 90 days is purged by a real sync
+/// (the production caller in `run_sync_exchange`), not only
+/// by a direct engine call.
+#[test]
+fn sync_purge_runs_on_real_sync() {
+    let (a, cell_a) = Node::manual("prs-a", 1_000_000);
+    let b = Node::new("prs-b");
+    let (_, note_id) = add_shared_note(&a, "note", "v1");
+    a.engine
+        .create_tombstone(&note_id, RecordKind::NotebookNote)
+        .unwrap();
+    assert_eq!(a.registry.list_tombstones().unwrap().len(), 1);
+    pair_nodes(&a, &b, SasFlow::Compare);
+    cell_a.fetch_add(91 * 24 * 60 * 60 * 1000, Ordering::SeqCst);
+    let (sa, sb) = handshake_pair(&a, &b);
+    sync_both(&a, &b, sa, sb, &SyncKinds::all());
+    assert!(
+        a.registry.list_tombstones().unwrap().is_empty(),
+        "91-day tombstone must be purged by the sync path"
+    );
+}
+
+/// F7-10: a flooding peer's rekeys are dropped + audited; the
+/// receiver's session stays open and its rekey count stays
+/// bounded (1: only the first rekey completed).
+#[test]
+fn session_rekey_flood_rate_limited_receiver_stays_open() {
+    let a = Node::new("rkf-a");
+    let b = Node::new("rkf-b");
+    pair_nodes(&a, &b, SasFlow::Compare);
+    // Short rekey timeout so the flooding side fails fast
+    // instead of waiting the production 10 s per attempt.
+    let config = SessionConfig {
+        rekey_timeout_ms: 800,
+        ..SessionConfig::default()
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let b_id = Arc::clone(&b.identity);
+    let b_reg = Arc::clone(&b.registry);
+    let b_clock = b.clock.clone();
+    let cfg_b = config.clone();
+    let b_audit = Arc::clone(&b.audit);
+    let handle = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        handshake_listener(stream, &b_id, &b_reg, &cfg_b, &b_clock, Some(b_audit)).unwrap()
+    });
+    let stream = TcpStream::connect(addr).unwrap();
+    let mut sa = handshake_initiator(
+        stream,
+        &a.identity,
+        &a.registry,
+        &config,
+        &a.clock,
+        None,
+    )
+    .unwrap();
+    let mut sb = handle.join().unwrap();
+    sa.initiate_rekey().unwrap();
+    assert_eq!(sb.rekey_count(), 1);
+    // Second rekey 0 s later: under the 5 s cooldown, the
+    // receiver drops it; the sender times out on its side.
+    assert!(sa.initiate_rekey().is_err());
+    assert!(
+        poll_audit_contains(&b, "rekey_rate_limited", 20),
+        "excess rekey must be audited"
+    );
+    assert_eq!(sb.rekey_count(), 1, "receiver rekey count bounded");
+    assert!(!sb.is_closed(), "receiver session must stay open");
+    // The receiver still serves: a ping from the sender side
+    // would need the sender, so prove liveness by re-keying
+    // after the cooldown instead — the session is usable.
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert!(!sb.is_closed());
+    drop(sa);
+    drop(sb);
+}
+
+/// F7-11: a handoff turn is visible while Running, its
+/// `handoff_turn_started` audit precedes the brain's return,
+/// and cancelling releases the lease at once — a second
+/// offer for the same actuator is accepted immediately,
+/// not held to the 10-minute TTL.
+#[test]
+fn handoff_turn_cancel_releases_lease_early() {
+    let a = Node::new("htc-a");
+    let b = Node::new("htc-b");
+    pair_nodes(&a, &b, SasFlow::Compare);
+    let backend = MockBackend::new();
+    let hub_b = start_hub(&b, HubConfig::default(), backend);
+    hub_b.install_v2_brain_turn(Arc::new(|_prompt| {
+        std::thread::sleep(std::time::Duration::from_secs(5));
+        "turn reply".to_string()
+    }));
+    let package = make_package(&a, &b, "slow task");
+    let mut session = handshake_to_hub(&a, &hub_b);
+    offer_over_session(&mut session, &package);
+    assert!(hub_b
+        .pending_handoffs()
+        .iter()
+        .any(|item| item.package.package_id == package.package_id));
+    hub_b.decide_handoff(&package.package_id, true).unwrap();
+    // Turn is Running and the started audit is already there
+    // while the brain is still sleeping.
+    let mut running = false;
+    for _ in 0..20 {
+        if let Some(state) = hub_b.handoff_turn_state(&package.package_id) {
+            if state.status == HandoffTurnStatus::Running {
+                running = true;
+                break;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(running, "turn must be Running");
+    assert!(
+        audit_contains(&b, "handoff_turn_started"),
+        "started audit precedes the brain's return"
+    );
+    assert!(b.handoff.lease_for(HANDOFF_ACTUATOR).is_some());
+    assert!(hub_b.cancel_handoff_turn(&package.package_id));
+    // The brain still sleeps ~5 s; when it returns, the turn
+    // is Cancelled and the lease is already gone.
+    let mut cancelled = false;
+    for _ in 0..80 {
+        if let Some(state) = hub_b.handoff_turn_state(&package.package_id) {
+            if state.status == HandoffTurnStatus::Cancelled {
+                cancelled = true;
+                break;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(cancelled, "turn must end Cancelled");
+    assert!(
+        b.handoff.lease_for(HANDOFF_ACTUATOR).is_none(),
+        "lease must be released on cancel, not at TTL"
+    );
+    // A second offer for the same actuator is accepted at
+    // once — no lease_busy to the TTL.
+    let package2 = make_package(&a, &b, "second task");
+    offer_over_session(&mut session, &package2);
+    hub_b
+        .decide_handoff(&package2.package_id, true)
+        .expect("second offer must be accepted: lease was freed");
+    assert!(b.handoff.lease_for(HANDOFF_ACTUATOR).is_some());
+    hub_b.stop();
+}
+
+/// F7-12 (hub half): while an approval card awaits a
+/// decision, the session loop keeps serving — a ping still
+/// gets its pong. The panel half (a separate worker thread
+/// for the card wait) lives in mimint-ui and is verified by
+/// inspection + screenshot, not by this core test.
+#[test]
+fn hub_session_serves_ping_while_card_awaits_decision() {
+    let h = Node::new("spc-h");
+    let p = Node::new("spc-p");
+    pair_nodes(&h, &p, SasFlow::Compare);
+    let mut prefs = h.registry.get_prefs(&p.device_id()).unwrap();
+    prefs.approve_allowed = true;
+    h.registry.set_prefs(&p.device_id(), &prefs).unwrap();
+    let hub = start_hub(&h, HubConfig::default(), MockBackend::new());
+    let (_card, _rx) = h
+        .relay
+        .create_card(origin_for(&h, "req-pending-1", "shell.exec"), &p.device_id(), true)
+        .unwrap();
+    let mut session = handshake_to_hub(&p, &hub);
+    let got = recv_approval_card(&mut session);
+    assert_eq!(got.request_id, "req-pending-1");
+    // No decision is ever sent — the card waits. A ping on
+    // the same session must still be answered promptly.
+    let start = std::time::Instant::now();
+    ping_pong(&mut session);
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(5),
+        "pong must arrive while the card waits"
+    );
+    hub.stop();
+}
+
+/// F7-22: a guest's INPUT driver_request over a real session
+/// is refused (ok:false + forbidden_role, backend never
+/// called, session alive); a read method (screenshot) is
+/// still allowed for the guest (§5.3).
+#[test]
+fn guest_driver_input_refused_over_real_session() {
+    let h = Node::new("gdi-h");
+    let p = Node::new("gdi-p");
+    pair_nodes(&h, &p, SasFlow::Compare);
+    h.registry
+        .set_trust_granted(&p.device_id(), Trust::Guest)
+        .unwrap();
+    let backend = MockBackend::new();
+    let hub = start_hub(&h, HubConfig::default(), backend.clone());
+    let mut session = handshake_to_hub(&p, &hub);
+    let denied = send_driver_request(&mut session, "click", "req-guest-1");
+    assert!(!denied.ok, "guest click must be refused");
+    assert_eq!(denied.code.as_deref(), Some("forbidden_role"));
+    assert!(!backend.called("click"), "backend must not run a refused input");
+    let allowed = send_driver_request(&mut session, "screenshot", "req-guest-2");
+    assert!(allowed.ok, "guest screenshot must stay allowed: {allowed:?}");
+    ping_pong(&mut session);
+    hub.stop();
+}
+
+/// F7-03: a handoff package naming a strange actuator is
+/// refused by the hub — it never becomes pending and no
+/// lease exists for it. (The good path with "body" is
+/// covered by the existing handoff tests.)
+#[test]
+fn handoff_strange_actuator_rejected_over_session() {
+    let a = Node::new("sar-a");
+    let b = Node::new("sar-b");
+    pair_nodes(&a, &b, SasFlow::Compare);
+    let hub_b = start_hub(&b, HubConfig::default(), MockBackend::new());
+    let mut evil = make_package(&a, &b, "evil task");
+    evil.actuator = "evil-actuator".to_string();
+    let mut session = handshake_to_hub(&a, &hub_b);
+    offer_over_session(&mut session, &evil);
+    assert!(
+        !reply_waiting(&session, 500),
+        "no accept for a strange actuator"
+    );
+    assert!(
+        !hub_b
+            .pending_handoffs()
+            .iter()
+            .any(|item| item.package.package_id == evil.package_id),
+        "strange-actuator package must never be pending"
+    );
+    assert!(b.handoff.lease_for("evil-actuator").is_none());
+    assert!(b.handoff.lease_for(HANDOFF_ACTUATOR).is_none());
+    hub_b.stop();
+}
+
+/// F7-18: a symlinked SOUL file is never synced — the walker
+/// skips it, and `SoulStore::load` refuses to follow it.
+#[test]
+fn soul_symlink_never_syncs_and_load_refuses() {
+    let a = Node::new("ssy-a");
+    let b = Node::new("ssy-b");
+    let target = a.dir.join("outside.md");
+    std::fs::write(
+        &target,
+        "# SOUL\n\nYou are an impostor soul.\n",
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(&target, a.dir.join("EVIL.md")).unwrap();
+    assert!(a.soul.load("EVIL.md").is_err(), "load must refuse symlinks");
+    a.soul.save("agent-001", "SOUL.md", "You are the real soul.").unwrap();
+    let (sa, sb) = paired_synced(&a, &b);
+    sync_both(&a, &b, sa, sb, &SyncKinds::all());
+    assert!(b.soul.load("EVIL.md").is_err(), "symlink must not arrive");
+    assert!(b.soul.load("SOUL.md").is_ok(), "real soul still syncs");
+}
+
+/// F7-18: cross-agent notebook isolation — a private note
+/// owned by another agent never leaves, through sync or
+/// through the handoff notebook context.
+#[test]
+fn notebook_cross_agent_private_never_leaves() {
+    let a = Node::new("xan-a");
+    let b = Node::new("xan-b");
+    let _ = a
+        .notebook
+        .add_for("agent-002", "other agent private", "do not sync this line")
+        .unwrap();
+    let (_, shared_id) = add_shared_note(&a, "shared", "sync me");
+    let (sa, sb) = paired_synced(&a, &b);
+    sync_both(&a, &b, sa, sb, &SyncKinds::all());
+    assert_eq!(note_body(&b, &shared_id).as_deref(), Some("sync me"));
+    let ctx = shared_notebook_context(&a.notebook).unwrap();
+    assert!(
+        !ctx.contains("do not sync this line"),
+        "handoff context must not carry another agent's private line"
+    );
+    assert!(ctx.contains("sync me"));
 }

@@ -740,11 +740,15 @@ impl SyncEngine {
         if !kinds.allows(kind) {
             return Ok(ApplyOutcome::Dropped);
         }
-        // F7-01: the version must be authored by the peer
-        // sending it. A record carrying a third device's (or
-        // our own) version id is a forgery, whatever its
-        // `based_on` claims.
-        if record.version_device != peer_device_id {
+        // F7-01/F7-27: version_device is NOT required to equal
+        // the sending peer — sync is transitive, so B forwards
+        // A's records to C verbatim (version_device stays A).
+        // Requiring equality would break multi-hop sync. The
+        // only version_device forgery rejected outright is a
+        // peer claiming WE authored the record it sends us:
+        // our own records never arrive from a peer (a looped
+        // copy is Ignored by decide(), never applied).
+        if record.version_device == self.device_id {
             self.audit(
                 "sync_record_rejected_version_device",
                 serde_json::json!({
@@ -752,6 +756,7 @@ impl SyncEngine {
                     "kind": record.kind,
                     "peer_device_id": peer_device_id,
                     "version_device": record.version_device,
+                    "reason": "self_impersonation",
                 }),
             );
             return Ok(ApplyOutcome::Rejected);
