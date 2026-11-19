@@ -17,9 +17,11 @@
 //! a text field for the SAS digits the user reads on the other
 //! device's screen.
 
+use mimint_core::friends::approval::{ApprovalRelay, CardOrigin, DecisionOutcome};
 use mimint_core::friends::context::FriendsContext;
 use mimint_core::friends::esp32::esp32_status_label;
 use mimint_core::friends::esp32::Esp32Path;
+use mimint_core::friends::handoff::HandoffManager;
 use mimint_core::friends::handoff::{shared_notebook_context, HandoffOffer};
 use mimint_core::friends::hub::Hub;
 use mimint_core::friends::identity::Identity;
@@ -29,11 +31,11 @@ use mimint_core::friends::pairing::{
 };
 use mimint_core::friends::registry::{DeviceRegistry, Trust};
 use mimint_core::friends::session::{handshake_initiator, SessionConfig};
+use mimint_core::friends::sync::SyncEngine;
 use mimint_core::friends::sync::{run_sync_over_session, ResolutionChoice, SyncKinds};
 use mimint_core::friends::texts;
-use mimint_core::friends::util::Clock;
+use mimint_core::friends::util::{random_hex, Clock};
 use mimint_core::friends::wire::{MessageKind, PROTOCOL_VERSION};
-use mimint_core::friends::{approval::ApprovalRelay, handoff::HandoffManager, sync::SyncEngine};
 use mimint_core::MimintError;
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -106,6 +108,14 @@ pub enum FriendsCommand {
         task: String,
         next: String,
     },
+    /// Create a test approval card for a peer (demo hook for
+    /// the G2 approval flow; the production path is the brain's
+    /// approver creating the card in this same process). The
+    /// worker waits up to 65s for the peer's decision.
+    CreateCard {
+        target: String,
+        action: String,
+    },
 }
 
 /// Events the worker (and the hub's listener UI) send back to
@@ -172,6 +182,11 @@ pub enum FriendsEvent {
     HandoffReceived {
         package_id: String,
         task: String,
+    },
+    /// The peer decided on a card this device created.
+    CardDecided {
+        request_id: String,
+        outcome: String,
     },
     Status(String),
 }
@@ -444,6 +459,53 @@ fn handle_command(
                 }
             }
         }
+        FriendsCommand::CreateCard { target, action } => {
+            let prefs = ctx.registry.get_prefs(&target).unwrap_or_default();
+            let origin = CardOrigin {
+                device_id: ctx.identity.device_id().to_string(),
+                device_name: format!(
+                    "Thiết bị {}",
+                    &ctx.identity.device_id()[..8.min(ctx.identity.device_id().len())]
+                ),
+                agent_id: "agent-001".to_string(),
+                request_id: random_hex(16),
+                action,
+                detail: serde_json::json!({"source": "friends panel test card"}),
+            };
+            match ctx
+                .relay
+                .create_card(origin, &target, prefs.approve_allowed)
+            {
+                Ok((card, rx)) => {
+                    let _ = event_tx.send(FriendsEvent::Status(format!(
+                        "Đã tạo thẻ {} — đang chờ peer quyết định (tối đa 60 giây).",
+                        card.request_id
+                    )));
+                    match rx.recv_timeout(Duration::from_secs(65)) {
+                        Ok(outcome) => {
+                            let outcome = match outcome {
+                                DecisionOutcome::Approved => "approved",
+                                DecisionOutcome::Denied => "denied",
+                            };
+                            let _ = event_tx.send(FriendsEvent::CardDecided {
+                                request_id: card.request_id,
+                                outcome: outcome.to_string(),
+                            });
+                        }
+                        Err(_) => {
+                            let _ = event_tx.send(FriendsEvent::Status(
+                                "Thẻ hết hạn mà peer chưa quyết định.".to_string(),
+                            ));
+                        }
+                    }
+                }
+                Err(err) => {
+                    let _ = event_tx.send(FriendsEvent::Status(format!(
+                        "Không tạo được thẻ phê duyệt: {err}"
+                    )));
+                }
+            }
+        }
         FriendsCommand::HandoffOffer {
             to,
             addr,
@@ -552,6 +614,8 @@ pub struct FriendsPanel {
     handoff_task: String,
     handoff_next: String,
     handoff_notice: Option<String>,
+    card_target: String,
+    card_action: String,
     rename_target: Option<String>,
     rename_text: String,
     diff_cache: HashMap<i64, Vec<String>>,
@@ -588,6 +652,8 @@ impl FriendsPanel {
             handoff_task: String::new(),
             handoff_next: String::new(),
             handoff_notice: None,
+            card_target: String::new(),
+            card_action: "screenshot".to_string(),
             rename_target: None,
             rename_text: String::new(),
             diff_cache: HashMap::new(),
@@ -688,6 +754,12 @@ impl FriendsPanel {
                 }
                 FriendsEvent::HandoffFailed { error } => {
                     self.status = format!("Handoff thất bại: {error}");
+                }
+                FriendsEvent::CardDecided {
+                    request_id,
+                    outcome,
+                } => {
+                    self.status = format!("Peer đã quyết định thẻ {request_id}: {outcome}.");
                 }
                 FriendsEvent::HandoffReceived { package_id, task } => {
                     self.handoff_notice = Some(format!(
@@ -1168,6 +1240,23 @@ impl FriendsPanel {
                 crate::audit_view::format_time_ms(card.created_ms),
                 crate::audit_view::format_time_ms(card.expires_ms)
             ));
+        }
+        ui.separator();
+        ui.heading("Thẻ phê duyệt thử (demo)");
+        ui.label("Tạo một thẻ phê duyệt cho peer đã bật phê duyệt (tab Thiết bị). Peer quyết định bằng `mimint-cli friends approve-wait --addr <hub này>`. Đường production là brain tạo thẻ trong chính tiến trình này.");
+        ui.horizontal(|ui| {
+            ui.label("Peer (device id):");
+            ui.text_edit_singleline(&mut self.card_target);
+        });
+        ui.horizontal(|ui| {
+            ui.label("Hành động:");
+            ui.text_edit_singleline(&mut self.card_action);
+        });
+        if ui.button("Tạo thẻ phê duyệt thử").clicked() {
+            self.send(FriendsCommand::CreateCard {
+                target: self.card_target.clone(),
+                action: self.card_action.clone(),
+            });
         }
     }
 

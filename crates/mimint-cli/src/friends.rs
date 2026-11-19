@@ -16,6 +16,7 @@
 //!
 //! [`ActorDriverBackend`]: mimint_control::ActorDriverBackend
 
+use mimint_core::friends::approval::ApprovalDecision;
 use mimint_core::friends::context::{
     AutoInitiatorUi, AutoListenerUi, FriendsContext, TerminalInitiatorUi,
 };
@@ -40,9 +41,9 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-pub const FRIENDS_USAGE: &str = "mimint-cli friends: Phase 7 paired-body operations.\n\nUsage:\n  mimint-cli friends [--data-dir DIR] [--config PATH] [--db PATH] [--audit PATH] <command> [args]\n\nCommands:\n  devices                              List paired devices (trust, pairing state)\n  pair <addr> [--typing] [--guest] [--auto-confirm]\n                                         Pair with the hub at <addr> (initiator side;\n                                         the peer runs `friends hub --allow-pairing`)\n  sync <device-id> --addr <addr>         Two-way sync with a paired peer\n  revoke <device-id>                     Revoke a peer (keeps the entry; access cut)\n  delete <device-id>                     Delete a peer entry entirely\n  rename <device-id> <name>             Rename a peer\n  trust <device-id> <owner|guest>        Change the trust granted to a peer\n  reset-identity                         Rotate this body's identity key (old key refused at once)\n  approve-opt-in <device-id> --on|--off  Let a peer approve actions (default off)\n  hub [--lan] [--lab] [--allow-pairing] [--auto-confirm]\n                                         Run the hub in the foreground (brain: Ollama qwen2.5:3b)\n  handoff --to <id> --addr <addr> --task <text> [--next <text>]\n                                         Offer a task handoff to a peer\n  conflicts                              List unresolved sync conflicts with diffs\n  resolve <id> --keep-local|--keep-remote|--keep-both\n                                         Resolve one conflict\n  fake-esp32 --path xiaozhi|v2 --addr <host:port> --uuid <uuid> [--text <text>] [--ota-addr <host:port>]\n                                         Run a fake ESP32 device against a hub\n  bench [--quick]                        Measure budgets B1–B8 for real (isolated temp dirs)\n  help                                   Show this help\n\nPairing mode is process-scoped: start the peer hub with --allow-pairing.\n--auto-confirm is demo-only (auto-answers the SAS prompts) and prints a warning.\nThe hub has no body attached: driver methods are refused until the GUI wires one.\n";
+pub const FRIENDS_USAGE: &str = "mimint-cli friends: Phase 7 paired-body operations.\n\nUsage:\n  mimint-cli friends [--data-dir DIR] [--config PATH] [--db PATH] [--audit PATH] <command> [args]\n\nCommands:\n  devices                              List paired devices (trust, pairing state)\n  pair <addr> [--typing] [--guest] [--auto-confirm]\n                                         Pair with the hub at <addr> (initiator side;\n                                         the peer runs `friends hub --allow-pairing`)\n  sync <device-id> --addr <addr>         Two-way sync with a paired peer\n  revoke <device-id>                     Revoke a peer (keeps the entry; access cut)\n  delete <device-id>                     Delete a peer entry entirely\n  rename <device-id> <name>             Rename a peer\n  trust <device-id> <owner|guest>        Change the trust granted to a peer\n  reset-identity                         Rotate this body's identity key (old key refused at once)\n  approve-opt-in <device-id> --on|--off  Let a peer approve actions (default off)\n  hub [--lan] [--lab] [--allow-pairing] [--auto-confirm]\n                                         Run the hub in the foreground (brain: Ollama qwen2.5:3b)\n  handoff --to <id> --addr <addr> --task <text> [--next <text>]\n                                         Offer a task handoff to a peer\n  conflicts                              List unresolved sync conflicts with diffs\n  resolve <id> --keep-local|--keep-remote|--keep-both\n                                         Resolve one conflict\n  fake-esp32 --path xiaozhi|v2 --addr <host:port> --uuid <uuid> [--text <text>] [--ota-addr <host:port>]\n                                         Run a fake ESP32 device against a hub\n  bench [--quick]                        Measure budgets B1–B8 for real (isolated temp dirs)\n  approve-wait --addr <host:port>       Wait for a peer approval card on this hub session, show its full origin, and decide\n  help                                   Show this help\n\nPairing mode is process-scoped: start the peer hub with --allow-pairing.\n--auto-confirm is demo-only (auto-answers the SAS prompts) and prints a warning.\nThe hub has no body attached: driver methods are refused until the GUI wires one.\n";
 
 /// The CLI's driver backend: there is no body in this process,
 /// so every driver method is refused with a clear error rather
@@ -253,6 +254,7 @@ pub fn run_friends(argv: &[String]) -> Result<(), MimintError> {
         "resolve" => cmd_resolve(&args, rest),
         "fake-esp32" => cmd_fake_esp32(&args, rest),
         "bench" => crate::friends_bench::cmd_bench(&args, rest),
+        "approve-wait" => cmd_approve_wait(&args, rest),
         other => Err(MimintError::Config(format!(
             "unknown friends command '{other}'\n{FRIENDS_USAGE}"
         ))),
@@ -927,6 +929,79 @@ impl ListenerUi for ChannelSasListenerUi {
             trust_granted: self.trust,
             fingerprint_confirmed: true,
             fingerprint_skipped_with_warning: false,
+        }
+    }
+}
+
+/// Wait for a peer approval card: connect to the peer hub,
+/// ping (which triggers card delivery), show the first card
+/// with its full origin fields, and ask the user to approve
+/// or deny it. The decision goes back over the same E2E
+/// session. This is the peer-side decision surface for cards
+/// the local brain (or the panel's test-card button) created.
+fn cmd_approve_wait(args: &FriendsArgs, rest: &[String]) -> Result<(), MimintError> {
+    let addr = value_of(rest, "--addr")
+        .ok_or_else(|| MimintError::Config("approve-wait needs --addr <host:port>".to_string()))?;
+    let (ctx, _resolved) = open_context(args)?;
+    let stream = TcpStream::connect(&addr)
+        .map_err(|err| MimintError::Io(format!("cannot connect to {addr}: {err}")))?;
+    let mut session = handshake_initiator(
+        stream,
+        &ctx.identity,
+        &ctx.registry,
+        &SessionConfig::default(),
+        &ctx.clock,
+        ctx.audit.clone(),
+    )?;
+    println!("Đã kết nối tới {addr}. Đang chờ thẻ phê duyệt (tối đa 70 giây)...");
+    let deadline = Instant::now() + Duration::from_secs(70);
+    loop {
+        if Instant::now() > deadline {
+            println!("Hết thời gian chờ: không có thẻ phê duyệt nào.");
+            return Ok(());
+        }
+        session.send(MessageKind::Ping, b"")?;
+        let (kind, payload) = session.recv()?;
+        match kind {
+            MessageKind::ApprovalCard => {
+                let card: mimint_core::friends::approval::ApprovalCard =
+                    serde_json::from_slice(&payload)
+                        .map_err(|err| MimintError::Config(err.to_string()))?;
+                println!("Thẻ phê duyệt từ peer:");
+                println!("  thiết bị: {} ({:.8})", card.device_name, card.device_id);
+                println!("  agent: {}", card.agent_id);
+                println!("  yêu cầu: {}", card.request_id);
+                println!("  hành động: {}", card.action);
+                println!("  chi tiết: {}", card.detail);
+                print!("Phê duyệt? [approve/deny]: ");
+                let _ = std::io::stdout().flush();
+                let mut line = String::new();
+                let _ = std::io::stdin().read_line(&mut line);
+                let decision = if line.trim().eq_ignore_ascii_case("approve") {
+                    "approve"
+                } else {
+                    "deny"
+                };
+                let d = ApprovalDecision {
+                    v: PROTOCOL_VERSION,
+                    kind: "approval_decision".to_string(),
+                    device_id: card.device_id.clone(),
+                    agent_id: card.agent_id.clone(),
+                    request_id: card.request_id.clone(),
+                    decision: decision.to_string(),
+                    decided_ms: mimint_core::audit::now_ms(),
+                };
+                session.send(
+                    MessageKind::ApprovalDecision,
+                    &serde_json::to_vec(&d).map_err(|err| MimintError::Config(err.to_string()))?,
+                )?;
+                println!("Đã gửi quyết định: {decision}.");
+                return Ok(());
+            }
+            MessageKind::Pong => {
+                std::thread::sleep(Duration::from_secs(2));
+            }
+            _ => {}
         }
     }
 }
