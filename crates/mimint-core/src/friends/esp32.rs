@@ -139,8 +139,11 @@ impl FakeXiaoZhiDevice {
     pub fn connect(addr: &str, uuid: &str, token: &str) -> Result<Self, MimintError> {
         let stream = TcpStream::connect(addr)
             .map_err(|err| MimintError::Io(format!("fake xiaozhi connect: {err}")))?;
+        // 120s, not 10s: a real brain turn waits on Ollama
+        // (~19s for a short reply on this machine), and the
+        // device must not time out while the brain thinks.
         stream
-            .set_read_timeout(Some(Duration::from_secs(10)))
+            .set_read_timeout(Some(Duration::from_secs(120)))
             .map_err(|err| MimintError::Io(err.to_string()))?;
         let path = format!("/xiaozhi?token={token}");
         let conn = WsConnection::connect_upgrade(stream, addr, &path).map_err(MimintError::from)?;
