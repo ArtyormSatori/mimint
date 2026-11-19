@@ -105,6 +105,11 @@ pub struct LocalVersionRow {
     pub kind: String,
     pub version: VersionId,
     pub based_on: Option<VersionId>,
+    /// The version a conflict resolution supersedes (F7-29):
+    /// set only on the row of a resolution record, so a re-sent
+    /// resolution still carries it and the peer applies it under
+    /// Rule 2. `None` for ordinary records.
+    pub supersedes_version: Option<VersionId>,
     pub hash: String,
 }
 
@@ -287,6 +292,7 @@ impl DeviceRegistry {
                 version_lamport INTEGER NOT NULL,
                 version_device TEXT NOT NULL,
                 based_on TEXT,
+                supersedes_version TEXT,
                 hash TEXT NOT NULL,
                 updated_ms INTEGER NOT NULL
             );
@@ -352,6 +358,20 @@ impl DeviceRegistry {
                 received_ms INTEGER NOT NULL
             );",
         )?;
+        // F7-29: databases created before this change lack
+        // `local_versions.supersedes_version` (fresh databases
+        // get it from the CREATE above). Add the column when
+        // missing; existing rows keep NULL supersedes, so no
+        // data is lost.
+        let has_supersedes: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('local_versions') \
+             WHERE name = 'supersedes_version'",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_supersedes == 0 {
+            conn.execute_batch("ALTER TABLE local_versions ADD COLUMN supersedes_version TEXT")?;
+        }
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -958,11 +978,13 @@ impl DeviceRegistry {
         let conn = self.connection();
         let row = conn
             .query_row(
-                "SELECT sync_id, kind, version_lamport, version_device, based_on, hash
+                "SELECT sync_id, kind, version_lamport, version_device, based_on, \
+                 supersedes_version, hash
                  FROM local_versions WHERE sync_id = ?1",
                 params![sync_id],
                 |row| {
                     let based_on_text: Option<String> = row.get(4)?;
+                    let supersedes_text: Option<String> = row.get(5)?;
                     Ok(LocalVersionRow {
                         sync_id: row.get(0)?,
                         kind: row.get(1)?,
@@ -971,7 +993,9 @@ impl DeviceRegistry {
                             device: row.get(3)?,
                         },
                         based_on: based_on_text.and_then(|t| serde_json::from_str(&t).ok()),
-                        hash: row.get(5)?,
+                        supersedes_version: supersedes_text
+                            .and_then(|t| serde_json::from_str(&t).ok()),
+                        hash: row.get(6)?,
                     })
                 },
             )
@@ -983,12 +1007,14 @@ impl DeviceRegistry {
         let conn = self.connection();
         conn.execute(
             "INSERT INTO local_versions (sync_id, kind, version_lamport, version_device,
-                based_on, hash, updated_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                based_on, supersedes_version, hash, updated_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(sync_id) DO UPDATE SET kind = excluded.kind,
                 version_lamport = excluded.version_lamport,
                 version_device = excluded.version_device,
-                based_on = excluded.based_on, hash = excluded.hash,
+                based_on = excluded.based_on,
+                supersedes_version = excluded.supersedes_version,
+                hash = excluded.hash,
                 updated_ms = excluded.updated_ms",
             params![
                 row.sync_id,
@@ -996,6 +1022,9 @@ impl DeviceRegistry {
                 row.version.lamport as i64,
                 row.version.device,
                 row.based_on
+                    .as_ref()
+                    .map(|v| serde_json::to_string(v).unwrap_or_default()),
+                row.supersedes_version
                     .as_ref()
                     .map(|v| serde_json::to_string(v).unwrap_or_default()),
                 row.hash,
@@ -1513,5 +1542,68 @@ mod tests {
         changed.sync_skills = false;
         registry.set_prefs("dev1", &changed).unwrap();
         assert_eq!(registry.get_prefs("dev1").unwrap(), changed);
+    }
+
+    #[test]
+    fn local_version_supersedes_round_trip_and_old_db_migrates() {
+        // F7-29: a resolution's supersedes survives a set/get
+        // round-trip, and ordinary rows still store None.
+        let registry = temp_registry("sup");
+        let row = LocalVersionRow {
+            sync_id: "note:1".to_string(),
+            kind: "notebook_note".to_string(),
+            version: VersionId::new(5, "dev-a"),
+            based_on: Some(VersionId::new(2, "dev-a")),
+            supersedes_version: Some(VersionId::new(3, "dev-b")),
+            hash: "abc".to_string(),
+        };
+        registry.set_local_version(&row).unwrap();
+        let loaded = registry.get_local_version("note:1").unwrap().expect("row");
+        assert_eq!(loaded, row);
+        let plain = LocalVersionRow {
+            supersedes_version: None,
+            ..row.clone()
+        };
+        registry.set_local_version(&plain).unwrap();
+        let loaded = registry.get_local_version("note:1").unwrap().expect("row");
+        assert_eq!(loaded.supersedes_version, None);
+
+        // F7-29 migration: a database created with the OLD
+        // schema (no supersedes column) opens fine, keeps its
+        // rows, and reads supersedes as None.
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let path = std::env::temp_dir().join(format!(
+            "mimint-peers-old-{}-{nanos}.db",
+            std::process::id()
+        ));
+        {
+            let conn = Connection::open(&path).expect("open old db");
+            conn.execute_batch(
+                "CREATE TABLE local_versions (
+                    sync_id TEXT PRIMARY KEY,
+                    kind TEXT NOT NULL,
+                    version_lamport INTEGER NOT NULL,
+                    version_device TEXT NOT NULL,
+                    based_on TEXT,
+                    hash TEXT NOT NULL,
+                    updated_ms INTEGER NOT NULL
+                );
+                INSERT INTO local_versions
+                    (sync_id, kind, version_lamport, version_device, based_on, hash, updated_ms)
+                    VALUES ('note:old', 'notebook_note', 2, 'dev-a', NULL, 'deadbeef', 1000);",
+            )
+            .expect("old schema");
+        }
+        let migrated = DeviceRegistry::open(&path).expect("open migrates");
+        let loaded = migrated
+            .get_local_version("note:old")
+            .unwrap()
+            .expect("old row survives");
+        assert_eq!(loaded.version, VersionId::new(2, "dev-a"));
+        assert_eq!(loaded.hash, "deadbeef");
+        assert_eq!(loaded.supersedes_version, None);
     }
 }

@@ -331,12 +331,15 @@ impl SyncEngine {
         let existing = self.registry.get_local_version(sync_id)?;
         if let Some(row) = existing {
             if row.hash == hash {
+                // F7-29: an unchanged record is re-sent as-is —
+                // a stored resolution keeps its supersedes, so
+                // the peer still applies it under Rule 2.
                 let record = SyncRecord::build(
                     sync_id.to_string(),
                     kind,
                     row.version,
                     row.based_on,
-                    None,
+                    row.supersedes_version.clone(),
                     origin_device.to_string(),
                     self.now_ms(),
                     Some(body),
@@ -367,6 +370,10 @@ impl SyncEngine {
                 kind: kind.as_str().to_string(),
                 version,
                 based_on: Some(row.version),
+                // A fresh edit is not a resolution: it chains
+                // from the recorded version and supersedes
+                // nothing (F7-29).
+                supersedes_version: None,
                 hash,
             })?;
             return Ok(record);
@@ -403,6 +410,7 @@ impl SyncEngine {
             kind: kind.as_str().to_string(),
             version,
             based_on,
+            supersedes_version: None,
             hash,
         })?;
         Ok(record)
@@ -831,6 +839,10 @@ impl SyncEngine {
                 kind: record.kind.clone(),
                 version: record.version(),
                 based_on: record.based_on.clone(),
+                // F7-29: keep a received record's supersedes
+                // (e.g. a resolution this side applied), so a
+                // later re-send still carries it.
+                supersedes_version: record.supersedes_version.clone(),
                 hash: record.body_sha256.clone(),
             })?;
             self.registry.set_last_seen(
@@ -921,6 +933,10 @@ impl SyncEngine {
                     kind: record.kind.clone(),
                     version: record.version(),
                     based_on: record.based_on.clone(),
+                    // F7-29: keep a received record's supersedes
+                    // (e.g. a resolution this side applied), so a
+                    // later re-send still carries it.
+                    supersedes_version: record.supersedes_version.clone(),
                     hash: record.body_sha256.clone(),
                 })?;
                 self.registry.set_last_seen(
@@ -932,6 +948,27 @@ impl SyncEngine {
                     },
                 )?;
                 self.note_accepted_lineage(peer_device_id, record)?;
+                // F7-29: an applied successor/resolution settles
+                // any open conflict it anchors on — the clash is
+                // moot once local state moves past it. Without
+                // this the peer keeps showing a stale conflict
+                // for a record that already converged.
+                for open in self.registry.list_conflicts(false)? {
+                    if open.sync_id == record.sync_id
+                        && successor_claim(record, &open.local_version).is_some()
+                    {
+                        self.registry
+                            .resolve_conflict(open.id, "superseded_by_peer")?;
+                        self.audit(
+                            "sync_conflict_settled_by_peer",
+                            serde_json::json!({
+                                "sync_id": record.sync_id,
+                                "kind": record.kind,
+                                "conflict_id": open.id,
+                            }),
+                        );
+                    }
+                }
                 Ok(ApplyOutcome::Applied)
             }
             ConflictDecision::KeepLocal => Ok(ApplyOutcome::KeptLocal),
@@ -1019,6 +1056,10 @@ impl SyncEngine {
             kind: record.kind.clone(),
             version: record.version(),
             based_on: record.based_on.clone(),
+            // F7-29: keep a received record's supersedes
+            // (e.g. a resolution this side applied), so a
+            // later re-send still carries it.
+            supersedes_version: record.supersedes_version.clone(),
             hash: record.body_sha256.clone(),
         })?;
         self.registry.set_last_seen(
@@ -1616,6 +1657,11 @@ impl SyncEngine {
                 kind: resolution.kind.clone(),
                 version: resolution.version(),
                 based_on: resolution.based_on.clone(),
+                // F7-29: persist the resolution's supersedes so
+                // the next sync re-sends it and the peer applies
+                // the resolution under Rule 2 instead of opening
+                // a new conflict.
+                supersedes_version: resolution.supersedes_version.clone(),
                 hash: resolution.body_sha256.clone(),
             })?;
         }
@@ -1688,6 +1734,7 @@ impl SyncEngine {
             kind: kind.as_str().to_string(),
             version,
             based_on: None,
+            supersedes_version: None,
             hash: record.body_sha256.clone(),
         })?;
         Ok(record)

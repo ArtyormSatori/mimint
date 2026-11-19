@@ -2093,6 +2093,55 @@ fn sync_conflict_resolution_converges() {
     assert_eq!(note_body(&a, &note_id).as_deref(), Some("B's version"));
     assert_eq!(note_body(&b, &note_id).as_deref(), Some("B's version"));
     assert!(a.registry.list_conflicts(false).unwrap().is_empty());
+    assert!(
+        b.registry.list_conflicts(false).unwrap().is_empty(),
+        "KeepRemote must not leave a conflict on B either"
+    );
+
+    // F7-29: KeepLocal must converge too. Before the fix the
+    // resolution lost its supersedes on re-send, so B opened a
+    // second conflict instead of applying it under Rule 2.
+    let a = Node::new("crkl-a");
+    let b = Node::new("crkl-b");
+    let (_, note_id) = add_shared_note(&a, "note", "v1");
+    let (sa, sb) = paired_synced(&a, &b);
+    sync_both(&a, &b, sa, sb, &SyncKinds::all());
+    edit_note(&a, &note_id, "A's version");
+    edit_note(&b, &note_id, "B's version");
+    let (sa, sb) = handshake_pair(&a, &b);
+    sync_both(&a, &b, sa, sb, &SyncKinds::all());
+    let conflicts = a.registry.list_conflicts(false).unwrap();
+    assert_eq!(conflicts.len(), 1);
+    let remote_version = conflicts[0].remote_version.clone();
+    a.engine
+        .resolve_conflict(conflicts[0].id, ResolutionChoice::KeepLocal)
+        .unwrap();
+    // The stored resolution keeps its supersedes, and the next
+    // outgoing record carries it (unit-level check of
+    // `versioned_record`).
+    let stored = a
+        .registry
+        .get_local_version(&note_id)
+        .unwrap()
+        .expect("A must hold the resolution");
+    assert_eq!(stored.supersedes_version, Some(remote_version.clone()));
+    let outgoing = a.engine.current_records(&SyncKinds::all()).unwrap();
+    let offered = outgoing
+        .iter()
+        .find(|r| r.sync_id == note_id)
+        .expect("resolution must be offered");
+    assert_eq!(offered.supersedes_version, Some(remote_version));
+    // Next sync converges: both sides hold A's version, and
+    // neither side opens a new conflict.
+    let (sa, sb) = handshake_pair(&a, &b);
+    sync_both(&a, &b, sa, sb, &SyncKinds::all());
+    assert_eq!(note_body(&a, &note_id).as_deref(), Some("A's version"));
+    assert_eq!(note_body(&b, &note_id).as_deref(), Some("A's version"));
+    assert!(a.registry.list_conflicts(false).unwrap().is_empty());
+    assert!(
+        b.registry.list_conflicts(false).unwrap().is_empty(),
+        "B must apply the KeepLocal resolution, not conflict again (F7-29)"
+    );
 }
 
 #[test]
