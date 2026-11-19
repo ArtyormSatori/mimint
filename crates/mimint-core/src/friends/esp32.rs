@@ -83,14 +83,18 @@ where
     }
 }
 
-/// The exact ESP32 status label (§8.5): one of four, no
-/// others. Lab mode, XiaoZhi LAN, v2, or voice-unsupported.
+/// The exact ESP32 status label (§8.5): one of the lab /
+/// XiaoZhi / v2 / voice labels, no others. F7-14: lab mode
+/// keeps the two paths apart (a lab XiaoZhi device and a lab
+/// v2 device show different labels), and an unpaired v2
+/// device no longer wears the XiaoZhi LAN label.
 pub fn esp32_status_label(path: Esp32Path, lab_mode: bool, paired: bool) -> &'static str {
     match (path, lab_mode, paired) {
-        (_, true, _) => texts::ESP32_LABEL_LAB,
+        (Esp32Path::XiaoZhi, true, _) => texts::ESP32_LABEL_LAB_XIAOZHI,
+        (Esp32Path::V2, true, _) => texts::ESP32_LABEL_LAB_V2,
         (Esp32Path::XiaoZhi, false, _) => texts::ESP32_LABEL_XIAOZHI_LAN,
         (Esp32Path::V2, false, true) => texts::ESP32_LABEL_V2,
-        (Esp32Path::V2, false, false) => texts::ESP32_LABEL_XIAOZHI_LAN,
+        (Esp32Path::V2, false, false) => texts::ESP32_LABEL_V2_UNPAIRED,
     }
 }
 
@@ -300,9 +304,19 @@ mod tests {
 
     #[test]
     fn esp32_status_labels_are_exactly_four() {
+        // F7-14: lab mode keeps the paths apart, and an
+        // unpaired v2 device no longer wears the XiaoZhi label.
         assert_eq!(
             esp32_status_label(Esp32Path::XiaoZhi, true, true),
-            texts::ESP32_LABEL_LAB
+            texts::ESP32_LABEL_LAB_XIAOZHI
+        );
+        assert_eq!(
+            esp32_status_label(Esp32Path::V2, true, false),
+            texts::ESP32_LABEL_LAB_V2
+        );
+        assert_ne!(
+            esp32_status_label(Esp32Path::XiaoZhi, true, true),
+            esp32_status_label(Esp32Path::V2, true, true)
         );
         assert_eq!(
             esp32_status_label(Esp32Path::XiaoZhi, false, true),
@@ -312,10 +326,11 @@ mod tests {
             esp32_status_label(Esp32Path::V2, false, true),
             texts::ESP32_LABEL_V2
         );
-        // An unpaired v2 device shows the limited-auth label.
+        // An unpaired v2 device shows its own label, never
+        // the XiaoZhi LAN label.
         assert_eq!(
             esp32_status_label(Esp32Path::V2, false, false),
-            texts::ESP32_LABEL_XIAOZHI_LAN
+            texts::ESP32_LABEL_V2_UNPAIRED
         );
     }
 }

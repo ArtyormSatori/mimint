@@ -22,7 +22,7 @@ use mimint_core::friends::context::{
 };
 use mimint_core::friends::esp32::{FakeV2Device, FakeXiaoZhiDevice};
 use mimint_core::friends::handoff::{
-    shared_notebook_context, HandoffDecision, HandoffOffer, HandoffReject,
+    shared_notebook_context, HandoffDecision, HandoffOffer, HandoffReject, HANDOFF_ACTUATOR,
 };
 use mimint_core::friends::hub::{DriverBackend, HubConfig};
 use mimint_core::friends::identity::DeviceKeyStore;
@@ -45,7 +45,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-pub const FRIENDS_USAGE: &str = "mimint-cli friends: Phase 7 paired-body operations.\n\nUsage:\n  mimint-cli friends [--data-dir DIR] [--config PATH] [--db PATH] [--audit PATH] <command> [args]\n\nCommands:\n  devices                              List paired devices (trust, pairing state)\n  pair <addr> [--typing] [--guest] [--auto-confirm]\n                                         Pair with the hub at <addr> (initiator side;\n                                         the peer runs `friends hub --allow-pairing`)\n  sync <device-id> --addr <addr>         Two-way sync with a paired peer\n  revoke <device-id>                     Revoke a peer (keeps the entry; access cut)\n  delete <device-id>                     Delete a peer entry entirely\n  rename <device-id> <name>             Rename a peer\n  trust <device-id> <owner|guest>        Change the trust granted to a peer\n  reset-identity                         Rotate this body's identity key (old key refused at once)\n  approve-opt-in <device-id> --on|--off  Let a peer approve actions (default off)\n  hub [--lan] [--lab] [--allow-pairing] [--auto-confirm]\n                                         Run the hub in the foreground (brain: Ollama qwen2.5:3b)\n  handoff --to <id> --addr <addr> --task <text> [--next <text>] [--wait-secs N]\n                                         Offer a task handoff to a peer (the receiver's user decides;\n                                         this waits up to the 10-minute lease TTL for the answer)\n  handoff list                           List handoff packages waiting for this body's user\n  handoff accept <package-id>            Accept a pending handoff (lease + handoff_accept)\n  handoff reject <package-id>            Decline a pending handoff (lease stays with the sender)\n  conflicts                              List unresolved sync conflicts with diffs\n  resolve <id> --keep-local|--keep-remote|--keep-both\n                                         Resolve one conflict\n  fake-esp32 --path xiaozhi|v2 --addr <host:port> --uuid <uuid> [--text <text>] [--ota-addr <host:port>]\n                                         Run a fake ESP32 device against a hub\n  bench [--quick]                        Measure budgets B1–B8 for real (isolated temp dirs)\n  approve-wait --addr <host:port>       Wait for a peer approval card on this hub session, show its full origin, and decide\n  help                                   Show this help\n\nPairing mode is process-scoped: start the peer hub with --allow-pairing.\n--auto-confirm is demo-only (auto-answers the SAS prompts) and prints a warning.\nThe hub has no body attached: driver methods are refused until the GUI wires one.\n";
+pub const FRIENDS_USAGE: &str = "mimint-cli friends: Phase 7 paired-body operations.\n\nUsage:\n  mimint-cli friends [--data-dir DIR] [--config PATH] [--db PATH] [--audit PATH] <command> [args]\n\nCommands:\n  devices                              List paired devices (trust, pairing state)\n  pair <addr> [--typing] [--guest] [--auto-confirm]\n                                         Pair with the hub at <addr> (initiator side;\n                                         the peer runs `friends hub --allow-pairing`)\n  sync <device-id> --addr <addr>         Two-way sync with a paired peer\n  revoke <device-id>                     Revoke a peer (keeps the entry; access cut)\n  delete <device-id>                     Delete a peer entry entirely\n  rename <device-id> <name>             Rename a peer\n  trust <device-id> <owner|guest>        Change the trust granted to a peer\n  reset-identity                         Rotate this body's identity key (old key refused at once)\n  approve-opt-in <device-id> --on|--off  Let a peer approve actions (default off)\n  hub [--lan] [--lab] [--allow-pairing] [--auto-confirm]\n                                         Run the hub in the foreground (brain: Ollama qwen2.5:3b)\n  handoff --to <id> --addr <addr> --task <text> [--next <text>] [--wait-secs N]\n                                         Offer a task handoff to a peer (the receiver's user decides;\n                                         this waits up to the 10-minute lease TTL for the answer)\n  handoff list                           List handoff packages waiting for this body's user\n  handoff accept <package-id>            Accept a pending handoff (lease + handoff_accept)\n  handoff reject <package-id>            Decline a pending handoff (lease stays with the sender)\n  conflicts                              List unresolved sync conflicts with diffs\n  pending-approvals                      List SoulFile/profile records held for your approval (F7-02)\n  approve-sync <sync-id>                 Approve a held SoulFile/profile record (applies it)\n  reject-sync <sync-id>                  Reject a held SoulFile/profile record (drops it)\n  resolve <id> --keep-local|--keep-remote|--keep-both\n                                         Resolve one conflict\n  fake-esp32 --path xiaozhi|v2 --addr <host:port> --uuid <uuid> [--text <text>] [--ota-addr <host:port>]\n                                         Run a fake ESP32 device against a hub\n  bench [--quick]                        Measure budgets B1–B8 for real (isolated temp dirs)\n  approve-wait --addr <host:port>       Wait for a peer approval card on this hub session, show its full origin, and decide\n  help                                   Show this help\n\nPairing mode is process-scoped: start the peer hub with --allow-pairing.\n--auto-confirm is demo-only (auto-answers the SAS prompts) and prints a warning.\nThe hub has no body attached: driver methods are refused until the GUI wires one.\n";
 
 /// The CLI's driver backend: there is no body in this process,
 /// so every driver method is refused with a clear error rather
@@ -216,6 +216,14 @@ fn open_context_with_ui(
             Clock::system(),
         )?,
     };
+    // F7-23: warn on every CLI open when the registry was
+    // recreated after peers.db was deleted.
+    if ctx.peers_db_restored {
+        println!(
+            "WARNING: {}",
+            mimint_core::friends::texts::PEERS_DB_RESTORE_WARNING
+        );
+    }
     Ok((ctx, resolved))
 }
 
@@ -253,6 +261,9 @@ pub fn run_friends(argv: &[String]) -> Result<(), MimintError> {
         "hub" => cmd_hub(&args, rest),
         "handoff" => cmd_handoff_dispatch(&args, rest),
         "conflicts" => cmd_conflicts(&args),
+        "pending-approvals" => cmd_pending_approvals(&args),
+        "approve-sync" => cmd_approve_sync(&args, rest),
+        "reject-sync" => cmd_reject_sync(&args, rest),
         "resolve" => cmd_resolve(&args, rest),
         "fake-esp32" => cmd_fake_esp32(&args, rest),
         "bench" => crate::friends_bench::cmd_bench(&args, rest),
@@ -283,6 +294,14 @@ fn cmd_devices(args: &FriendsArgs) -> Result<(), MimintError> {
             prefs.approve_allowed,
             peer.key_generation
         );
+        // F7-21: trust_received is display-only — label it so
+        // it can never be read as the local grant.
+        if let Some(received) = peer.trust_received {
+            println!(
+                "    peer nói đã cấp cho bạn: {:?} (chỉ để xem — không dùng để cho phép gì ở đây)",
+                received
+            );
+        }
     }
     Ok(())
 }
@@ -425,12 +444,20 @@ fn cmd_reset_identity(args: &FriendsArgs) -> Result<(), MimintError> {
     let store = DeviceKeyStore::in_data_dir(&args.data_dir);
     let old = store.ensure()?;
     let new = store.rotate()?;
+    // F7-28: the old key is dead, so every pairing made with
+    // it is incomplete until re-paired, and already-revoked
+    // entries are deleted instead of lingering as stale rows.
+    let (ctx, _) = open_context(args)?;
+    let (marked, deleted) = ctx.registry.cleanup_after_rotation()?;
     println!(
         "Old identity {} is refused at once (no grace period).",
         old.device_id()
     );
     println!("New device id: {}", new.device_id());
     println!("New fingerprint: {}", new.fingerprint());
+    println!(
+        "Rotation cleanup: {marked} peer(s) marked pairing-incomplete (re-pair required), {deleted} revoked entry(ies) deleted."
+    );
     println!("WARNING: {}", mimint_core::friends::texts::KEY_LOSS_WARNING);
     println!("Re-pair every peer: the old key no longer authenticates this body.");
     Ok(())
@@ -564,7 +591,8 @@ fn cmd_hub(args: &FriendsArgs, rest: &[String]) -> Result<(), MimintError> {
         ctx.hub.exposure_state()
     );
     println!("  xiaozhi  port {}", ctx.hub.xiaozhi_port());
-    println!("  ota      port {}", ctx.hub.ota_port());
+    println!("  ota      port {} ({})", ctx.hub.ota_port(), if ctx.hub.ota_open() { "đang mở" } else { "đã đóng" });
+    println!("  {}", mimint_core::friends::texts::HUB_EXPOSURE_OTA_OPEN);
     println!("  brain    Ollama qwen2.5:3b @ 127.0.0.1:11434 (one brain for both ESP32 paths)");
     println!("  driver   none (no body attached to this CLI process)");
     println!("Press Ctrl-C to stop. Pairing: peer runs `mimint-cli friends pair <this-host>:<friends-port>`.");
@@ -596,7 +624,7 @@ fn cmd_handoff(args: &FriendsArgs, rest: &[String]) -> Result<(), MimintError> {
         Vec::new(),
         Vec::new(),
         notebook_context,
-        "default",
+        HANDOFF_ACTUATOR,
     )?;
     let stream = TcpStream::connect(&addr)
         .map_err(|err| MimintError::Io(format!("cannot connect to {addr}: {err}")))?;
@@ -779,6 +807,43 @@ fn cmd_conflicts(args: &FriendsArgs) -> Result<(), MimintError> {
             row.id
         );
         println!("    (SOUL/profile: --keep-both is disabled, with an explanation.)");
+    }
+    Ok(())
+}
+
+fn cmd_pending_approvals(args: &FriendsArgs) -> Result<(), MimintError> {
+    let (ctx, _) = open_context(args)?;
+    let rows = ctx.sync_engine.pending_sync_approvals()?;
+    if rows.is_empty() {
+        println!("No SoulFile/profile records waiting for approval.");
+        return Ok(());
+    }
+    for (sync_id, kind, peer_device_id, _record_json, received_ms) in rows {
+        println!(
+            "- {kind} {sync_id} from {peer_device_id:.8} (received {received_ms} ms) — approve with `friends approve-sync {sync_id}` or reject with `friends reject-sync {sync_id}`"
+        );
+    }
+    Ok(())
+}
+
+fn cmd_approve_sync(args: &FriendsArgs, rest: &[String]) -> Result<(), MimintError> {
+    let sync_id = need_positional(rest, 0, "sync id")?;
+    let (ctx, _) = open_context(args)?;
+    if ctx.sync_engine.approve_pending_sync(&sync_id)? {
+        println!("Approved and applied {sync_id}.");
+    } else {
+        println!("Nothing pending for {sync_id}.");
+    }
+    Ok(())
+}
+
+fn cmd_reject_sync(args: &FriendsArgs, rest: &[String]) -> Result<(), MimintError> {
+    let sync_id = need_positional(rest, 0, "sync id")?;
+    let (ctx, _) = open_context(args)?;
+    if ctx.sync_engine.reject_pending_sync(&sync_id)? {
+        println!("Rejected {sync_id} (dropped, not applied).");
+    } else {
+        println!("Nothing pending for {sync_id}.");
     }
     Ok(())
 }

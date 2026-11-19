@@ -332,8 +332,21 @@ impl SoulStore {
     }
 
     /// Load a SOUL file. Errors when the file does not exist.
+    /// F7-18: a symlink in the SOUL directory is refused —
+    /// `load` never follows one, so a link pointing outside
+    /// the data directory cannot smuggle foreign content in
+    /// (the sync walker skips symlinks too).
     pub fn load(&self, file: &str) -> Result<SoulDoc, MimintError> {
         let path = self.resolve(file)?;
+        if std::fs::symlink_metadata(&path)
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false)
+        {
+            return Err(MimintError::Config(format!(
+                "SOUL file {} is a symlink; refusing to follow it",
+                path.display()
+            )));
+        }
         let text = fs::read_to_string(&path).map_err(|err| {
             MimintError::Config(format!("cannot read SOUL file {}: {err}", path.display()))
         })?;

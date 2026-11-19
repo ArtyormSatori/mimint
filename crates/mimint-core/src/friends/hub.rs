@@ -239,6 +239,10 @@ pub struct Hub {
     pending_handshakes: AtomicUsize,
     stop_flag: AtomicBool,
     lan_listener_on: AtomicBool,
+    /// Whether the OTA accept loop serves connections (F7-06):
+    /// `close_lan` switches it off together with the friends
+    /// LAN listener, and revokes live OTA tokens.
+    ota_on: AtomicBool,
     /// Was a driver action seen in the last 60s?
     driver_active: Mutex<Option<DriverIndicator>>,
     /// The WS turn handler, installed by the app context (it
@@ -266,9 +270,38 @@ pub struct Hub {
     /// Completed handoff brain turns (package id → reply
     /// text), drained by the panel. Capped at 8 entries.
     handoff_turn_replies: Mutex<HashMap<String, String>>,
+    /// Handoff brain-turn lifecycle (F7-11): one entry per
+    /// accepted package — Running while the brain works,
+    /// Done/Cancelled/Error after. The panel reads this for
+    /// the heartbeat/status line; cancel sets the flag the
+    /// turn thread checks when the brain returns.
+    handoff_turns: Mutex<HashMap<String, HandoffTurnState>>,
+    /// Cancel flags for running handoff brain turns (F7-11),
+    /// keyed by package id. `cancel_handoff_turn` sets the
+    /// flag; the turn thread reads it when the brain returns.
+    handoff_turn_cancel: Mutex<HashMap<String, Arc<AtomicBool>>>,
     /// The address OTA responses advertise (the hub's LAN IP
     /// when LAN is on, else loopback), set at `start()`.
     advertise_host: Mutex<String>,
+}
+
+/// Lifecycle of one handoff brain turn (F7-11).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HandoffTurnStatus {
+    Running,
+    Done,
+    Cancelled,
+    Error,
+}
+
+/// One handoff brain turn's observable state, for the panel
+/// heartbeat/status line (F7-11).
+#[derive(Debug, Clone)]
+pub struct HandoffTurnState {
+    pub package_id: String,
+    pub status: HandoffTurnStatus,
+    pub started_ms: u64,
+    pub finished_ms: Option<u64>,
 }
 
 /// One handoff reply waiting to be sent on the live session
@@ -322,6 +355,7 @@ impl Hub {
             pending_handshakes: AtomicUsize::new(0),
             stop_flag: AtomicBool::new(false),
             lan_listener_on: AtomicBool::new(false),
+            ota_on: AtomicBool::new(false),
             driver_active: Mutex::new(None),
             ws_handler_slot: Mutex::new(None),
             ceremony_ui,
@@ -329,6 +363,8 @@ impl Hub {
             cards_sent: Mutex::new(std::collections::HashSet::new()),
             handoff_outbox: Mutex::new(HashMap::new()),
             handoff_turn_replies: Mutex::new(HashMap::new()),
+            handoff_turns: Mutex::new(HashMap::new()),
+            handoff_turn_cancel: Mutex::new(HashMap::new()),
             advertise_host: Mutex::new("127.0.0.1".to_string()),
         }
     }
@@ -524,6 +560,14 @@ impl Hub {
     /// drives the body directly, so no guard is bypassed; any
     /// action it wants goes through the normal approval path.
     /// The reply is stored for the panel to show.
+    ///
+    /// F7-11: the `handoff_turn_started` audit is written
+    /// when the turn STARTS (not after the brain returns);
+    /// the turn is tracked in `handoff_turns` (Running →
+    /// Done/Cancelled/Error) so the panel can show a
+    /// heartbeat/status line and the user can cancel it; the
+    /// lease is released as soon as the turn finishes, errors,
+    /// or is cancelled — never held to the 10-minute TTL.
     fn start_handoff_turn(self: &Arc<Self>, package: &HandoffPackage) {
         let brain = self
             .v2_brain_turn
@@ -537,6 +581,34 @@ impl Hub {
             return;
         };
         let package = package.clone();
+        let started_ms = self.clock.now_ms();
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        {
+            let mut flags = self
+                .handoff_turn_cancel
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            flags.insert(package.package_id.clone(), Arc::clone(&cancel_flag));
+        }
+        {
+            let mut turns = self
+                .handoff_turns
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            turns.insert(
+                package.package_id.clone(),
+                HandoffTurnState {
+                    package_id: package.package_id.clone(),
+                    status: HandoffTurnStatus::Running,
+                    started_ms,
+                    finished_ms: None,
+                },
+            );
+        }
+        self.audit(
+            "handoff_turn_started",
+            serde_json::json!({"package_id": package.package_id}),
+        );
         let hub = Arc::clone(self);
         std::thread::spawn(move || {
             let prompt = format!(
@@ -547,19 +619,95 @@ impl Hub {
                 package.notebook_context
             );
             let reply = brain(&prompt);
-            let mut replies = hub
-                .handoff_turn_replies
+            let cancelled = cancel_flag.load(Ordering::SeqCst);
+            let finished_ms = hub.clock.now_ms();
+            {
+                let mut turns = hub
+                    .handoff_turns
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                if let Some(state) = turns.get_mut(&package.package_id) {
+                    state.status = if cancelled {
+                        HandoffTurnStatus::Cancelled
+                    } else {
+                        HandoffTurnStatus::Done
+                    };
+                    state.finished_ms = Some(finished_ms);
+                }
+            }
+            if !cancelled {
+                let mut replies = hub
+                    .handoff_turn_replies
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                if replies.len() >= 8 {
+                    replies.clear();
+                }
+                replies.insert(package.package_id.clone(), reply);
+            }
+            // Release the lease early: the turn is over (or
+            // was cancelled), the body is free again.
+            let released = hub.handoff.release_lease_by_id(&package.lease_id);
+            hub.audit(
+                if cancelled {
+                    "handoff_turn_cancelled"
+                } else {
+                    "handoff_turn_finished"
+                },
+                serde_json::json!({
+                    "package_id": package.package_id,
+                    "lease_released": released,
+                }),
+            );
+            hub.handoff_turn_cancel
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&package.package_id);
+        });
+    }
+
+    /// Observable state of one handoff brain turn (F7-11),
+    /// for the panel status line. None when no turn ran.
+    pub fn handoff_turn_state(&self, package_id: &str) -> Option<HandoffTurnState> {
+        self.handoff_turns
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(package_id)
+            .cloned()
+    }
+
+    /// Cancel a running handoff brain turn (F7-11): the turn
+    /// thread drops its reply when the brain returns and the
+    /// lease is released at once. Returns false when no turn
+    /// is running for the package. Note: the brain call
+    /// itself cannot be interrupted mid-flight — cancellation
+    /// takes effect when it returns.
+    pub fn cancel_handoff_turn(&self, package_id: &str) -> bool {
+        let running = {
+            let turns = self
+                .handoff_turns
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
-            if replies.len() >= 8 {
-                replies.clear();
-            }
-            replies.insert(package.package_id.clone(), reply);
-            hub.audit(
-                "handoff_turn_started",
-                serde_json::json!({"package_id": package.package_id}),
-            );
-        });
+            turns
+                .get(package_id)
+                .is_some_and(|state| state.status == HandoffTurnStatus::Running)
+        };
+        if !running {
+            return false;
+        }
+        if let Some(flag) = self
+            .handoff_turn_cancel
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(package_id)
+        {
+            flag.store(true, Ordering::SeqCst);
+        }
+        self.audit(
+            "handoff_turn_cancel_requested",
+            serde_json::json!({"package_id": package_id}),
+        );
+        true
     }
 
     /// Background handoff sweeper (§7.3): applies CLI decisions
@@ -724,9 +872,13 @@ impl Hub {
     /// the LAN listener stops, LAN sessions are cut,
     /// loopback sessions stay, pairing in the registry is
     /// untouched, and the hub falls back to loopback.
-    /// Returns the closed session peer ids.
+    /// F7-06: the OTA accept loop stops too and every live
+    /// OTA token is revoked — closing LAN no longer leaves
+    /// port 19132 serving. Returns the closed session peer ids.
     pub fn close_lan(&self) -> Vec<String> {
         self.lan_listener_on.store(false, Ordering::SeqCst);
+        self.ota_on.store(false, Ordering::SeqCst);
+        let revoked_tokens = self.ota.revoke_all_tokens();
         let mut sessions = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
         let mut ids = Vec::new();
         let keys: Vec<String> = sessions.keys().cloned().collect();
@@ -751,9 +903,55 @@ impl Hub {
         }
         self.audit(
             "hub_lan_closed",
-            serde_json::json!({"closed_sessions": ids}),
+            serde_json::json!({"closed_sessions": ids, "ota_tokens_revoked": revoked_tokens}),
         );
         ids
+    }
+
+    /// Re-enable the LAN listener + OTA loop after
+    /// `close_lan` (F7-06): the panel's "Bật lại LAN" button
+    /// and the CLI use this. The hub must have been started
+    /// with `listen_lan`; otherwise this is a no-op for the
+    /// friends listener (loopback hubs stay loopback) but
+    /// still re-enables OTA on loopback.
+    pub fn open_lan(&self) {
+        if self.config.listen_lan {
+            self.lan_listener_on.store(true, Ordering::SeqCst);
+        }
+        self.ota_on.store(true, Ordering::SeqCst);
+        self.audit("hub_lan_opened", serde_json::json!({}));
+    }
+
+    /// Whether the OTA accept loop is currently serving
+    /// (F7-06): shown in the hub tab next to the exposure
+    /// state, so the user can see OTA is open.
+    pub fn ota_open(&self) -> bool {
+        self.ota_on.load(Ordering::SeqCst)
+    }
+
+    /// Revoke a peer AND cut its live session at once
+    /// (F7-07): the registry flag alone only blocks the next
+    /// handshake, so the hub also shuts the session socket
+    /// down. Returns false when the peer did not exist.
+    pub fn revoke_peer(&self, device_id: &str) -> bool {
+        let now = self.clock.now_ms();
+        let revoked = self
+            .registry
+            .revoke_peer(device_id, now)
+            .unwrap_or(false);
+        if !revoked {
+            return false;
+        }
+        let mut sessions = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some((_info, stream)) = sessions.remove(device_id) {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        }
+        drop(sessions);
+        self.audit(
+            "hub_peer_revoked",
+            serde_json::json!({"peer_device_id": device_id}),
+        );
+        true
     }
 
     /// Start the listeners (friends + XiaoZhi WS + OTA) on
@@ -809,6 +1007,7 @@ impl Hub {
         ota_listener
             .set_nonblocking(true)
             .map_err(|err| MimintError::Io(err.to_string()))?;
+        self.ota_on.store(true, Ordering::SeqCst);
         let hub = Arc::clone(self);
         std::thread::spawn(move || hub.ota_accept_loop(ota_listener));
         // The handoff sweeper (§7.3): CLI decisions + pending
@@ -888,6 +1087,13 @@ impl Hub {
             }
             match listener.accept() {
                 Ok((stream, _addr)) => {
+                    // F7-06: after `close_lan` the OTA loop
+                    // serves nothing — not even loopback — until
+                    // the LAN is re-enabled or the hub restarts.
+                    if !self.ota_on.load(Ordering::SeqCst) {
+                        drop(stream);
+                        continue;
+                    }
                     let hub = Arc::clone(self);
                     std::thread::spawn(move || {
                         let host = hub
@@ -1094,6 +1300,23 @@ impl Hub {
         let mut last_activity = std::time::Instant::now();
         loop {
             if self.stop_flag.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            // F7-07: revoke cuts a live session, not just the
+            // next handshake. The registry is the shared truth
+            // across processes (the CLI revokes from another
+            // process), so the loop re-checks it every poll.
+            if self
+                .registry
+                .get_peer(&peer_device_id)
+                .ok()
+                .flatten()
+                .is_some_and(|entry| entry.revoked)
+            {
+                self.audit(
+                    "hub_session_revoked",
+                    serde_json::json!({"peer_device_id": peer_device_id}),
+                );
                 return Ok(());
             }
             self.drain_handoff_outbox(&mut session, &peer_device_id);

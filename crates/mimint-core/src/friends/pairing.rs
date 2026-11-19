@@ -342,7 +342,21 @@ pub fn build_peer_entry(
     }
 }
 
-/// Run the ceremony as the INITIATOR (side A). On success the
+/// The IP part of a peer address (`"ip:port"` or
+/// `"[ipv6]:port"`), for the IP lockout bucket (F7-05).
+/// Returns None when the address does not parse.
+pub fn ip_of_peer_addr(peer_addr: &str) -> Option<String> {
+    if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
+        return Some(addr.ip().to_string());
+    }
+    // Fallback for a bare "ip:port" string.
+    let ip = peer_addr.rsplit_once(':')?.0.trim_matches(['[', ']']);
+    if ip.is_empty() {
+        None
+    } else {
+        Some(ip.to_string())
+    }
+}
 /// peer's pin is stored (step 6) and the entry is returned; the
 /// caller must still prove the pairing with one ordinary
 /// session handshake before treating it as complete.
@@ -569,6 +583,24 @@ pub fn run_ceremony_listener(
     let request: PairRequest = serde_json::from_slice(&request_frame)
         .map_err(|err| MimintError::Config(format!("pairing ceremony: bad pair_request: {err}")))?;
     let source = request.device_id.clone();
+    // F7-05: lockout is keyed by BOTH the self-declared
+    // device_id AND the source IP. Rotating device_id from
+    // the same IP still hits the IP bucket; the device bucket
+    // keeps working when the IP is shared (NAT) or changes.
+    // Neither bucket locks forever: both expire after 15
+    // minutes of no failures, like the device bucket did.
+    let ip_source = ip_of_peer_addr(peer_addr).map(|ip| format!("ip:{ip}"));
+    let locked_source = |registry: &DeviceRegistry, now_ms: u64| -> Option<(String, u64)> {
+        if let Ok(Some(until)) = registry.lockout_until(&source, now_ms) {
+            return Some((source.clone(), until));
+        }
+        if let Some(ip_key) = &ip_source {
+            if let Ok(Some(until)) = registry.lockout_until(ip_key, now_ms) {
+                return Some((ip_key.clone(), until));
+            }
+        }
+        None
+    };
 
     // Pairing mode is mandatory (§3.3).
     if !controller.is_pairing_mode() {
@@ -582,13 +614,13 @@ pub fn run_ceremony_listener(
             "pairing rejected: pairing mode is not enabled on this device".to_string(),
         ));
     }
-    // Lockout (§3.4): persistent, per source.
-    if let Ok(Some(locked_until)) = registry.lockout_until(&source, clock.now_ms()) {
+    // Lockout (§3.4): persistent, per source (device_id and IP).
+    if let Some((locked_key, locked_until)) = locked_source(registry, clock.now_ms()) {
         send_pairing_error(stream);
         audit_pairing(
             &audit,
             "pairing_locked",
-            serde_json::json!({"peer_device_id": source, "locked_until_ms": locked_until}),
+            serde_json::json!({"peer_device_id": source, "locked_until_ms": locked_until, "locked_source": locked_key}),
         );
         return Err(MimintError::Config(
             "pairing locked for this source after repeated failures".to_string(),
@@ -613,7 +645,7 @@ pub fn run_ceremony_listener(
         );
         return Err(MimintError::Config("pairing rate limited".to_string()));
     }
-    let _ = peer_addr;
+    // (peer_addr is used for the IP lockout bucket above.)
 
     let set_remaining_timeout = |stream: &TcpStream| -> Result<(), MimintError> {
         let remaining = deadline_ms.saturating_sub(clock.now_ms());
@@ -672,9 +704,18 @@ pub fn run_ceremony_listener(
             SasFlow::Compare => "sas_mismatch_reported",
             SasFlow::Typing => "sas_mismatch",
         };
+        // F7-05: the failure counts toward BOTH buckets, so
+        // rotating device_id from the same IP cannot reset
+        // the count.
         let (count, locked) = registry
             .record_pairing_failure(&source, clock.now_ms())
             .unwrap_or((0, None));
+        let (ip_count, ip_locked) = match &ip_source {
+            Some(ip_key) => registry
+                .record_pairing_failure(ip_key, clock.now_ms())
+                .unwrap_or((0, None)),
+            None => (0, None),
+        };
         audit_pairing(
             &audit,
             "pairing_failed",
@@ -683,13 +724,15 @@ pub fn run_ceremony_listener(
                 "reason": reason,
                 "fail_count": count,
                 "locked": locked.is_some(),
+                "ip_fail_count": ip_count,
+                "ip_locked": ip_locked.is_some(),
             }),
         );
-        if locked.is_some() {
+        if locked.is_some() || ip_locked.is_some() {
             audit_pairing(
                 &audit,
                 "pairing_locked",
-                serde_json::json!({"peer_device_id": source, "locked_until_ms": locked}),
+                serde_json::json!({"peer_device_id": source, "locked_until_ms": locked.or(ip_locked)}),
             );
         }
         send_pairing_error(stream);
@@ -787,6 +830,9 @@ pub fn run_ceremony_listener(
     );
     registry.upsert_peer(&entry)?;
     let _ = registry.reset_pairing_failures(&source);
+    if let Some(ip_key) = &ip_source {
+        let _ = registry.reset_pairing_failures(ip_key);
+    }
     audit_pairing(
         &audit,
         "pairing_completed",

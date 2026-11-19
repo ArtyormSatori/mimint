@@ -60,13 +60,17 @@ fn measure(
 
 fn print_results(results: &[BudgetMeasurement]) {
     let header = format!(
-        "{:<4} {:>10} {:<6} {:>10}  {:<5}  {}",
+        "{:<4} {:>12} {:<6} {:>10}  {:<5}  {}",
         "id", "value", "unit", "budget", "pass", "method"
     );
     println!("{header}");
     for r in results {
+        // F7-26: 3 decimals (B5 is sub-millisecond; "0.00ms"
+        // hid the real value and looked like a resolution
+        // limit — it is a mean over 1000 rounds, measured
+        // with `Instant` at nanosecond resolution).
         println!(
-            "{:<4} {:>10.2} {:<6} {:>10.2}  {:<5}  {}",
+            "{:<4} {:>12.3} {:<6} {:>10.2}  {:<5}  {}",
             r.id,
             r.value,
             r.unit,
@@ -74,6 +78,56 @@ fn print_results(results: &[BudgetMeasurement]) {
             if r.passed { "PASS" } else { "FAIL" },
             r.method
         );
+    }
+    if let Some(b5) = results.iter().find(|r| r.id == "B5") {
+        println!(
+            "B5 in nanoseconds: {:.0} ns per message (mean seal+open, 5-byte payload, in process)",
+            b5.value * 1_000_000.0
+        );
+    }
+    // F7-26: B7's scope, stated on the output itself.
+    println!("B7 scope: RSS delta of THIS process only (context open + hub start).");
+    match ollama_rss_mib() {
+        Some(rss) => println!(
+            "Ollama RSS (separate process, OUTSIDE the B7 budget): {rss:.1} MiB"
+        ),
+        None => println!("Ollama RSS: Ollama is not running right now (outside the B7 budget either way)."),
+    }
+}
+
+/// RSS of the Ollama server process, if one is running
+/// (F7-26: reported separately, never folded into B7).
+fn ollama_rss_mib() -> Option<f64> {
+    let mut total_kib: u64 = 0;
+    let mut found = false;
+    let entries = std::fs::read_dir("/proc").ok()?;
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        let cmdline = std::fs::read(entry.path().join("cmdline")).unwrap_or_default();
+        let first = cmdline.split(|b| *b == 0).next().unwrap_or(&[]);
+        if !first.ends_with(b"ollama") && first != b"ollama" {
+            continue;
+        }
+        if let Ok(status) = std::fs::read_to_string(entry.path().join("status")) {
+            for line in status.lines() {
+                if let Some(rest) = line.strip_prefix("VmRSS:") {
+                    if let Some(num) = rest.split_whitespace().next() {
+                        if let Ok(kib) = num.parse::<u64>() {
+                            total_kib += kib;
+                            found = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if found {
+        Some(total_kib as f64 / 1024.0)
+    } else {
+        None
     }
 }
 
@@ -190,7 +244,7 @@ pub fn cmd_bench(_args: &FriendsArgs, rest: &[String]) -> Result<(), MimintError
         mean(&samples),
         "ms",
         B5_ONE_MESSAGE_MS,
-        "mean seal+open per message, 1000 messages, in process".to_string(),
+        "mean seal+open per message, 1000 messages, 5-byte payload, in process (Instant, ns resolution)".to_string(),
     ));
 
     // B6 + B7: hub start time and RSS delta of starting a hub.
@@ -232,7 +286,7 @@ pub fn cmd_bench(_args: &FriendsArgs, rest: &[String]) -> Result<(), MimintError
         (rss_after - rss_before).max(0.0),
         "MiB",
         B7_RSS_MIB,
-        "RSS delta of opening a context + starting a hub".to_string(),
+        "RSS delta of opening a context + starting a hub, this process only (Ollama is a separate process, outside this budget)".to_string(),
     ));
 
     // B8: idle CPU with the hub running.

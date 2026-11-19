@@ -23,7 +23,8 @@ use crate::friends::conflict::{
 };
 use crate::friends::records::{body_hash, RecordKind, SyncRecord, EMPTY_BODY_SHA256};
 use crate::friends::registry::{
-    ConflictRow, DeviceRegistry, LocalVersionRow, PeerPrefs, SeenVersion, TombstoneRow, VersionId,
+    ConflictRow, DeviceRegistry, LocalVersionRow, PeerPrefs, SeenVersion, TombstoneRow,
+    VersionId, TOMBSTONE_RETENTION_MS,
 };
 use crate::friends::session::Session;
 use crate::friends::texts;
@@ -416,6 +417,11 @@ impl SyncEngine {
         };
         let mut names: Vec<String> = Vec::new();
         for entry in entries.flatten() {
+            // F7-18: symlinks are never soul files, even when
+            // they point at a well-formed .md file elsewhere.
+            if entry.file_type().map(|t| t.is_symlink()).unwrap_or(false) {
+                continue;
+            }
             let name = entry.file_name().to_string_lossy().into_owned();
             // Only Markdown files are soul files. The data
             // directory also holds the identity key, the
@@ -1476,6 +1482,9 @@ impl SyncEngine {
     /// Purge tombstones older than 90 days (§4.7). Purged
     /// tombstones leave receipts so a returning old version is
     /// noticed as a resurrection instead of silently applied.
+    /// Also prunes sent-version provenance older than 90 days
+    /// (F7-01: live versions are re-sent on sync, so pruning
+    /// cannot break provenance for anything still syncing).
     pub fn purge_expired_tombstones(&self) -> Result<Vec<TombstoneRow>, MimintError> {
         let purged = self.registry.purge_expired_tombstones(self.now_ms())?;
         for row in &purged {
@@ -1484,6 +1493,9 @@ impl SyncEngine {
                 serde_json::json!({"sync_id": row.sync_id, "kind": row.kind}),
             );
         }
+        let _ = self
+            .registry
+            .prune_sent_versions(self.now_ms(), TOMBSTONE_RETENTION_MS);
         Ok(purged)
     }
 
@@ -1791,6 +1803,9 @@ pub fn run_sync_exchange(
             peer_ack_kind.0.as_str()
         )));
     }
+    // F7-09: purge expired tombstones after every sync, so a
+    // long-running hub purges without a restart.
+    let _ = engine.purge_expired_tombstones();
     Ok((sent, applied_count, conflict_count, rejected_count))
 }
 

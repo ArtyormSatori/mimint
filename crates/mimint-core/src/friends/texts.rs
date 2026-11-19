@@ -5,8 +5,12 @@
 //! here is quoted from `docs/phase7-design.md`; do not paraphrase
 //! them in callers.
 
-/// Warning shown at the device-management screen and when the
-/// data dir is deleted (§3.2, exact wording).
+/// Warning shown when the registry was recreated after
+/// peers.db was deleted (F7-23): the Lamport clock is back
+/// to 0 and `last_seen` is gone, so the next syncs may raise
+/// more conservative conflicts than usual. Pairing itself
+/// must be redone for every peer.
+pub const PEERS_DB_RESTORE_WARNING: &str = "Cảnh báo: peers.db đã bị xóa và tạo mới — đồng hồ Lamport về 0 và lịch sử đã-thấy (last_seen) đã mất, nên lần đồng bộ sau có thể sinh nhiều xung đột bảo thủ hơn bình thường. Mọi thiết bị đã pair trước đó phải ghép đôi lại.";
 pub const KEY_LOSS_WARNING: &str = "Nếu mất file khóa này, thiết bị này sẽ mất danh tính bảo mật và phải ghép đôi lại từ đầu với từng thiết bị đã pair. Khóa không được sao lưu, không được đồng bộ, và không thể khôi phục. Đừng xóa thư mục dữ liệu nếu bạn chưa hiểu hậu quả này.";
 
 /// Privacy Mode text (§9.1, exact wording). Shown as text with a
@@ -21,6 +25,12 @@ pub const HUB_EXPOSURE_DRIVER_CONNECTED: &str =
     "Driver đang kết nối — thiết bị khác đang có phiên điều khiển";
 pub const HUB_EXPOSURE_LAN_UNPAIRED: &str =
     "LAN chưa pair — không chấp nhận điều khiển/sync từ peer lạ";
+
+/// OTA exposure note (F7-06): shown in the hub tab whenever
+/// the OTA accept loop is serving, so closing LAN without
+/// closing OTA can never be invisible again.
+pub const HUB_EXPOSURE_OTA_OPEN: &str =
+    "OTA đang mở — cổng 19132 vẫn nhận kiểm tra từ thiết bị XiaoZhi đã đăng ký UUID (đóng LAN sẽ đóng luôn OTA)";
 
 /// Note shown with the "close LAN now" control (§5.1).
 pub const CLOSE_LAN_KEEPS_PAIRING: &str = "Đóng LAN không thu hồi pairing — các thiết bị đã pair vẫn còn trong danh sách và nối lại được khi bạn bật LAN.";
@@ -39,6 +49,15 @@ pub const ESP32_LABEL_LAB: &str = "Lab mode — không mã hóa";
 pub const ESP32_LABEL_XIAOZHI_LAN: &str = "XiaoZhi LAN — xác thực giới hạn";
 pub const ESP32_LABEL_V2: &str = "Firmware v2 — khóa đã pair";
 pub const ESP32_LABEL_VOICE_UNSUPPORTED: &str = "Voice hoàn chỉnh — chưa hỗ trợ Phase 7";
+
+/// Lab-mode labels that keep the two paths apart (F7-14):
+/// lab mode no longer swallows the XiaoZhi/v2 distinction.
+pub const ESP32_LABEL_LAB_XIAOZHI: &str = "Lab mode — XiaoZhi LAN, không mã hóa";
+pub const ESP32_LABEL_LAB_V2: &str = "Lab mode — Firmware v2, không mã hóa";
+/// A v2 device that has not paired yet is NOT a XiaoZhi LAN
+/// device (F7-14): it has no paired key and no limited-auth
+/// channel yet.
+pub const ESP32_LABEL_V2_UNPAIRED: &str = "Firmware v2 — chưa ghép đôi (chưa có khóa pair)";
 
 /// Conflict-resolution consequence explanations (§4.4).
 pub const CONFLICT_KEEP_MINE: &str = "Giữ bản của tôi — bản của peer sẽ bị thay thế bằng bản này ở lần đồng bộ sau; bản của peer vẫn xem lại được trong lịch sử xung đột.";

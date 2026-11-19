@@ -159,10 +159,26 @@ impl OtaServer {
         Ok(token)
     }
 
+    /// Revoke every live OTA token at once (F7-06): called
+    /// by `close_lan`, so a token issued before the LAN was
+    /// closed cannot open a WS connection afterwards.
+    /// Returns the number of tokens revoked.
+    pub fn revoke_all_tokens(&self) -> usize {
+        let mut tokens = self.tokens.lock().unwrap_or_else(|p| p.into_inner());
+        let count = tokens.len();
+        tokens.clear();
+        if count > 0 {
+            self.audit(
+                "ota_tokens_revoked",
+                serde_json::json!({"revoked": count}),
+            );
+        }
+        count
+    }
+
     /// Consume a token for one WS connection: valid iff it
     /// exists, is unexpired, and was never used.
-    pub fn consume_token(&self, token: &str) -> Option<String> {
-        let now = self.clock.now_ms();
+    pub fn consume_token(&self, token: &str) -> Option<String> {        let now = self.clock.now_ms();
         let mut tokens = self.tokens.lock().unwrap_or_else(|p| p.into_inner());
         let entry = tokens.get_mut(token)?;
         if entry.used || now >= entry.expires_ms {

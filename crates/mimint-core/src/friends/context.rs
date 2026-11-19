@@ -349,6 +349,12 @@ pub struct FriendsContext {
     pub clock: Clock,
     pub config_path: PathBuf,
     pub notebook: Arc<Notebook>,
+    /// F7-23: true when this open found an identity key but
+    /// NO peers.db — the registry was deleted (or restored
+    /// from scratch), so Lamport is back to 0 and `last_seen`
+    /// is gone. The CLI prints the restore warning and the
+    /// panel shows it; a first run (no key yet) is false.
+    pub peers_db_restored: bool,
 }
 
 impl FriendsContext {
@@ -396,6 +402,13 @@ impl FriendsContext {
         let config_path = config_path.as_ref().to_path_buf();
         std::fs::create_dir_all(&data_dir)
             .map_err(|err| MimintError::Io(format!("cannot create data dir: {err}")))?;
+        // F7-23: peers.db missing while the identity key
+        // already exists means the registry was deleted and
+        // recreated (not a first run).
+        let peers_db_restored = !data_dir.join(crate::friends::registry::PEERS_DB_FILE).exists()
+            && data_dir
+                .join(crate::friends::identity::IDENTITY_KEY_FILE)
+                .exists();
         let identity = Arc::new(DeviceKeyStore::in_data_dir(&data_dir).ensure()?);
         let registry = Arc::new(DeviceRegistry::open(data_dir.join("peers.db"))?);
         let controller = Arc::new(PairingController::new(clock.clone()));
@@ -432,6 +445,12 @@ impl FriendsContext {
             audit.clone(),
             clock.clone(),
         )?);
+        // F7-09: the tombstone purge finally has a production
+        // caller — every context open (startup) purges
+        // tombstones past 90 days, instead of only tests doing
+        // it. `run_sync_exchange` purges again after each sync,
+        // so a long-running hub purges too.
+        let _ = sync_engine.purge_expired_tombstones();
         let ota = Arc::new(OtaServer::new(
             Arc::clone(&registry),
             clock.clone(),
@@ -465,6 +484,7 @@ impl FriendsContext {
             clock,
             config_path,
             notebook,
+            peers_db_restored,
         })
     }
 

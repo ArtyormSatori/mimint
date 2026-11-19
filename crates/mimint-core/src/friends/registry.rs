@@ -15,6 +15,13 @@
 //! device granted the peer (enforced locally); `trust_received`
 //! is the level the peer granted this device (learned during
 //! the ceremony, shown in the UI, never enforced here).
+//! Display rule (F7-21): the UI must label `trust_received`
+//! as display-only — "peer nói đã cấp cho bạn (chỉ để xem)"
+//! — and never show it under the same bare "quyền" label as
+//! the local grant, so the two directions cannot be confused.
+//! No permission check anywhere in the tree reads
+//! `trust_received`; every gate reads the local grant
+//! (`peer.trust`).
 
 use crate::error::MimintError;
 use rusqlite::{params, Connection, OptionalExtension};
@@ -488,13 +495,28 @@ impl DeviceRegistry {
 
     /// Clear the "pairing incomplete" flag after the first
     /// successful ordinary session handshake.
-    pub fn mark_pairing_complete(&self, device_id: &str) -> Result<(), MimintError> {
-        let conn = self.connection();
+    pub fn mark_pairing_complete(&self, device_id: &str) -> Result<(), MimintError> {        let conn = self.connection();
         conn.execute(
             "UPDATE devices SET pairing_incomplete = 0 WHERE device_id = ?1",
             params![device_id],
         )?;
         Ok(())
+    }
+
+    /// F7-28: after this body rotates its identity key, every
+    /// peer pairing was made with the OLD key: mark them all
+    /// pairing-incomplete (they must re-pair and complete one
+    /// handshake with the new key) and delete entries that
+    /// were already revoked (stale). Returns
+    /// (marked_incomplete, deleted_revoked).
+    pub fn cleanup_after_rotation(&self) -> Result<(usize, usize), MimintError> {
+        let conn = self.connection();
+        let marked = conn.execute(
+            "UPDATE devices SET pairing_incomplete = 1 WHERE pairing_incomplete = 0",
+            [],
+        )?;
+        let deleted = conn.execute("DELETE FROM devices WHERE revoked = 1", [])?;
+        Ok((marked, deleted))
     }
 
     // -- pairing attempts / lockout -------------------------------

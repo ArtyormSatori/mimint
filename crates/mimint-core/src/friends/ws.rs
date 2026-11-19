@@ -648,4 +648,86 @@ mod tests {
             .unwrap();
         assert!(matches!(server.read_frame(), Err(WsError::Unsupported(_))));
     }
+
+    /// F7-19 vector 1: a LARGE first fragment is refused just
+    /// like a small one — fragmentation is rejected at the FIN
+    /// check, before any size accounting, so a 300 KiB first
+    /// fragment (over the 256 KiB cap) can never smuggle a
+    /// reassembly past the limit.
+    #[test]
+    fn ws_rejects_large_fragmented_frame() {
+        let port = free_port();
+        let listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
+        let handle = std::thread::spawn(move || serve_once(listener));
+        let mut client = client_handshake(port);
+        let mut server = handle.join().unwrap();
+        // 70_000-byte first fragment, FIN=0.
+        let big = vec![b'x'; 70_000];
+        client
+            .write_all(&raw_client_frame(0x2, false, &big, [1, 2, 3, 4]))
+            .unwrap();
+        assert!(matches!(server.read_frame(), Err(WsError::Unsupported(_))));
+        // 300 KiB first fragment (over the 256 KiB cap),
+        // FIN=0: refused at the FIN check, not at the cap.
+        let huge = vec![b'y'; 300 * 1024];
+        client
+            .write_all(&raw_client_frame(0x2, false, &huge, [5, 6, 7, 8]))
+            .unwrap();
+        assert!(matches!(server.read_frame(), Err(WsError::Unsupported(_))));
+    }
+
+    /// F7-19 vector 2: a control frame (ping) with a 126-byte
+    /// payload is refused — control payloads are capped at
+    /// 125 bytes (RFC 6455 §5.5).
+    #[test]
+    fn ws_rejects_control_payload_over_125() {
+        let port = free_port();
+        let listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
+        let handle = std::thread::spawn(move || serve_once(listener));
+        let mut client = client_handshake(port);
+        let mut server = handle.join().unwrap();
+        let payload = vec![b'p'; 126];
+        client
+            .write_all(&raw_client_frame(0x9, true, &payload, [1, 2, 3, 4]))
+            .unwrap();
+        let err = server.read_frame().unwrap_err();
+        assert!(
+            matches!(err, WsError::Unsupported(_)),
+            "126-byte ping must be Unsupported, got {err:?}"
+        );
+        // 125 bytes is the boundary: accepted.
+        let boundary = vec![b'p'; 125];
+        client
+            .write_all(&raw_client_frame(0x9, true, &boundary, [1, 2, 3, 4]))
+            .unwrap();
+        assert_eq!(
+            server.read_frame().unwrap(),
+            WsFrame::Ping(boundary)
+        );
+    }
+
+    /// F7-19 vector 3: unusual close codes are accepted as
+    /// raw u16 values — the implementation does not validate
+    /// them (1005 "no status", 1006 "abnormal", 999 reserved,
+    /// 4000 private-use all decode to `WsFrame::Close`).
+    /// This locks the permissive behavior: if validation is
+    /// ever added, this test must be updated deliberately.
+    #[test]
+    fn ws_accepts_unusual_close_codes() {
+        let port = free_port();
+        let listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
+        let handle = std::thread::spawn(move || serve_once(listener));
+        let mut client = client_handshake(port);
+        let mut server = handle.join().unwrap();
+        for code in [1005u16, 1006, 999, 4000, 1011] {
+            client
+                .write_all(&raw_client_frame(0x8, true, &code.to_be_bytes(), [1, 1, 1, 1]))
+                .unwrap();
+            assert_eq!(
+                server.read_frame().unwrap(),
+                WsFrame::Close(Some((code, String::new()))),
+                "close code {code} must decode as-is"
+            );
+        }
+    }
 }

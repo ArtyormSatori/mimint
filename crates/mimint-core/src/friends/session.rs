@@ -82,6 +82,17 @@ impl Default for SessionConfig {
 /// step 6, R1).
 pub const OLD_KEY_KEEP_MS: u64 = 10_000;
 
+/// Rekey flood guard (F7-10): at most one peer-initiated
+/// rekey per 5 seconds, at most 6 per rolling minute. A
+/// legitimate peer rekeys at most once per 1M messages /
+/// 1 GiB / 24h, so these limits never bind honest traffic;
+/// excess requests are dropped + audited, never processed,
+/// and the session stays open (fail-closed for simultaneous
+/// rekey is unchanged).
+pub const REKEY_MIN_INTERVAL_MS: u64 = 5_000;
+pub const REKEY_MAX_PER_MINUTE: usize = 6;
+const REKEY_RATE_WINDOW_MS: u64 = 60_000;
+
 /// A HELLO message (plaintext, §2.4).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -572,6 +583,9 @@ pub struct Session {
     confirm_received: bool,
     confirm_sent: bool,
     pending: VecDeque<(MessageKind, Vec<u8>)>,
+    /// Timestamps (clock ms) of peer-initiated rekeys this
+    /// session accepted, for the F7-10 rate limit.
+    rekey_request_times: VecDeque<u64>,
     clock: Clock,
     config: SessionConfig,
     audit: Option<Arc<AuditLog>>,
@@ -810,6 +824,7 @@ pub fn handshake_initiator(
         confirm_received: false,
         confirm_sent: false,
         pending: VecDeque::new(),
+        rekey_request_times: VecDeque::new(),
         clock: clock.clone(),
         config: config.clone(),
         audit: audit.clone(),
@@ -953,6 +968,7 @@ fn handshake_listener_after_hello(
         confirm_received: false,
         confirm_sent: false,
         pending: VecDeque::new(),
+        rekey_request_times: VecDeque::new(),
         clock: clock.clone(),
         config: config.clone(),
         audit: audit.clone(),
@@ -1288,6 +1304,34 @@ impl Session {
     }
 
     fn handle_rekey_request(&mut self, plain: &[u8]) -> Result<(), MimintError> {
+        // F7-10: cooldown + rate limit on peer-initiated
+        // rekeys. Excess requests are dropped + audited; the
+        // session is NOT failed (the peer's own rekey attempt
+        // times out on its side if it keeps flooding).
+        let now = self.clock.now_ms();
+        while let Some(front) = self.rekey_request_times.front() {
+            if now.saturating_sub(*front) >= REKEY_RATE_WINDOW_MS {
+                self.rekey_request_times.pop_front();
+            } else {
+                break;
+            }
+        }
+        let too_soon = self
+            .rekey_request_times
+            .back()
+            .is_some_and(|last| now.saturating_sub(*last) < REKEY_MIN_INTERVAL_MS);
+        if too_soon || self.rekey_request_times.len() >= REKEY_MAX_PER_MINUTE {
+            audit_event(
+                &self.audit,
+                "rekey_rate_limited",
+                serde_json::json!({
+                    "peer_device_id": self.peer_device_id,
+                    "rekeys_in_window": self.rekey_request_times.len(),
+                }),
+            );
+            return Ok(());
+        }
+        self.rekey_request_times.push_back(now);
         let request: RekeyMessage = serde_json::from_slice(plain)
             .map_err(|err| MimintError::Config(format!("bad rekey: {err}")))?;
         let (ack, keys) = match self.crypto.prepare_rekey_response(&request) {
