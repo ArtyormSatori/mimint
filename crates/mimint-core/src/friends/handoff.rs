@@ -27,6 +27,12 @@ use std::sync::{Arc, Mutex};
 
 /// Handoff lease TTL (§7.2): 10 minutes.
 pub const HANDOFF_LEASE_TTL_MS: u64 = 10 * 60 * 1000;
+/// The ONLY actuator a handoff lease may name (§7.2/§7.3,
+/// F7-03): the receiver's body. `verify_package` refuses any
+/// other value, and the lease map is keyed by this constant —
+/// a peer-supplied actuator string can no longer open a
+/// second, invisible lease on the same body.
+pub const HANDOFF_ACTUATOR: &str = "body";
 /// Maximum package size (§7.2): 64 KiB.
 pub const HANDOFF_PACKAGE_MAX_BYTES: usize = 64 * 1024;
 /// Clock-skew tolerance (§7.2): 2 minutes, checked at receipt.
@@ -255,6 +261,16 @@ impl HandoffManager {
                 "handoff package version mismatch".to_string(),
             ));
         }
+        // F7-03: the actuator is allow-listed to exactly one
+        // value. A package naming any other actuator (or a
+        // second lease key) is refused here, before any lease
+        // exists for it.
+        if package.actuator != HANDOFF_ACTUATOR {
+            return Err(MimintError::Config(format!(
+                "handoff package actuator must be {:?}, got {:?}",
+                HANDOFF_ACTUATOR, package.actuator
+            )));
+        }
         if package.to_device_id != own_device_id {
             return Err(MimintError::Config(
                 "handoff package is addressed to a different device".to_string(),
@@ -304,10 +320,13 @@ impl HandoffManager {
                 )));
             }
         }
+        // F7-04: the holder is the RECEIVER (this body, the
+        // `to_device_id`), which is the side that actually
+        // holds the lease — not the sender.
         let lease = Lease {
             lease_id: package.lease_id.clone(),
             package_id: package.package_id.clone(),
-            holder_device_id: package.from_device_id.clone(),
+            holder_device_id: package.to_device_id.clone(),
             actuator: package.actuator.clone(),
             acquired_ms: now,
             expires_ms: package.expires_ms,
@@ -603,7 +622,10 @@ impl HandoffManager {
 
     /// Record a user decision for the hub sweeper to pick up
     /// (the CLI `handoff accept|reject` commands). One file
-    /// per decision, temp + rename.
+    /// per decision, temp + rename. F7-17: the decisions
+    /// directory is 0700 and the decision file is 0600
+    /// (owner-only), so another local user can neither read
+    /// nor plant a decision.
     pub fn write_decision(&self, decision: &HandoffDecision) -> Result<(), MimintError> {
         let Some(dir) = self.decisions_dir() else {
             return Err(MimintError::Config(
@@ -613,13 +635,37 @@ impl HandoffManager {
         std::fs::create_dir_all(&dir).map_err(|err| {
             MimintError::Io(format!("cannot create handoff decisions dir: {err}"))
         })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+        }
         let path = dir.join(format!("{}.json", decision.package_id));
         let bytes = serde_json::to_vec(decision).map_err(|err| {
             MimintError::Config(format!("cannot serialize handoff decision: {err}"))
         })?;
         let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, &bytes)
+        {
+            use std::io::Write;
+            #[cfg(unix)]
+            let mut file = {
+                use std::os::unix::fs::OpenOptionsExt;
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .mode(0o600)
+                    .open(&tmp)
+            }
             .map_err(|err| MimintError::Io(format!("cannot write handoff decision: {err}")))?;
+            #[cfg(not(unix))]
+            let mut file = std::fs::File::create(&tmp).map_err(|err| {
+                MimintError::Io(format!("cannot write handoff decision: {err}"))
+            })?;
+            file.write_all(&bytes).map_err(|err| {
+                MimintError::Io(format!("cannot write handoff decision: {err}"))
+            })?;
+        }
         std::fs::rename(&tmp, &path)
             .map_err(|err| MimintError::Io(format!("cannot store handoff decision: {err}")))?;
         Ok(())
@@ -627,7 +673,8 @@ impl HandoffManager {
 
     /// Take every decision file (parsed or not — an
     /// unparsable file is dropped + audited so it cannot
-    /// poison the queue forever).
+    /// poison the queue forever). F7-17: a file owned by a
+    /// different uid is skipped + audited, never applied.
     pub fn take_decision_files(&self) -> Vec<HandoffDecision> {
         let Some(dir) = self.decisions_dir() else {
             return Vec::new();
@@ -640,6 +687,21 @@ impl HandoffManager {
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) != Some("json") {
                 continue;
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                let owned_by_other = std::fs::metadata(&path)
+                    .map(|m| m.uid() != unsafe { libc::getuid() })
+                    .unwrap_or(false);
+                if owned_by_other {
+                    let _ = std::fs::remove_file(&path);
+                    self.audit(
+                        "handoff_decision_wrong_owner",
+                        serde_json::json!({"file": path.display().to_string()}),
+                    );
+                    continue;
+                }
             }
             let parsed: Option<HandoffDecision> = std::fs::read(&path)
                 .ok()
@@ -701,9 +763,76 @@ mod tests {
                 vec!["notes.md".to_string()],
                 vec![],
                 "shared context".to_string(),
-                "default",
+                "body",
             )
             .unwrap()
+    }
+
+    #[test]
+    fn handoff_verify_rejects_non_body_actuator() {
+        // F7-03: "default" and any other actuator string are
+        // refused at verify — they can no longer open a
+        // second, invisible lease on the same body.
+        let manager = HandoffManager::new(Clock::fixed(5000), None);
+        let identity = test_identity();
+        let pkg = package(&manager, &identity, "device-b");
+        for actuator in ["default", "arm", ""] {
+            let mut forged = pkg.clone();
+            forged.actuator = actuator.to_string();
+            let canonical = canonical_package_bytes(&forged).unwrap();
+            let signature = identity.sign(&canonical).unwrap();
+            forged.sig = hex_encode(&signature);
+            assert!(
+                manager
+                    .verify_package(&forged, identity.public_key().as_slice(), "device-b")
+                    .is_err(),
+                "actuator {actuator:?} must be refused"
+            );
+        }
+        // The canonical actuator verifies fine.
+        assert!(manager
+            .verify_package(&pkg, identity.public_key().as_slice(), "device-b")
+            .is_ok());
+        assert_eq!(HANDOFF_ACTUATOR, "body");
+    }
+
+    #[test]
+    fn handoff_decision_file_is_owner_only() {
+        // F7-17: decisions dir 0700, decision file 0600.
+        let dir = std::env::temp_dir().join(format!(
+            "mimint-p7-decision-perms-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let manager = HandoffManager::new(Clock::fixed(5000), None);
+        manager.set_pending_dir(dir.clone());
+        manager
+            .write_decision(&HandoffDecision {
+                package_id: "aabbcc".to_string(),
+                accept: true,
+                decided_ms: 5000,
+            })
+            .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let dir_mode = std::fs::metadata(dir.join("handoff-decisions"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(dir_mode, 0o700, "decisions dir must be 0700");
+            let file_mode = std::fs::metadata(dir.join("handoff-decisions/aabbcc.json"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(file_mode, 0o600, "decision file must be 0600");
+        }
+        // The sweeper reads back its own file.
+        assert_eq!(manager.take_decision_files().len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -754,9 +883,10 @@ mod tests {
         let pkg1 = package(&manager, &identity, "device-b");
         let pkg2 = package(&manager, &identity, "device-b");
         let lease = manager.acquire_lease(&pkg1).unwrap();
+        assert_eq!(lease.holder_device_id, "device-b");
         assert!(manager.acquire_lease(&pkg2).is_err());
-        assert!(manager.lease_for("default").is_some());
-        assert!(manager.release_lease("default", &lease.lease_id));
+        assert!(manager.lease_for("body").is_some());
+        assert!(manager.release_lease("body", &lease.lease_id));
         assert!(manager.acquire_lease(&pkg2).is_ok());
     }
 }

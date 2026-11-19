@@ -18,6 +18,18 @@
 //! 3. A successor (remote `based_on` == local version) → apply.
 //! 4. Local is the successor (local `based_on` == remote) → keep local.
 //! 5. Anything else (including missing history) → conflict.
+//! 6. Completeness: no other case exists — every pair of
+//!    differing versions where neither side has seen the
+//!    other's version is concurrent (§4.4 rule 6). The
+//!    fall-through to `Conflict` at the end of `decide()`
+//!    IS rule 6; no Lamport comparison ever decides.
+//!
+//! Causality gate (F7-01, enforced by the caller in
+//! `sync.rs`, not here): rules 2/3 only apply when the
+//! claimed base version has provenance — this body sent it
+//! to the peer, sent it to anyone (multi-hop), or received
+//! it before. See `version_has_provenance` in the registry
+//! and `successor_claim` in `sync.rs`.
 //!
 //! Concurrent if and only if neither side has seen the other's
 //! version (per the "seen" definition in §4.4).

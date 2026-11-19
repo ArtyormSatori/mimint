@@ -282,6 +282,43 @@ impl DeviceRegistry {
             CREATE TABLE IF NOT EXISTS meta (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
+            );
+            -- F7-01/F7-27 (sent-version state): every full
+            -- record version this body SENT to a peer, per
+            -- peer. A peer may only claim `based_on` /
+            -- `supersedes_version` for a version it could
+            -- have received: one this body sent to it, one
+            -- this body sent to anyone (multi-hop A->B->C),
+            -- or one this body received before (known).
+            CREATE TABLE IF NOT EXISTS sent_versions (
+                peer_device_id TEXT NOT NULL,
+                sync_id TEXT NOT NULL,
+                version_lamport INTEGER NOT NULL,
+                version_device TEXT NOT NULL,
+                hash TEXT NOT NULL,
+                sent_ms INTEGER NOT NULL,
+                PRIMARY KEY (peer_device_id, sync_id, version_lamport, version_device)
+            );
+            -- Versions received from a peer (or referenced as
+            -- based_on/supersedes by an accepted record):
+            -- the circulating-version set for provenance.
+            CREATE TABLE IF NOT EXISTS known_versions (
+                sync_id TEXT NOT NULL,
+                version_lamport INTEGER NOT NULL,
+                version_device TEXT NOT NULL,
+                hash TEXT NOT NULL,
+                PRIMARY KEY (sync_id, version_lamport, version_device)
+            );
+            -- F7-02: SoulFile / naming_profile records that
+            -- arrived from a peer and were NOT auto-applied:
+            -- they wait here for the local user's explicit
+            -- approval (conflict screen / CLI).
+            CREATE TABLE IF NOT EXISTS pending_sync_approvals (
+                sync_id TEXT PRIMARY KEY,
+                kind TEXT NOT NULL,
+                peer_device_id TEXT NOT NULL,
+                record_json TEXT NOT NULL,
+                received_ms INTEGER NOT NULL
             );",
         )?;
         Ok(Self {
@@ -643,6 +680,201 @@ impl DeviceRegistry {
             params![sync_id],
         )?;
         Ok(())
+    }
+
+    // -- sent-version / known-version provenance (F7-01/F7-27) --
+
+    /// Record that this body sent `version` of `sync_id` to
+    /// `peer_device_id` (called from `build_push`, the only
+    /// place full records leave this body).
+    pub fn record_sent_version(
+        &self,
+        peer_device_id: &str,
+        sync_id: &str,
+        version: &VersionId,
+        hash: &str,
+        sent_ms: u64,
+    ) -> Result<(), MimintError> {
+        let conn = self.connection();
+        conn.execute(
+            "INSERT OR IGNORE INTO sent_versions
+                (peer_device_id, sync_id, version_lamport, version_device, hash, sent_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                peer_device_id,
+                sync_id,
+                version.lamport as i64,
+                version.device,
+                hash,
+                sent_ms as i64,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Record a version this body received from a peer (or
+    /// referenced as `based_on`/`supersedes_version` by an
+    /// accepted record): part of the circulating-version set.
+    pub fn record_known_version(
+        &self,
+        sync_id: &str,
+        version: &VersionId,
+        hash: &str,
+    ) -> Result<(), MimintError> {
+        let conn = self.connection();
+        conn.execute(
+            "INSERT OR IGNORE INTO known_versions
+                (sync_id, version_lamport, version_device, hash)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![sync_id, version.lamport as i64, version.device, hash],
+        )?;
+        Ok(())
+    }
+
+    /// Provenance for a claimed base version (F7-01/F7-27):
+    /// true when the peer could plausibly have seen it —
+    /// this body sent it to this peer, sent it to ANY peer
+    /// (multi-hop: the peer may have received it via a third
+    /// body), or this body received it (or its lineage) from
+    /// a peer before. A version this body created locally and
+    /// never sent to anyone has NO provenance for any peer.
+    pub fn version_has_provenance(
+        &self,
+        peer_device_id: &str,
+        sync_id: &str,
+        version: &VersionId,
+    ) -> Result<bool, MimintError> {
+        let conn = self.connection();
+        let sent_to_peer: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM sent_versions WHERE peer_device_id = ?1 AND sync_id = ?2
+                 AND version_lamport = ?3 AND version_device = ?4",
+                params![
+                    peer_device_id,
+                    sync_id,
+                    version.lamport as i64,
+                    version.device
+                ],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if sent_to_peer.is_some() {
+            return Ok(true);
+        }
+        let sent_to_any: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM sent_versions WHERE sync_id = ?1
+                 AND version_lamport = ?2 AND version_device = ?3",
+                params![sync_id, version.lamport as i64, version.device],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if sent_to_any.is_some() {
+            return Ok(true);
+        }
+        let known: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM known_versions WHERE sync_id = ?1
+                 AND version_lamport = ?2 AND version_device = ?3",
+                params![sync_id, version.lamport as i64, version.device],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(known.is_some())
+    }
+
+    /// Drop sent-version rows older than `keep_ms` (called
+    /// with the tombstone purge; provenance for live records
+    /// is unaffected because live versions are re-sent on
+    /// every sync that needs them).
+    pub fn prune_sent_versions(&self, now_ms: u64, keep_ms: u64) -> Result<usize, MimintError> {
+        let cutoff = now_ms.saturating_sub(keep_ms) as i64;
+        let conn = self.connection();
+        Ok(conn.execute(
+            "DELETE FROM sent_versions WHERE sent_ms <= ?1",
+            params![cutoff],
+        )?)
+    }
+
+    // -- pending sync approvals (F7-02) ---------------------------
+
+    /// Hold a SoulFile / naming_profile record for the local
+    /// user's explicit approval instead of auto-applying it.
+    pub fn store_pending_approval(
+        &self,
+        sync_id: &str,
+        kind: &str,
+        peer_device_id: &str,
+        record_json: &str,
+        received_ms: u64,
+    ) -> Result<(), MimintError> {
+        let conn = self.connection();
+        conn.execute(
+            "INSERT INTO pending_sync_approvals
+                (sync_id, kind, peer_device_id, record_json, received_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(sync_id) DO UPDATE SET
+                kind = excluded.kind,
+                peer_device_id = excluded.peer_device_id,
+                record_json = excluded.record_json,
+                received_ms = excluded.received_ms",
+            params![sync_id, kind, peer_device_id, record_json, received_ms as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Pending approvals, oldest first.
+    pub fn list_pending_approvals(
+        &self,
+    ) -> Result<Vec<(String, String, String, String, u64)>, MimintError> {
+        let conn = self.connection();
+        let mut stmt = conn.prepare(
+            "SELECT sync_id, kind, peer_device_id, record_json, received_ms
+             FROM pending_sync_approvals ORDER BY received_ms ASC",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)? as u64,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Take (and remove) one pending approval, if present.
+    pub fn take_pending_approval(
+        &self,
+        sync_id: &str,
+    ) -> Result<Option<(String, String, String)>, MimintError> {
+        let row = {
+            let conn = self.connection();
+            conn.query_row(
+                "SELECT kind, peer_device_id, record_json FROM pending_sync_approvals
+                 WHERE sync_id = ?1",
+                params![sync_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?
+        };
+        if row.is_some() {
+            let conn = self.connection();
+            conn.execute(
+                "DELETE FROM pending_sync_approvals WHERE sync_id = ?1",
+                params![sync_id],
+            )?;
+        }
+        Ok(row)
     }
 
     // -- local versions ----------------------------------------------

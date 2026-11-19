@@ -167,6 +167,9 @@ pub enum ApplyOutcome {
     Dropped,
     /// Rejected by validation (never reaches the store).
     Rejected,
+    /// A SoulFile / naming_profile record held for the local
+    /// user's explicit approval (F7-02): never auto-applied.
+    PendingApproval,
 }
 
 /// How a conflict is resolved (§4.4).
@@ -636,9 +639,13 @@ impl SyncEngine {
     }
 
     /// Build a `sync_push` answering a request: full records
-    /// for the wanted ids, batch-capped.
+    /// for the wanted ids, batch-capped. Every record sent is
+    /// recorded in the sent-version state (F7-01/F7-27): the
+    /// peer may later claim `based_on` for exactly these
+    /// versions.
     pub fn build_push(
         &self,
+        peer_device_id: &str,
         request: &SyncRequest,
         kinds: &SyncKinds,
     ) -> Result<SyncPush, MimintError> {
@@ -656,6 +663,16 @@ impl SyncEngine {
             }
             // Unknown ids are silently skipped: the peer asked
             // for something this side no longer holds.
+        }
+        let now = self.now_ms();
+        for record in &records {
+            let _ = self.registry.record_sent_version(
+                peer_device_id,
+                &record.sync_id,
+                &record.version(),
+                &record.body_sha256,
+                now,
+            );
         }
         Ok(SyncPush {
             v: PROTOCOL_VERSION,
@@ -689,18 +706,49 @@ impl SyncEngine {
         Ok(outcomes)
     }
 
+    /// Apply one incoming record (F7-08: a record that fails
+    /// validation is Rejected on its own — it never aborts
+    /// the rest of the batch; the caller advances `last_seen`
+    /// for the good records only).
     fn apply_one(
         &self,
         peer_device_id: &str,
         record: &SyncRecord,
         kinds: &SyncKinds,
     ) -> Result<ApplyOutcome, MimintError> {
-        record.validate().map_err(|err| {
-            MimintError::Config(format!("sync record {} rejected: {}", record.sync_id, err))
-        })?;
+        // Validation failure is a per-record Rejected, not a
+        // batch error (F7-06/F7-08).
+        if let Err(err) = record.validate() {
+            self.audit(
+                "sync_record_rejected",
+                serde_json::json!({
+                    "sync_id": record.sync_id,
+                    "kind": record.kind,
+                    "peer_device_id": peer_device_id,
+                    "error": err.to_string(),
+                }),
+            );
+            return Ok(ApplyOutcome::Rejected);
+        }
         let kind = record.record_kind()?;
         if !kinds.allows(kind) {
             return Ok(ApplyOutcome::Dropped);
+        }
+        // F7-01: the version must be authored by the peer
+        // sending it. A record carrying a third device's (or
+        // our own) version id is a forgery, whatever its
+        // `based_on` claims.
+        if record.version_device != peer_device_id {
+            self.audit(
+                "sync_record_rejected_version_device",
+                serde_json::json!({
+                    "sync_id": record.sync_id,
+                    "kind": record.kind,
+                    "peer_device_id": peer_device_id,
+                    "version_device": record.version_device,
+                }),
+            );
+            return Ok(ApplyOutcome::Rejected);
         }
         self.observe(record.version_lamport);
 
@@ -743,6 +791,28 @@ impl SyncEngine {
         // apply as new, consume the receipt, and notice it.
         let local_row = self.registry.get_local_version(&record.sync_id)?;
         if local_row.is_none() && !self.local_item_exists(&record.sync_id, kind)? {
+            // F7-02: a SoulFile / naming_profile never
+            // auto-applies — not even as a brand-new record.
+            // It waits for the local user's explicit approval.
+            if matches!(kind, RecordKind::SoulFile | RecordKind::NamingProfile) {
+                let record_json = serde_json::to_string(record).unwrap_or_default();
+                self.registry.store_pending_approval(
+                    &record.sync_id,
+                    &record.kind,
+                    peer_device_id,
+                    &record_json,
+                    self.now_ms(),
+                )?;
+                self.audit(
+                    "sync_soul_pending_approval",
+                    serde_json::json!({
+                        "sync_id": record.sync_id,
+                        "kind": record.kind,
+                        "peer_device_id": peer_device_id,
+                    }),
+                );
+                return Ok(ApplyOutcome::PendingApproval);
+            }
             let receipt = self.registry.take_purge_receipt(&record.sync_id)?;
             self.apply_record_to_store(record, kind)?;
             self.registry.set_local_version(&LocalVersionRow {
@@ -760,6 +830,7 @@ impl SyncEngine {
                     hash: record.body_sha256.clone(),
                 },
             )?;
+            self.note_accepted_lineage(record)?;
             if let Some((_kind, deleted_by_device, deleted_ms)) = receipt {
                 self.audit(
                     "sync_resurrection_noticed",
@@ -775,8 +846,31 @@ impl SyncEngine {
             return Ok(ApplyOutcome::Applied);
         }
 
-        // Local record exists: the §4.4 algorithm decides.
+        // Local record exists: the §4.4 algorithm decides —
+        // but only after the causality gate (F7-01). A
+        // successor/resolution claim whose base the peer
+        // could never have seen is a forgery: Rejected, no
+        // apply, no conflict screen, distinct audit event.
         let local = self.local_version_for(&record.sync_id, kind)?;
+        if let Some(claimed) = successor_claim(record, &local.version) {
+            let proven = self
+                .registry
+                .version_has_provenance(peer_device_id, &record.sync_id, claimed)?;
+            if !proven {
+                self.audit(
+                    "sync_successor_rejected",
+                    serde_json::json!({
+                        "sync_id": record.sync_id,
+                        "kind": record.kind,
+                        "peer_device_id": peer_device_id,
+                        "claimed_base_lamport": claimed.lamport,
+                        "claimed_base_device": claimed.device,
+                        "reason": "forged_based_on",
+                    }),
+                );
+                return Ok(ApplyOutcome::Rejected);
+            }
+        }
         let last_seen = self
             .registry
             .get_last_seen(peer_device_id, &record.sync_id)?;
@@ -790,9 +884,26 @@ impl SyncEngine {
                         hash: record.body_sha256.clone(),
                     },
                 )?;
+                self.note_accepted_lineage(record)?;
                 Ok(ApplyOutcome::Ignored)
             }
             ConflictDecision::Apply => {
+                // F7-02: SoulFile / naming_profile never
+                // auto-apply, even as a genuine successor.
+                // The conflict screen is the only way in.
+                if matches!(kind, RecordKind::SoulFile | RecordKind::NamingProfile) {
+                    self.record_conflict(peer_device_id, record, kind)?;
+                    self.audit(
+                        "sync_soul_requires_approval",
+                        serde_json::json!({
+                            "sync_id": record.sync_id,
+                            "kind": record.kind,
+                            "peer_device_id": peer_device_id,
+                        }),
+                    );
+                    self.note_accepted_lineage(record)?;
+                    return Ok(ApplyOutcome::Conflicted);
+                }
                 self.apply_record_to_store(record, kind)?;
                 self.registry.set_local_version(&LocalVersionRow {
                     sync_id: record.sync_id.clone(),
@@ -809,14 +920,97 @@ impl SyncEngine {
                         hash: record.body_sha256.clone(),
                     },
                 )?;
+                self.note_accepted_lineage(record)?;
                 Ok(ApplyOutcome::Applied)
             }
             ConflictDecision::KeepLocal => Ok(ApplyOutcome::KeptLocal),
             ConflictDecision::Conflict => {
                 self.record_conflict(peer_device_id, record, kind)?;
+                self.note_accepted_lineage(record)?;
                 Ok(ApplyOutcome::Conflicted)
             }
         }
+    }
+
+    /// Record an accepted record's version and its causality
+    /// lineage as circulating versions (F7-01/F7-27). Only
+    /// called for accepted records — a rejected forgery must
+    /// never launder provenance for its claimed base.
+    fn note_accepted_lineage(&self, record: &SyncRecord) -> Result<(), MimintError> {
+        self.registry.record_known_version(
+            &record.sync_id,
+            &record.version(),
+            &record.body_sha256,
+        )?;
+        if let Some(based_on) = &record.based_on {
+            self.registry
+                .record_known_version(&record.sync_id, based_on, &record.body_sha256)?;
+        }
+        if let Some(supersedes) = &record.supersedes_version {
+            self.registry
+                .record_known_version(&record.sync_id, supersedes, &record.body_sha256)?;
+        }
+        Ok(())
+    }
+
+    /// Pending SoulFile / naming_profile approvals (F7-02).
+    pub fn pending_sync_approvals(
+        &self,
+    ) -> Result<Vec<(String, String, String, String, u64)>, MimintError> {
+        self.registry.list_pending_approvals()
+    }
+
+    /// Approve a held SoulFile / naming_profile record: apply
+    /// it exactly as a new record would have applied, then
+    /// advance the baseline. Returns false when nothing was
+    /// pending for the id.
+    pub fn approve_pending_sync(&self, sync_id: &str) -> Result<bool, MimintError> {
+        let Some((_kind, peer_device_id, record_json)) =
+            self.registry.take_pending_approval(sync_id)?
+        else {
+            return Ok(false);
+        };
+        let record: SyncRecord = serde_json::from_str(&record_json)
+            .map_err(|err| MimintError::Config(format!("bad pending sync record: {err}")))?;
+        record.validate()?;
+        let kind = record.record_kind()?;
+        self.apply_record_to_store(&record, kind)?;
+        self.registry.set_local_version(&LocalVersionRow {
+            sync_id: record.sync_id.clone(),
+            kind: record.kind.clone(),
+            version: record.version(),
+            based_on: record.based_on.clone(),
+            hash: record.body_sha256.clone(),
+        })?;
+        self.registry.set_last_seen(
+            &peer_device_id,
+            &record.sync_id,
+            &SeenVersion {
+                version: record.version(),
+                hash: record.body_sha256.clone(),
+            },
+        )?;
+        self.note_accepted_lineage(&record)?;
+        self.audit(
+            "sync_pending_approved",
+            serde_json::json!({"sync_id": record.sync_id, "kind": record.kind}),
+        );
+        Ok(true)
+    }
+
+    /// Reject a held SoulFile / naming_profile record: drop it
+    /// without applying. The peer will re-offer it on the next
+    /// sync; the user can approve it then if they change their
+    /// mind. Returns false when nothing was pending.
+    pub fn reject_pending_sync(&self, sync_id: &str) -> Result<bool, MimintError> {
+        if self.registry.take_pending_approval(sync_id)?.is_none() {
+            return Ok(false);
+        }
+        self.audit(
+            "sync_pending_rejected",
+            serde_json::json!({"sync_id": sync_id}),
+        );
+        Ok(true)
     }
 
     fn apply_tombstone(
@@ -1470,6 +1664,25 @@ impl SyncEngine {
     }
 }
 
+/// The base version a record claims as its successor /
+/// resolution anchor (F7-01): the version Rule 2 or Rule 3
+/// would apply against, if it equals the local version.
+/// `None` when the record claims no successor relationship
+/// to the local version (Rule 5 / conflict territory).
+fn successor_claim<'a>(record: &'a SyncRecord, local_version: &VersionId) -> Option<&'a VersionId> {
+    if let Some(supersedes) = &record.supersedes_version {
+        if *supersedes == *local_version {
+            return Some(supersedes);
+        }
+    }
+    if let Some(based_on) = &record.based_on {
+        if *based_on == *local_version {
+            return Some(based_on);
+        }
+    }
+    None
+}
+
 /// Run one full sync exchange over an authenticated session.
 /// Both sides run the same steps in the same order (offer →
 /// request → push → ack), so no deadlock: each send precedes
@@ -1518,7 +1731,7 @@ pub fn run_sync_exchange(
     let peer_request: SyncRequest = serde_json::from_slice(&peer_request_payload)
         .map_err(|err| MimintError::Config(format!("sync: bad sync_request: {err}")))?;
 
-    let push = engine.build_push(&peer_request, kinds)?;
+    let push = engine.build_push(peer_device_id, &peer_request, kinds)?;
     let sent = push.records.len();
     session.send(MessageKind::SyncPush, &serde_json::to_vec(&push).unwrap())?;
     let (peer_push_kind, peer_push_payload) = session.recv()?;
@@ -1530,10 +1743,10 @@ pub fn run_sync_exchange(
     }
     let peer_push: SyncPush = serde_json::from_slice(&peer_push_payload)
         .map_err(|err| MimintError::Config(format!("sync: bad sync_push: {err}")))?;
-    // Validate every record before applying any.
-    for record in &peer_push.records {
-        record.validate()?;
-    }
+    // F7-08: no whole-batch pre-validation. `apply_push`
+    // validates each record on its own: one bad record is
+    // Rejected and audited, the good records still apply,
+    // and the next sync does not stall on the bad one.
     let outcomes = engine.apply_push(peer_device_id, &peer_push, kinds)?;
     let mut applied = Vec::new();
     let mut conflicts = Vec::new();
@@ -1553,7 +1766,7 @@ pub fn run_sync_exchange(
                 applied.push(sync_id);
                 applied_count += 1;
             }
-            ApplyOutcome::Conflicted | ApplyOutcome::TombstonePending => {
+            ApplyOutcome::Conflicted | ApplyOutcome::TombstonePending | ApplyOutcome::PendingApproval => {
                 conflicts.push(sync_id);
                 conflict_count += 1;
             }
