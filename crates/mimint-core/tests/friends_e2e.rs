@@ -5227,23 +5227,26 @@ fn session_rekey_flood_rate_limited_receiver_stays_open() {
     });
     sa.initiate_rekey().unwrap();
     // Second rekey 0 s later: under the 5 s cooldown, the
-    // receiver drops it; the sender times out on its side.
-    assert!(sa.initiate_rekey().is_err());
-    assert!(
-        poll_audit_contains(&b, "rekey_rate_limited", 20),
-        "excess rekey must be audited"
-    );
-    // The receiver session must still be alive after the
-    // flood: its recv is still blocked (a failed session
-    // would have returned from recv already).
-    std::thread::sleep(std::time::Duration::from_millis(300));
+    // receiver drops it; the sender times out on its side
+    // (800 ms). Run the flooding attempt on a thread so
+    // liveness can be checked WHILE the sender is still
+    // waiting: the receiver session must still be alive then
+    // (its recv still blocked — a failed session would have
+    // returned from recv already). Checking after the sender
+    // fails is meaningless: the failure itself closes the
+    // socket, which ends the receiver's recv too.
+    let flood = std::thread::spawn(move || sa.initiate_rekey());
+    std::thread::sleep(std::time::Duration::from_millis(400));
     assert!(
         !pump_done.load(Ordering::SeqCst),
         "receiver session must stay open after the flood"
     );
-    // Dropping the sender closes the socket, so the pump's
-    // recv returns and the thread can be joined.
-    drop(sa);
+    let flood_result = flood.join().unwrap();
+    assert!(flood_result.is_err(), "flooding rekey must time out");
+    assert!(
+        poll_audit_contains(&b, "rekey_rate_limited", 20),
+        "excess rekey must be audited"
+    );
     let sb_rekeys = pump.join().unwrap();
     assert_eq!(sb_rekeys, 1, "receiver rekey count bounded");
 }

@@ -951,6 +951,15 @@ impl FriendsPanel {
                 self.handoff_turn_reply = Some(reply);
             }
         }
+        // F7-23: the registry was recreated after peers.db
+        // was deleted — Lamport is back to 0 and last_seen is
+        // gone, so the next sync may conflict more.
+        if self.peers_db_restored {
+            ui.colored_label(
+                egui::Color32::from_rgb(0xDC, 0x26, 0x26),
+                texts::PEERS_DB_RESTORE_WARNING,
+            );
+        }
         ui.heading("Bạn bè — thiết bị đã ghép đôi");
         ui.label(format!(
             "Thiết bị này: {} (fingerprint {})",
@@ -1095,7 +1104,19 @@ impl FriendsPanel {
             ui.separator();
             ui.horizontal(|ui| {
                 ui.label(format!("{} ({:.8})", peer.name, peer.device_id));
-                ui.label(format!("quyền: {}", peer.trust.as_str()));
+                // F7-21: the trust scale is the LOCAL grant —
+                // label it as such, and show what the peer
+                // claims to have granted only as display-only.
+                ui.label(format!(
+                    "quyền máy này cấp cho peer: {}",
+                    peer.trust.as_str()
+                ));
+                if let Some(received) = peer.trust_received {
+                    ui.label(format!(
+                        "peer nói đã cấp cho bạn: {} (chỉ để xem)",
+                        received.as_str()
+                    ));
+                }
                 if peer.pairing_incomplete {
                     ui.colored_label(
                         egui::Color32::from_rgb(0xB4, 0x53, 0x09),
@@ -1129,9 +1150,17 @@ impl FriendsPanel {
             });
             ui.horizontal(|ui| {
                 if !peer.revoked && ui.button("Thu hồi").clicked() {
-                    let now = self.controller_clock_ms();
-                    let _ = self.registry.revoke_peer(&peer.device_id, now);
-                    self.status = format!("Đã thu hồi {}.", peer.name);
+                    // F7-07: revoke through the hub, not the
+                    // registry alone — the hub also cuts the
+                    // peer's live session at once.
+                    if self.hub.revoke_peer(&peer.device_id) {
+                        self.status = format!(
+                            "Đã thu hồi {} (phiên đang chạy đã bị ngắt).",
+                            peer.name
+                        );
+                    } else {
+                        self.status = format!("Không thu hồi được {}.", peer.name);
+                    }
                 }
                 if ui.button("Xóa").clicked() {
                     let _ = self.registry.delete_peer(&peer.device_id);
@@ -1169,14 +1198,40 @@ impl FriendsPanel {
             }
         }
         ui.separator();
-        ui.label(texts::PRIVACY_MODE_TEXT);
+        ui.label(texts::SELECTIVE_SYNC_NOTEBOOK);
+        ui.separator();
+        // F7-25: the "[Xem danh sách thiết bị đã ghép đôi]"
+        // inside PRIVACY_MODE_TEXT was plain text — render it
+        // as a real button that switches to this tab.
+        let privacy = texts::PRIVACY_MODE_TEXT
+            .replace(" [Xem danh sách thiết bị đã ghép đôi]", "");
+        ui.label(privacy);
+        if ui.button("Xem danh sách thiết bị đã ghép đôi").clicked() {
+            self.view = FriendsView::Devices;
+        }
         if ui.button("Sao chép fingerprint của thiết bị này").clicked() {
             ui.ctx().copy_text(self.identity.fingerprint().to_string());
         }
-    }
-
-    fn controller_clock_ms(&self) -> u64 {
-        Clock::system().now_ms()
+        // F7-25: the demo approval card lives here now, not in
+        // the Hub tab — it is a per-peer approval test, and the
+        // Hub tab must stay about the hub.
+        ui.separator();
+        ui.heading("Thẻ phê duyệt thử (demo)");
+        ui.label("Tạo một thẻ phê duyệt cho peer đã bật phê duyệt (checkbox ở trên). Peer quyết định bằng `mimint-cli friends approve-wait --addr <hub này>`. Đường production là brain tạo thẻ trong chính tiến trình này.");
+        ui.horizontal(|ui| {
+            ui.label("Peer (device id):");
+            ui.text_edit_singleline(&mut self.card_target);
+        });
+        ui.horizontal(|ui| {
+            ui.label("Hành động:");
+            ui.text_edit_singleline(&mut self.card_action);
+        });
+        if ui.button("Tạo thẻ phê duyệt thử").clicked() {
+            self.send(FriendsCommand::CreateCard {
+                target: self.card_target.clone(),
+                action: self.card_action.clone(),
+            });
+        }
     }
 
     fn show_pair(&mut self, ui: &mut egui::Ui) {
@@ -1212,6 +1267,24 @@ impl FriendsPanel {
         }
         if let Some(pending) = &self.pending_sas {
             ui.separator();
+            // F7-15: the ceremony expires 5 minutes after the
+            // SAS appears — show the countdown, not just the
+            // pairing-mode timer in the Hub tab.
+            if let Some(started) = self.pair_started_ms {
+                let elapsed = Clock::system().now_ms().saturating_sub(started);
+                let remaining = (5 * 60 * 1000u64).saturating_sub(elapsed);
+                if remaining > 0 {
+                    ui.label(format!(
+                        "Ceremony còn {} giây (hết hạn sau 5 phút — phải xác nhận trước đó).",
+                        remaining / 1000
+                    ));
+                } else {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(0xDC, 0x26, 0x26),
+                        "Ceremony đã hết hạn 5 phút — bật lại chế độ ghép đôi rồi thử lại.",
+                    );
+                }
+            }
             ui.colored_label(
                 egui::Color32::from_rgb(0x1D, 0x4E, 0xD8),
                 format!(
@@ -1225,14 +1298,35 @@ impl FriendsPanel {
                 mimint_core::friends::crypto::fingerprint_short(&pending.fingerprint),
                 pending.fingerprint
             ));
+            // F7-16: copy the PEER's fingerprint (the Devices
+            // tab button copies this device's instead).
+            if ui.button("Sao chép fingerprint của peer").clicked() {
+                ui.ctx().copy_text(pending.fingerprint.clone());
+            }
             if self.pair_compare {
                 ui.label("So sánh mã này với mã trên màn hình thiết bị kia. Chỉ bấm \"khớp\" khi hai mã giống hệt nhau — máy không thể phát hiện bạn xác nhận một mã sai (rủi ro T12).");
             } else {
                 ui.label("Đọc mã này cho người ở thiết bị kia gõ vào. Mã không tự khớp — phía kia phải gõ đúng 6 số.");
             }
+            // F7-16: confirming the SAS and confirming the
+            // fingerprint are two separate steps. The confirm
+            // button stays disabled until the user ticks that
+            // they compared the peer fingerprint with the other
+            // device's screen — it no longer sets
+            // fingerprint_confirmed by itself.
+            ui.checkbox(
+                &mut self.sas_fingerprint_checked,
+                "Đã đối chiếu fingerprint của peer với màn hình thiết bị kia",
+            );
             let mut decision: Option<InitiatorDecision> = None;
             ui.horizontal(|ui| {
-                if ui.button("Mã khớp — xác nhận").clicked() {
+                if ui
+                    .add_enabled(
+                        self.sas_fingerprint_checked,
+                        egui::Button::new("Mã khớp — xác nhận"),
+                    )
+                    .clicked()
+                {
                     decision = Some(InitiatorDecision {
                         confirmed: true,
                         trust_granted: if self.pair_guest {
@@ -1240,7 +1334,7 @@ impl FriendsPanel {
                         } else {
                             Trust::Owner
                         },
-                        fingerprint_confirmed: true,
+                        fingerprint_confirmed: self.sas_fingerprint_checked,
                         fingerprint_skipped_with_warning: false,
                     });
                 }
@@ -1263,6 +1357,53 @@ impl FriendsPanel {
     }
 
     fn show_conflicts(&mut self, ui: &mut egui::Ui) {
+        // F7-25: the 90-day tombstone rule, where the user
+        // resolves deletions.
+        ui.label(texts::TOMBSTONE_90_DAY_LIMIT);
+        ui.separator();
+        // F7-02: SoulFile / naming_profile records held for
+        // this user's approval are listed here next to the
+        // conflicts, with approve / reject buttons.
+        let pending = self.sync_engine.pending_sync_approvals().unwrap_or_default();
+        if !pending.is_empty() {
+            ui.heading("Chờ bạn duyệt (SOUL / profile từ peer)");
+            ui.label("Các record này KHÔNG tự áp dụng — chỉ bạn mới được duyệt. Từ chối thì record bị bỏ, không áp dụng.");
+            for (sync_id, kind, peer_device_id, _record_json, _received_ms) in pending {
+                ui.separator();
+                ui.label(format!(
+                    "{kind} {sync_id} — từ {peer_device_id:.8}"
+                ));
+                ui.horizontal(|ui| {
+                    if ui.button("Duyệt và áp dụng").clicked() {
+                        match self.sync_engine.approve_pending_sync(&sync_id) {
+                            Ok(true) => {
+                                self.status = format!("Đã duyệt và áp dụng {sync_id}.");
+                            }
+                            Ok(false) => {
+                                self.status = format!("Không còn gì chờ duyệt cho {sync_id}.");
+                            }
+                            Err(err) => {
+                                self.status = format!("Không duyệt được {sync_id}: {err}");
+                            }
+                        }
+                    }
+                    if ui.button("Từ chối (bỏ record)").clicked() {
+                        match self.sync_engine.reject_pending_sync(&sync_id) {
+                            Ok(true) => {
+                                self.status = format!("Đã từ chối {sync_id}.");
+                            }
+                            Ok(false) => {
+                                self.status = format!("Không còn gì chờ duyệt cho {sync_id}.");
+                            }
+                            Err(err) => {
+                                self.status = format!("Không từ chối được {sync_id}: {err}");
+                            }
+                        }
+                    }
+                });
+            }
+            ui.separator();
+        }
         let conflicts = self.registry.list_conflicts(false).unwrap_or_default();
         if conflicts.is_empty() {
             ui.label("Không có xung đột chưa giải quyết.");
@@ -1345,6 +1486,14 @@ impl FriendsPanel {
             self.hub.xiaozhi_port(),
             self.hub.ota_port()
         ));
+        // F7-06: OTA is an exposure state of its own — show
+        // whether it is serving right now.
+        if self.hub.ota_open() {
+            ui.label(texts::HUB_EXPOSURE_OTA_OPEN);
+        } else {
+            ui.label("OTA đã đóng (đóng LAN sẽ đóng luôn OTA).");
+        }
+        ui.label(texts::CLOSE_LAN_KEEPS_PAIRING);
         let remaining = self.controller.pairing_mode_remaining_ms();
         if remaining > 0 {
             ui.label(format!("Chế độ ghép đôi còn {} giây.", remaining / 1000));
@@ -1362,6 +1511,10 @@ impl FriendsPanel {
             if ui.button("Tắt LAN (giữ loopback)").clicked() {
                 let cut = self.hub.close_lan();
                 self.status = format!("Đã tắt LAN, cắt {} session.", cut.len());
+            }
+            if ui.button("Bật lại LAN").clicked() {
+                self.hub.open_lan();
+                self.status = "Đã bật lại LAN (OTA cũng mở lại).".to_string();
             }
             if ui.button("Ngắt tất cả driver ngay").clicked() {
                 let killed = self.hub.kill_all_drivers();
@@ -1399,15 +1552,31 @@ impl FriendsPanel {
         }
         ui.separator();
         ui.heading("Thẻ phê duyệt đang chờ peer quyết định");
-        let cards = self.relay.pending_cards();
+        // F7-13: each card names BOTH sides — the hub that
+        // created it (origin) and the device that must answer
+        // — plus a live countdown instead of clock times only.
+        let cards = self.relay.pending_cards_detailed();
         if cards.is_empty() {
             ui.label("Không có thẻ nào đang chờ.");
         }
-        for card in cards {
+        let now = Clock::system().now_ms();
+        for (card, target) in cards {
+            let remaining = card.expires_ms.saturating_sub(now) / 1000;
+            let target_name = self
+                .registry
+                .get_peer(&target)
+                .ok()
+                .flatten()
+                .map(|p| p.name)
+                .unwrap_or_else(|| target.clone());
             ui.separator();
             ui.label(format!(
-                "{} — từ {} ({:.8}) — agent {} — yêu cầu {}",
+                "{} — hub gửi: {} ({:.8}) — agent {} — yêu cầu {}",
                 card.action, card.device_name, card.device_id, card.agent_id, card.request_id
+            ));
+            ui.label(format!(
+                "Thiết bị trả lời: {target_name} ({:.8}) — còn lại {remaining} giây",
+                target
             ));
             ui.label(format!(
                 "Chi tiết: {} — tạo lúc {}, hết hạn {}",
@@ -1415,23 +1584,6 @@ impl FriendsPanel {
                 crate::audit_view::format_time_ms(card.created_ms),
                 crate::audit_view::format_time_ms(card.expires_ms)
             ));
-        }
-        ui.separator();
-        ui.heading("Thẻ phê duyệt thử (demo)");
-        ui.label("Tạo một thẻ phê duyệt cho peer đã bật phê duyệt (tab Thiết bị). Peer quyết định bằng `mimint-cli friends approve-wait --addr <hub này>`. Đường production là brain tạo thẻ trong chính tiến trình này.");
-        ui.horizontal(|ui| {
-            ui.label("Peer (device id):");
-            ui.text_edit_singleline(&mut self.card_target);
-        });
-        ui.horizontal(|ui| {
-            ui.label("Hành động:");
-            ui.text_edit_singleline(&mut self.card_action);
-        });
-        if ui.button("Tạo thẻ phê duyệt thử").clicked() {
-            self.send(FriendsCommand::CreateCard {
-                target: self.card_target.clone(),
-                action: self.card_action.clone(),
-            });
         }
     }
 
@@ -1462,13 +1614,27 @@ impl FriendsPanel {
             });
             self.status = "Đang gửi handoff — chờ peer chấp nhận.".to_string();
         }
-        if let Some(lease) = self.handoff.lease_for("default") {
+        if let Some(lease) = self.handoff.lease_for(HANDOFF_ACTUATOR) {
             ui.separator();
+            // F7-04: the holder is the RECEIVING device (this
+            // body, when it accepted) — and the panel shows a
+            // live countdown, not just the expiry clock time.
+            let remaining = lease
+                .expires_ms
+                .saturating_sub(self.hub.now_ms())
+                / 1000;
             ui.label(format!(
-                "Lease đang giữ: actuator {} — holder {:.8} — hết hạn {}",
+                "Lease đang giữ: actuator {} — holder là máy nhận ({:.8}) — còn lại {remaining} giây (hết hạn {})",
                 lease.actuator,
                 lease.holder_device_id,
                 crate::audit_view::format_time_ms(lease.expires_ms)
+            ));
+        } else if self.status.starts_with("Đang gửi handoff") {
+            // F7-24: no answer yet and no lease held by either
+            // side — the state is genuinely unknown, say so.
+            ui.label(format!(
+                "Trạng thái handoff: {} — chưa có trả lời từ peer.",
+                texts::HANDOFF_STATE_UNKNOWN
             ));
         }
         // Pending handoffs waiting for THIS user's decision

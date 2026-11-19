@@ -269,8 +269,12 @@ impl InitiatorUi for TerminalInitiatorUi {
 
     fn decide(&self, ctx: &InitiatorDecisionCtx) -> InitiatorDecision {
         println!();
+        // F7-21: trust_received is display-only — label it so
+        // it can never be read as the permission that counts
+        // here (that is the trust THIS body grants, chosen
+        // below).
         println!(
-            "Thiết bị bên kia đã xác nhận. Quyền được cấp cho bạn: {}",
+            "Thiết bị bên kia nói đã cấp cho bạn quyền: {} (chỉ để xem — không dùng để cho phép gì ở đây)",
             ctx.trust_received.as_str()
         );
         let answer = TerminalListenerUi::read_line("Xác nhận ghép đôi với thiết bị này? [y/n]: ");
