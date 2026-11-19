@@ -42,6 +42,8 @@
 
 use crate::error::MimintError;
 use crate::fallback::RetryPolicy;
+use crate::friends::hub::HubConfig;
+use crate::friends::sync::SyncKinds;
 use crate::profile::{ProfileEntry, ProfileSet};
 use crate::registry::{BackendKind, BackendSpec, CostCap, DEFAULT_TIMEOUT_SECS};
 use serde::Deserialize;
@@ -186,6 +188,60 @@ pub struct RoutingSection {
     /// Identical body actions in a row before the turn ends
     /// with `gui_batch_loop`, 2..=50. Default: 5.
     pub gui_batch_threshold: Option<usize>,
+}
+
+/// Friends section (Phase 7). Master switch for the whole
+/// friends subsystem (pairing, sync, hub, approval, handoff).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FriendsSection {
+    /// Master switch. Default: true. When false, the CLI/GUI
+    /// must not start the hub or offer pairing.
+    pub enabled: Option<bool>,
+}
+
+/// Hub section (Phase 7, §5). Ports and session limits.
+/// `[hub.xiaozhi]` holds the lab-mode flag.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HubSection {
+    /// Bind the friends listener on LAN too (loopback-only
+    /// when false). Default: false.
+    pub listen_lan: Option<bool>,
+    /// Friends port. Default: 19120. Must be distinct.
+    pub friends_port: Option<u16>,
+    /// XiaoZhi WS port. Default: 19121. Must be distinct.
+    pub xiaozhi_port: Option<u16>,
+    /// OTA HTTP port. Default: 19122. Must be distinct.
+    pub ota_port: Option<u16>,
+    /// Max concurrent sessions, 1..=8. Default: 4.
+    pub max_sessions: Option<usize>,
+    /// XiaoZhi sub-section.
+    #[serde(default)]
+    pub xiaozhi: XiaozhiSection,
+}
+
+/// `[hub.xiaozhi]` (Phase 7, §8.2). Lab mode is user-enabled
+/// only; it never defaults on.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct XiaozhiSection {
+    /// Lab mode: the OTA server may return `ws://` URLs for
+    /// loopback/tailnet hubs. Default: false.
+    pub lab_mode: Option<bool>,
+}
+
+/// Sync section (Phase 7, §4.6): the GLOBAL selective-sync
+/// defaults. Per-peer prefs in the registry override these.
+/// Every kind defaults on.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SyncSection {
+    pub soul: Option<bool>,
+    pub skills: Option<bool>,
+    pub notebook: Option<bool>,
+    pub todos_plans: Option<bool>,
+    pub profiles: Option<bool>,
 }
 
 /// One `[[mcp-server]]` table (Phase 6, §12). Servers come ONLY
@@ -391,6 +447,15 @@ pub struct FileConfig {
     /// Multi-agent section (Phase 6). Absent means single-agent.
     #[serde(default)]
     pub agents: AgentsSection,
+    /// Friends master section (Phase 7). Absent means enabled.
+    #[serde(default)]
+    pub friends: FriendsSection,
+    /// Hub section (Phase 7). Absent means loopback defaults.
+    #[serde(default)]
+    pub hub: HubSection,
+    /// Sync defaults section (Phase 7). Absent means all kinds on.
+    #[serde(default)]
+    pub sync: SyncSection,
     /// Hierarchy section (Phase 6). Absent means disabled.
     #[serde(default)]
     pub hierarchy: HierarchySection,
@@ -434,6 +499,13 @@ pub struct ResolvedConfig {
     pub routing: RoutingConfig,
     /// Validated MCP server allow-list (Phase 6).
     pub mcp_servers: Vec<McpServerConfig>,
+    /// Friends master switch (Phase 7).
+    pub friends_enabled: bool,
+    /// Validated hub configuration (Phase 7) — passed
+    /// straight to [`FriendsContext::open`].
+    pub hub: HubConfig,
+    /// Global selective-sync defaults (Phase 7).
+    pub sync_kinds: SyncKinds,
 }
 
 impl FileConfig {
@@ -569,6 +641,15 @@ impl FileConfig {
         let sandbox = validate_sandbox_section(&self.sandbox)?;
         let routing = validate_routing_section(&self.routing)?;
         let mcp_servers = validate_mcp_servers(&self.mcp_server)?;
+        let friends_enabled = self.friends.enabled.unwrap_or(true);
+        let hub = validate_hub_section(&self.hub)?;
+        let sync_kinds = SyncKinds {
+            soul: self.sync.soul.unwrap_or(true),
+            skills: self.sync.skills.unwrap_or(true),
+            notebook: self.sync.notebook.unwrap_or(true),
+            todos_plans: self.sync.todos_plans.unwrap_or(true),
+            profiles: self.sync.profiles.unwrap_or(true),
+        };
 
         Ok(ResolvedConfig {
             privacy_enabled: self.privacy.enabled,
@@ -582,6 +663,9 @@ impl FileConfig {
             sandbox,
             routing,
             mcp_servers,
+            friends_enabled,
+            hub,
+            sync_kinds,
         })
     }
 }
@@ -593,6 +677,39 @@ fn range_check(what: &str, value: u64, min: u64, max: u64) -> Result<(), MimintE
         )));
     }
     Ok(())
+}
+
+fn validate_hub_section(section: &HubSection) -> Result<HubConfig, MimintError> {
+    let defaults = HubConfig::default();
+    let friends_port = section.friends_port.unwrap_or(defaults.friends_port);
+    let xiaozhi_port = section.xiaozhi_port.unwrap_or(defaults.xiaozhi_port);
+    let ota_port = section.ota_port.unwrap_or(defaults.ota_port);
+    for (name, port) in [
+        ("hub.friends_port", friends_port),
+        ("hub.xiaozhi_port", xiaozhi_port),
+        ("hub.ota_port", ota_port),
+    ] {
+        if port == 0 {
+            return Err(MimintError::Config(format!(
+                "{name} must be 1..=65535, got 0"
+            )));
+        }
+    }
+    if friends_port == xiaozhi_port || friends_port == ota_port || xiaozhi_port == ota_port {
+        return Err(MimintError::Config(format!(
+            "hub ports must be distinct: friends={friends_port}, xiaozhi={xiaozhi_port}, ota={ota_port}"
+        )));
+    }
+    let max_sessions = section.max_sessions.unwrap_or(defaults.max_sessions);
+    range_check("hub.max_sessions", max_sessions as u64, 1, 8)?;
+    Ok(HubConfig {
+        listen_lan: section.listen_lan.unwrap_or(defaults.listen_lan),
+        lab_mode: section.xiaozhi.lab_mode.unwrap_or(defaults.lab_mode),
+        friends_port,
+        xiaozhi_port,
+        ota_port,
+        max_sessions,
+    })
 }
 
 fn validate_agents_section(section: &AgentsSection) -> Result<AgentsConfig, MimintError> {
@@ -1205,5 +1322,59 @@ timeout_secs = 20
         assert!(FileConfig::parse(text).is_err());
         let text = "[[mcp-server]]\nname = \"x\"\ncommand = \"/bin/x\"\ntypo = 1\n";
         assert!(FileConfig::parse(text).is_err());
+    }
+
+    #[test]
+    fn friends_sections_default_to_loopback() {
+        let resolved = FileConfig::parse("").unwrap().validate().unwrap();
+        assert!(resolved.friends_enabled);
+        assert_eq!(resolved.hub.friends_port, 19120);
+        assert_eq!(resolved.hub.xiaozhi_port, 19121);
+        assert_eq!(resolved.hub.ota_port, 19122);
+        assert!(!resolved.hub.listen_lan);
+        assert!(!resolved.hub.lab_mode);
+        assert_eq!(resolved.hub.max_sessions, 4);
+        assert!(resolved.sync_kinds.soul);
+        assert!(resolved.sync_kinds.skills);
+        assert!(resolved.sync_kinds.notebook);
+        assert!(resolved.sync_kinds.todos_plans);
+        assert!(resolved.sync_kinds.profiles);
+    }
+
+    #[test]
+    fn friends_sections_resolve_custom_values() {
+        let text = "[friends]\nenabled = false\n\
+            [hub]\nlisten_lan = true\nfriends_port = 20120\nxiaozhi_port = 20121\nota_port = 20122\nmax_sessions = 2\n\
+            [hub.xiaozhi]\nlab_mode = true\n\
+            [sync]\nskills = false\nprofiles = false\n";
+        let resolved = FileConfig::parse(text).unwrap().validate().unwrap();
+        assert!(!resolved.friends_enabled);
+        assert!(resolved.hub.listen_lan);
+        assert!(resolved.hub.lab_mode);
+        assert_eq!(resolved.hub.friends_port, 20120);
+        assert_eq!(resolved.hub.xiaozhi_port, 20121);
+        assert_eq!(resolved.hub.ota_port, 20122);
+        assert_eq!(resolved.hub.max_sessions, 2);
+        assert!(resolved.sync_kinds.soul);
+        assert!(!resolved.sync_kinds.skills);
+        assert!(!resolved.sync_kinds.profiles);
+    }
+
+    #[test]
+    fn friends_sections_reject_bad_values() {
+        let dup = "[hub]\nfriends_port = 20120\nxiaozhi_port = 20120\n";
+        let err = FileConfig::parse(dup).unwrap().validate().err().unwrap();
+        assert!(err.to_string().contains("distinct"), "{err}");
+        let zero = "[hub]\nfriends_port = 0\n";
+        let err = FileConfig::parse(zero).unwrap().validate().err().unwrap();
+        assert!(err.to_string().contains("hub.friends_port"), "{err}");
+        for bad in ["[hub]\nmax_sessions = 0\n", "[hub]\nmax_sessions = 9\n"] {
+            let err = FileConfig::parse(bad).unwrap().validate().err().unwrap();
+            assert!(err.to_string().contains("hub.max_sessions"), "{err}");
+        }
+        let typo = "[hub]\ntypo = 1\n";
+        assert!(FileConfig::parse(typo).is_err());
+        let typo2 = "[hub.xiaozhi]\ntypo = true\n";
+        assert!(FileConfig::parse(typo2).is_err());
     }
 }
