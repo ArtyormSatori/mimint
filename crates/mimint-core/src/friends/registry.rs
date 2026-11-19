@@ -189,6 +189,10 @@ pub struct TombstoneRow {
     pub confirmed: bool,
 }
 
+/// One held SoulFile / naming_profile approval (F7-02):
+/// (sync_id, kind, peer_device_id, record_json, received_ms).
+pub type PendingApprovalRow = (String, String, String, String, u64);
+
 /// The registry database.
 pub struct DeviceRegistry {
     conn: Mutex<Connection>,
@@ -892,7 +896,7 @@ impl DeviceRegistry {
     /// Pending approvals, oldest first.
     pub fn list_pending_approvals(
         &self,
-    ) -> Result<Vec<(String, String, String, String, u64)>, MimintError> {
+    ) -> Result<Vec<PendingApprovalRow>, MimintError> {
         let conn = self.connection();
         let mut stmt = conn.prepare(
             "SELECT sync_id, kind, peer_device_id, record_json, received_ms

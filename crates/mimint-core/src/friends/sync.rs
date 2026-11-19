@@ -995,7 +995,7 @@ impl SyncEngine {
     /// Pending SoulFile / naming_profile approvals (F7-02).
     pub fn pending_sync_approvals(
         &self,
-    ) -> Result<Vec<(String, String, String, String, u64)>, MimintError> {
+    ) -> Result<Vec<crate::friends::registry::PendingApprovalRow>, MimintError> {
         self.registry.list_pending_approvals()
     }
 

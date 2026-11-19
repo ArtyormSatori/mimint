@@ -4941,7 +4941,7 @@ fn sync_soul_never_auto_applies_awaits_approval() {
         .save("agent-001", "SOUL.md", "You are a careful helper.")
         .unwrap();
     let (sa, sb) = paired_synced(&a, &b);
-    let (_ra, rb) = sync_both(&a, &b, sa, sb, &SyncKinds::all());
+    let (_ra, _rb) = sync_both(&a, &b, sa, sb, &SyncKinds::all());
     assert!(
         SoulStore::new(&b.dir).load("SOUL.md").is_err(),
         "SOUL must not arrive unapproved"
@@ -5030,8 +5030,10 @@ fn pairing_lockout_by_ip_survives_device_rotation() {
 fn hub_close_lan_stops_ota_and_revokes_tokens() {
     let b = Node::new("clo-b");
     register_uuid(&b, "test-uuid-0002");
-    let mut config = HubConfig::default();
-    config.listen_lan = true;
+    let config = HubConfig {
+        listen_lan: true,
+        ..HubConfig::default()
+    };
     let hub = start_hub(&b, config, MockBackend::new());
     assert!(hub.ota_open());
     let addr = format!("127.0.0.1:{}", hub.ota_port());
@@ -5067,7 +5069,7 @@ fn hub_close_lan_stops_ota_and_revokes_tokens() {
         .set_read_timeout(Some(std::time::Duration::from_secs(2)))
         .unwrap();
     let mut buf = [0u8; 1];
-    use std::io::Read as _;
+
     let read = stream.read(&mut buf);
     assert!(
         read.is_err(),
