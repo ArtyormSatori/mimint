@@ -418,6 +418,12 @@ pub struct ProviderClient {
     api_key: Option<Zeroizing<String>>,
     http: GuardedHttpClient,
     paid: bool,
+    /// Locked sampling for eval drills (F8.2-03): when set, every
+    /// chat request carries `temperature` + `seed` so repeated
+    /// measurements are reproducible. `None` = provider default
+    /// (the production path; only the eval harness locks it).
+    temperature: Option<f64>,
+    seed: Option<u64>,
 }
 
 impl ProviderClient {
@@ -505,7 +511,31 @@ impl ProviderClient {
             api_key: key,
             http,
             paid: !loopback,
+            temperature: None,
+            seed: None,
         })
+    }
+
+    /// Lock sampling for eval drills (F8.2-03): every subsequent
+    /// chat request carries this `temperature` and `seed`.
+    /// The drill harness locks `temperature = 0` + `seed = 0`
+    /// so repeated measurements are reproducible. `top_p` and
+    /// `num_ctx` are intentionally NOT set here: they stay at
+    /// the provider default and are recorded as unset in the
+    /// drill report.
+    pub fn set_sampling(&mut self, temperature: f64, seed: u64) {
+        self.temperature = Some(temperature);
+        self.seed = Some(seed);
+    }
+
+    /// Locked temperature, if any (for report metadata).
+    pub fn temperature(&self) -> Option<f64> {
+        self.temperature
+    }
+
+    /// Locked seed, if any (for report metadata).
+    pub fn seed(&self) -> Option<u64> {
+        self.seed
     }
 
     /// Full chat-completions URL. Contains no secret.
@@ -527,6 +557,14 @@ impl ProviderClient {
             "model": self.model,
             "messages": messages,
         });
+        // Locked sampling (F8.2-03): only when the harness locked
+        // it; production calls carry no sampling fields.
+        if let Some(temperature) = self.temperature {
+            body["temperature"] = serde_json::json!(temperature);
+        }
+        if let Some(seed) = self.seed {
+            body["seed"] = serde_json::json!(seed);
+        }
         if !tools.is_empty() {
             body["tools"] = serde_json::Value::Array(tools.to_vec());
             body["tool_choice"] = serde_json::Value::String("auto".to_string());

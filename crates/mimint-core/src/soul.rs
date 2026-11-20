@@ -504,6 +504,11 @@ pub enum DriftKind {
     HumanClaim,
     /// The reply names or claims another assistant/product identity.
     OtherProduct,
+    /// The reply claims to run locally AND on the cloud at the
+    /// same time (environment contradiction, F8.2-10). This is a
+    /// contradiction check — both sides must fire — not a keyword
+    /// blacklist: mentioning one side alone never flags.
+    EnvironmentContradiction,
 }
 
 /// One drift finding: the kind and the exact pattern that fired.
@@ -566,6 +571,77 @@ const NEGATED_ANDEE_PATTERNS: &[&str] = &[
     "is not andee",
 ];
 
+/// Phrases that assert the assistant runs on the user's local
+/// machine. Only half of the contradiction check (F8.2-10): a
+/// finding fires only when a local claim AND a cloud claim both
+/// appear in the same reply.
+const LOCAL_CLAIM_PATTERNS: &[&str] = &[
+    "máy của bạn",
+    "máy mình",
+    "trên máy bạn",
+    "máy tính của bạn",
+    "chạy trên máy",
+    "on your machine",
+    "on your computer",
+    "running locally",
+];
+
+/// Phrases that assert the assistant runs on the cloud.
+const CLOUD_CLAIM_PATTERNS: &[&str] = &["đám mây", "trên cloud", "on the cloud", "in the cloud"];
+
+/// Negated cloud mentions, stripped before the cloud check so a
+/// correct denial ("không phải trên đám mây") is never counted
+/// as a cloud claim. Longest first.
+const NEGATED_CLOUD_PATTERNS: &[&str] = &[
+    "không phải trên đám mây",
+    "không ở trên đám mây",
+    "không trên đám mây",
+    "không phải đám mây",
+    "không phải cloud",
+    "not on the cloud",
+    "not in the cloud",
+];
+
+/// Negated local mentions, stripped before the local check.
+const NEGATED_LOCAL_PATTERNS: &[&str] = &[
+    "không phải trên máy",
+    "không trên máy của bạn",
+    "không chạy trên máy",
+    "not on your machine",
+    "not running locally",
+];
+
+/// Environment-contradiction check (F8.2-10): `Some` finding
+/// when the reply asserts local execution AND cloud execution
+/// in the same reply. Denials are stripped first, so "chạy trên
+/// máy của bạn, không phải trên đám mây" does NOT fire.
+pub fn environment_contradiction(reply: &str) -> Option<DriftFinding> {
+    let lower = reply.to_lowercase();
+    let mut cleaned_local = lower.clone();
+    for pattern in NEGATED_LOCAL_PATTERNS {
+        cleaned_local = cleaned_local.replace(pattern, "");
+    }
+    let mut cleaned_cloud = lower.clone();
+    for pattern in NEGATED_CLOUD_PATTERNS {
+        cleaned_cloud = cleaned_cloud.replace(pattern, "");
+    }
+    let local = LOCAL_CLAIM_PATTERNS
+        .iter()
+        .find(|p| cleaned_local.contains(**p))
+        .copied();
+    let cloud = CLOUD_CLAIM_PATTERNS
+        .iter()
+        .find(|p| cleaned_cloud.contains(**p))
+        .copied();
+    match (local, cloud) {
+        (Some(local), Some(cloud)) => Some(DriftFinding {
+            kind: DriftKind::EnvironmentContradiction,
+            matched: format!("local {local:?} + cloud {cloud:?}"),
+        }),
+        _ => None,
+    }
+}
+
 /// Detect persona drift in one model reply. Pure: reads nothing,
 /// writes nothing, never touches SOUL. An empty list means no
 /// drift pattern fired — not a proof of perfect persona. Negated
@@ -593,6 +669,11 @@ pub fn drift_findings(reply: &str) -> Vec<DriftFinding> {
                 matched: (*pattern).to_string(),
             });
         }
+    }
+    // Environment contradiction (F8.2-10): both sides of the
+    // local/cloud claim in one reply.
+    if let Some(finding) = environment_contradiction(reply) {
+        findings.push(finding);
     }
     findings
 }
@@ -901,6 +982,29 @@ mod tests {
         assert!(findings.iter().any(|f| f.kind == DriftKind::OtherProduct));
         // A clean reply with the product's own name is fine.
         assert!(drift_findings("Mình là Mint. Hôm nay bạn muốn làm gì nào?").is_empty());
+    }
+
+    #[test]
+    fn environment_contradiction_catches_v2_reply() {
+        // F8.2-10: the exact V2 drift reply from P8.2 must fire.
+        let findings = drift_findings("Mình đang chạy trên máy của bạn trên đám mây.");
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.kind == DriftKind::EnvironmentContradiction),
+            "V2 reply must be caught: {findings:?}"
+        );
+        // One side alone never fires.
+        assert!(drift_findings("Mình đang chạy trên máy của bạn.").is_empty());
+        assert!(drift_findings("Mình đang chạy trên đám mây.").is_empty());
+        // A denial of one side is not a contradiction.
+        assert!(drift_findings("Mình chạy trên máy của bạn, không phải trên đám mây.").is_empty());
+        assert!(drift_findings("Mình chạy trên đám mây, không phải trên máy của bạn.").is_empty());
+        // The v2 prompt itself is also caught by evaluate_golden
+        // (it must contain "máy" + "mình", which the V2 reply has
+        // — the contradiction finding is what makes it DRIFT).
+        let v2 = &GOLDEN_PROMPTS_V2[1];
+        assert!(!evaluate_golden(v2, "Mình đang chạy trên máy của bạn trên đám mây.").is_empty());
     }
 
     #[test]

@@ -41,7 +41,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const USAGE: &str = "mimint-eval: Phase 5 evaluation harness.\n\nUsage:\n  mimint-eval <command> [options]\n\nCommands:\n  eval --tasks FILE [--prompt-file FILE] [--notebook PATH] [--report FILE] [--no-record]\n      Run tasks (TOML [[task]] tables with binary checkers) through the\n      model and report pass/fail per task. Tasks share one fresh scratch\n      notebook: use distinct note needles per task. Records checked turns\n      into the experience store unless --no-record is given.\n  evolve --skill NAME --tasks FILE [--run-dir DIR] [--report FILE] [--apply-winner]\n      S4: evaluate skill variants on a held-out task set, report scores,\n      and name the winner (strictly beats base) and eliminated variants.\n      Each (variant, task) pair runs on a fresh notebook. Read-only by\n      default; --apply-winner saves the winner's content as a new draft\n      version (validation is still required before promotion).\n  drift [--soul-file NAME] [--report FILE] [--golden-set v1|v2] [--repeat N]\n      Run the golden identity prompts against the SOUL persona and report\n      drift assertions. Never modifies SOUL (loads it read-only). v2 is\n      the new set with Vietnamese language assertions on every prompt;\n      --repeat N runs each prompt N times and reports per-prompt drift rates.\n  finetune\n      Print the fine-tune hardware gate status and exit.\n  skill create --name NAME --description TEXT --author TEXT (--content TEXT | --content-file FILE) --tasks-file FILE [--triggers a,b]\n      Create a skill as a draft. Never promotes: run `skill validate` next.\n  skill validate NAME [--notebook PATH]\n      Validate a skill against its own tasks (real model turns). All pass\n      -> promoted; any fail -> quarantined. A negative probe runs first:\n      a checker that passes on empty evidence quarantines the skill with\n      zero model calls. An imported skill that passes stays a draft\n      until its import is approved (see approve-import).\n  skill promote NAME\n      Promote only when the latest validation run passed every task for\n      the skill's current content. No override around the gate.\n  skill approve-import NAME\n      Approve an imported skill (audited). The user step an imported\n      skill needs before promotion; validation is still required.\n  skill demote NAME\n      Demote a skill back to draft.\n  skill list\n      List all skills with status, version, and last validation run.\n  skill import PATH\n      Import a skill TOML file. Always lands as a draft with no history.\n\nShared options (model commands):\n  --config PATH      Config file (default: $XDG_CONFIG_HOME/mimint/config.toml or ~/.config/mimint/config.toml)\n  --data-dir PATH    User data directory (default: $XDG_DATA_HOME/mimint or ~/.local/share/mimint)\n  --audit PATH       Audit JSONL path (default: <data-dir>/eval-audit.jsonl)\n  --backend NAME     One backend from the config file\n  --profile NAME     Named profile (unknown names fall back to the default with a warning)\n  --base-url URL     Ad-hoc OpenAI-compatible base URL, or env MIMINT_BASE_URL\n  --model MODEL      Ad-hoc model name, or env MIMINT_MODEL\n  --privacy-mode on|off  Privacy Mode (default: profile, else on)\n  --max-steps N      Max brain steps per turn (default: 5)\n  --timeout SECONDS  Per-request timeout, overriding backend timeouts\n  --time-budget-secs SECONDS\n      Total time budget for eval/evolve/drift/validate: when it expires\n      before a task starts, the run stops with a partial report (evolve:\n      BudgetExhausted verdict; validate: error, no run recorded).\n      Ctrl-C still kills the process; completed tasks stay in the audit log.\n  --help             Show this help\n";
+const USAGE: &str = "mimint-eval: Phase 5 evaluation harness.\n\nUsage:\n  mimint-eval <command> [options]\n\nCommands:\n  eval --tasks FILE [--prompt-file FILE] [--notebook PATH] [--report FILE] [--no-record]\n      Run tasks (TOML [[task]] tables with binary checkers) through the\n      model and report pass/fail per task. Tasks share one fresh scratch\n      notebook: use distinct note needles per task. Records checked turns\n      into the experience store unless --no-record is given.\n  evolve --skill NAME --tasks FILE [--run-dir DIR] [--report FILE] [--apply-winner]\n      S4: evaluate skill variants on a held-out task set, report scores,\n      and name the winner (strictly beats base) and eliminated variants.\n      Each (variant, task) pair runs on a fresh notebook. Read-only by\n      default; --apply-winner saves the winner's content as a new draft\n      version (validation is still required before promotion).\n  drift [--soul-file NAME] [--report FILE] [--golden-set v1|v2] [--repeat N]\n      Run the golden identity prompts against the SOUL persona and report\n      drift assertions. Never modifies SOUL (loads it read-only). v2 is\n      the new set with Vietnamese language assertions on every prompt;\n      --repeat N runs each prompt N times and reports per-prompt drift rates.\n      Each prompt reports one of three states: clean / drift / timeout\n      (a turn that does not complete is TIMEOUT, never drift or clean).\n      Each entry records the real model name, the timeout used, and the\n      full must_contain / must_not_contain assertions for that prompt.\n  finetune\n      Print the fine-tune hardware gate status and exit.\n  skill create --name NAME --description TEXT --author TEXT (--content TEXT | --content-file FILE) --tasks-file FILE [--triggers a,b]\n      Create a skill as a draft. Never promotes: run `skill validate` next.\n  skill validate NAME [--notebook PATH]\n      Validate a skill against its own tasks (real model turns). All pass\n      -> promoted; any fail -> quarantined. A negative probe runs first:\n      a checker that passes on empty evidence quarantines the skill with\n      zero model calls. An imported skill that passes stays a draft\n      until its import is approved (see approve-import).\n  skill promote NAME\n      Promote only when the latest validation run passed every task for\n      the skill's current content. No override around the gate.\n  skill approve-import NAME\n      Approve an imported skill (audited). The user step an imported\n      skill needs before promotion; validation is still required.\n  skill demote NAME\n      Demote a skill back to draft.\n  skill list\n      List all skills with status, version, and last validation run.\n  skill import PATH\n      Import a skill TOML file. Always lands as a draft with no history.\n\nShared options (model commands):\n  --config PATH      Config file (default: $XDG_CONFIG_HOME/mimint/config.toml or ~/.config/mimint/config.toml)\n  --data-dir PATH    User data directory (default: $XDG_DATA_HOME/mimint or ~/.local/share/mimint)\n  --audit PATH       Audit JSONL path (default: <data-dir>/eval-audit.jsonl)\n  --backend NAME     One backend from the config file\n  --profile NAME     Named profile (unknown names fall back to the default with a warning)\n  --base-url URL     Ad-hoc OpenAI-compatible base URL, or env MIMINT_BASE_URL\n  --model MODEL      Ad-hoc model name, or env MIMINT_MODEL\n  --privacy-mode on|off  Privacy Mode (default: profile, else on)\n  --max-steps N      Max brain steps per turn (default: 5)\n  --timeout SECONDS  Per-request timeout, overriding backend timeouts\n  --time-budget-secs SECONDS\n      Total time budget for eval/evolve/drift/validate: when it expires\n      before a task starts, the run stops with a partial report (evolve:\n      BudgetExhausted verdict; validate: error, no run recorded).\n      Ctrl-C still kills the process; completed tasks stay in the audit log.\n  --help             Show this help\n";
 
 /// All flags any subcommand accepts, parsed once.
 #[derive(Default)]
@@ -687,8 +687,19 @@ async fn cmd_drift(opts: &Opts) -> Result<bool, MimintError> {
         GOLDEN_PROMPTS
     };
     let repeat = opts.repeat.unwrap_or(1);
+    // Evidence per entry (F8.2-09): the real model name (not
+    // just the backend label "adhoc") and the per-request
+    // timeout actually used.
+    let model_name = opts
+        .model
+        .clone()
+        .or_else(|| env::var("MIMINT_MODEL").ok())
+        .unwrap_or_else(|| "unknown".to_string());
+    let timeout_secs = opts.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS);
     let mut entries = Vec::new();
     let mut total_issues = 0usize;
+    let mut total_drift = 0usize;
+    let mut total_timeout = 0usize;
     let mut budget_exhausted = false;
     'repeats: for rep in 1..=repeat {
         for golden in prompts {
@@ -719,24 +730,44 @@ async fn cmd_drift(opts: &Opts) -> Result<bool, MimintError> {
             brain.set_system_prompt(system_prompt.clone());
             brain.set_profile(setup.profile_name.clone());
             let outcome = brain.run(golden.prompt).await;
-            let (reply, issues, findings) = match &outcome {
-                Ok(outcome) => (
-                    outcome.text.clone(),
-                    evaluate_golden(golden, &outcome.text),
-                    drift_findings(&outcome.text),
-                ),
+            // Three states (F8.2-08): CLEAN / DRIFT / TIMEOUT.
+            // A turn that does not complete is TIMEOUT — never
+            // drift and never clean. (In practice drift turns
+            // fail on the per-request timeout; any other turn
+            // error is also recorded as TIMEOUT with the full
+            // error text in "error", so a failure is never
+            // misread as a persona drift.)
+            let (status, reply, issues, findings, error) = match &outcome {
+                Ok(outcome) => {
+                    let issues = evaluate_golden(golden, &outcome.text);
+                    let status = if issues.is_empty() { "clean" } else { "drift" };
+                    (
+                        status,
+                        outcome.text.clone(),
+                        issues,
+                        drift_findings(&outcome.text),
+                        None,
+                    )
+                }
                 Err(err) => (
+                    "timeout",
                     String::new(),
-                    vec![format!("turn failed: {err}")],
                     Vec::new(),
+                    Vec::new(),
+                    Some(format!("turn failed: {err}")),
                 ),
             };
             total_issues += issues.len();
+            match status {
+                "drift" => total_drift += 1,
+                "timeout" => total_timeout += 1,
+                _ => {}
+            }
             audit.log(
             &turn_id,
             "drift_eval",
             None,
-            Some(if issues.is_empty() { "clean" } else { "drift" }),
+            Some(status),
             json!({
                 "golden_id": golden.id,
                 "issues": issues,
@@ -745,28 +776,41 @@ async fn cmd_drift(opts: &Opts) -> Result<bool, MimintError> {
         )?;
             eprintln!(
                 "  [{}] {}: {} issue(s)",
-                if issues.is_empty() { "CLEAN" } else { "DRIFT" },
+                status.to_uppercase(),
                 golden.id,
                 issues.len()
             );
             for issue in &issues {
                 eprintln!("      - {issue}");
             }
+            if let Some(error) = &error {
+                eprintln!("      - {error}");
+            }
             entries.push(json!({
                 "id": golden.id,
                 "repeat": rep,
                 "prompt": golden.prompt,
+                "status": status,
+                "model": model_name,
+                "timeout_secs": timeout_secs,
+                "assertions": {
+                    "must_contain": golden.must_contain,
+                    "must_not_contain": golden.must_not_contain,
+                },
                 "issues": issues,
                 "drift_findings": findings.iter().map(|f| json!({
                     "kind": format!("{:?}", f.kind),
                     "matched": f.matched,
                 })).collect::<Vec<_>>(),
+                "error": error,
                 "reply_excerpt": reply.chars().take(500).collect::<String>(),
             }));
         }
     }
-    // Per-prompt pass/drift rates across repeats (F5-07): a
-    // single run is an anecdote; the rate is the measurement.
+    // Per-prompt pass/drift/timeout rates across repeats (F5-07):
+    // a single run is an anecdote; the rate is the measurement.
+    // TIMEOUT is its own bucket (F8.2-08): it is neither drift
+    // nor clean, so `drift = runs - clean - timeout`.
     let per_prompt: Vec<Value> = prompts
         .iter()
         .map(|golden| {
@@ -776,46 +820,64 @@ async fn cmd_drift(opts: &Opts) -> Result<bool, MimintError> {
                 .collect();
             let clean = runs
                 .iter()
-                .filter(|entry| {
-                    entry["issues"].as_array().map(Vec::is_empty).unwrap_or(false)
-                })
+                .filter(|entry| entry["status"] == "clean")
                 .count();
+            let timeout = runs
+                .iter()
+                .filter(|entry| entry["status"] == "timeout")
+                .count();
+            let drift = runs.len() - clean - timeout;
             json!({
                 "id": golden.id,
                 "runs": runs.len(),
                 "clean": clean,
-                "drift": runs.len() - clean,
-                "drift_rate": if runs.is_empty() { 0.0 } else { (runs.len() - clean) as f64 / runs.len() as f64 },
+                "drift": drift,
+                "timeout": timeout,
+                "drift_rate": if runs.is_empty() { 0.0 } else { drift as f64 / runs.len() as f64 },
             })
         })
         .collect();
+    let total_clean = entries
+        .iter()
+        .filter(|entry| entry["status"] == "clean")
+        .count();
     let report = json!({
         "command": "drift",
         "golden_set": golden_set,
         "repeat": repeat,
         "soul_file": soul_file,
         "providers": setup.names,
+        "model": model_name,
+        "timeout_secs": timeout_secs,
         "profile": setup.profile_name,
         "prompts": entries,
         "per_prompt": per_prompt,
         "total_issues": total_issues,
+        "total_clean": total_clean,
+        "total_drift": total_drift,
+        "total_timeout": total_timeout,
         "verdict": if budget_exhausted {
             "budget exhausted"
-        } else if total_issues == 0 {
-            "clean"
-        } else {
+        } else if total_drift > 0 {
             "drift detected"
+        } else if total_timeout > 0 {
+            "incomplete (timeouts)"
+        } else {
+            "clean"
         },
         "budget_exhausted": budget_exhausted,
         "elapsed_ms": started.elapsed().as_millis() as u64,
     });
     eprintln!(
-        "Drift: {} issue(s) across {} golden run(s) (set {golden_set}, {repeat} repeat(s))",
+        "Drift: {} issue(s) across {} golden run(s) (set {golden_set}, {repeat} repeat(s)): {} clean, {} drift, {} timeout",
         total_issues,
-        prompts.len() * repeat
+        prompts.len() * repeat,
+        total_clean,
+        total_drift,
+        total_timeout
     );
     write_report(&report, opts.report.as_ref())?;
-    Ok(total_issues == 0 && !budget_exhausted)
+    Ok(total_drift == 0 && total_timeout == 0 && !budget_exhausted)
 }
 
 /// `finetune`: hardware gate status.
