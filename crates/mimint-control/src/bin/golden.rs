@@ -76,6 +76,10 @@ mod gate {
     use mimint_control::tools::{register_body_tools, PrivacyFlag};
     use mimint_control::verify::BodyStepVerifier;
     use mimint_core::{
+        best_of_n::{
+            select, BestOfNConfig, BonBudget, RolloutCandidate, BON_MAX_STEPS, DEFAULT_TOKEN_BUDGET,
+        },
+        ledger::DEFAULT_MAX_TOKENS,
         Approver, AuditLog, Brain, CallContext, ChatMessage, EgressPolicy, FunctionCall,
         GuardedHttpClient, MimintError, Notebook, Provider, ProviderClient, Registry, ToolCall,
     };
@@ -272,11 +276,12 @@ mod gate {
         base_url: String,
         model: String,
         ollama_timeout_secs: u64,
+        best_of_n: Option<usize>,
         font: Option<String>,
         font_size: Option<f32>,
     }
 
-    const USAGE: &str = "usage: golden --harness <evalharness-bin> --workdir <dir> --log <out.jsonl> [--tasks GT-01,GT-02,GT-03,GT-04|none] [--ollama-task GT-01|none] [--ollama-tasks GT-01,...,GT-08] [--drill] [--report <report.json>] [--base-url URL] [--model NAME] [--ollama-timeout-secs N] [--font <ttf>] [--font-size N]\n       --drill runs all 8 tasks through real Ollama, writes a 4-section JSON report. Exit codes (F8.2-01): 0 = harness ran clean AND every requested task passed; 1 = system/config/connection/parse error; 2 = measured but below threshold (full drill 8/8, subset n/n).\n       --ollama-tasks (list) wins over legacy --ollama-task (single) when both are given.";
+    const USAGE: &str = "usage: golden --harness <evalharness-bin> --workdir <dir> --log <out.jsonl> [--tasks GT-01,GT-02,GT-03,GT-04|none] [--ollama-task GT-01|none] [--ollama-tasks GT-01,...,GT-08] [--drill] [--report <report.json>] [--base-url URL] [--model NAME] [--ollama-timeout-secs N] [--font <ttf>] [--font-size N] [--best-of-n N]\n       --best-of-n N runs each Ollama task N times (temperature 0.7, seeds 0..N-1) and picks the winner by oracle pass, then majority, then first; N must be 1..=5, default OFF. Best-of-N refuses a paid backend (cap_usd=0).\n       --drill runs all 8 tasks through real Ollama, writes a 4-section JSON report. Exit codes (F8.2-01): 0 = harness ran clean AND every requested task passed; 1 = system/config/connection/parse error; 2 = measured but below threshold (full drill 8/8, subset n/n).\n       --ollama-tasks (list) wins over legacy --ollama-task (single) when both are given.";
 
     fn parse_args() -> Result<GateArgs, String> {
         let args: Vec<String> = std::env::args().collect();
@@ -300,6 +305,7 @@ mod gate {
         // Local CPU inference is slow (a trivial request measured
         // ~28s on vega); the default leaves room for a full turn.
         let mut ollama_timeout_secs: u64 = 600;
+        let mut best_of_n: Option<usize> = None;
         let mut font = None;
         let mut font_size = None;
         let mut i = 1;
@@ -343,6 +349,17 @@ mod gate {
                 "--model" => model = next(&mut i),
                 "--ollama-timeout-secs" => {
                     ollama_timeout_secs = next(&mut i).parse().unwrap_or(600);
+                }
+                "--best-of-n" => {
+                    let value = next(&mut i);
+                    match value.parse::<usize>() {
+                        Ok(n) if (1..=5).contains(&n) => best_of_n = Some(n),
+                        _ => {
+                            return Err(format!(
+                                "--best-of-n N must be 1..=5, got {value}\n{USAGE}"
+                            ))
+                        }
+                    }
                 }
                 "--font" => font = Some(next(&mut i)),
                 "--font-size" => {
@@ -397,6 +414,7 @@ mod gate {
             base_url,
             model,
             ollama_timeout_secs,
+            best_of_n,
             font,
             font_size,
         })
@@ -601,26 +619,60 @@ mod gate {
         // a pipeline bug). Outside drill mode they do not gate;
         // in drill mode they do (exit 0 iff all PASS).
         if let Some(provider) = &ollama_provider {
+            // Best-of-N refuses a paid backend outright (D-P83-4):
+            // the Phase 2 cap_usd=0 lock already blocks paid
+            // backends for turns; this is the explicit second check
+            // for the multiplied cost of N rollouts.
+            if args.best_of_n.is_some_and(|n| n > 1) && provider.is_paid() {
+                return Err(
+                    "Best-of-N refused: paid backend (cap_usd=0 locks paid backends; Best-of-N multiplies cost by N)"
+                        .to_string(),
+                );
+            }
             for task_id in &args.ollama_tasks {
                 let Some(task) = TASKS.iter().find(|t| t.id == task_id) else {
                     return Err(format!("unknown ollama task: {task_id}"));
                 };
                 let prompt = ollama_prompt(task);
-                let mut record = run_one_task(
-                    task,
-                    &format!("ollama:{}", args.model),
-                    Arc::clone(provider) as Arc<dyn Provider>,
-                    &actor,
-                    &frames,
-                    &notebook,
-                    Arc::clone(&audit),
-                    &mut oracle,
-                    &canvas_version,
-                    &font,
-                    &font_size,
-                    Some(&prompt),
-                )
-                .await;
+                let mut record = match args.best_of_n.filter(|&n| n > 1) {
+                    Some(n) => {
+                        run_best_of_n_task(
+                            task,
+                            &format!("ollama:{}", args.model),
+                            &args.base_url,
+                            &args.model,
+                            args.ollama_timeout_secs,
+                            &actor,
+                            &frames,
+                            &notebook,
+                            Arc::clone(&audit),
+                            &mut oracle,
+                            &canvas_version,
+                            &font,
+                            &font_size,
+                            &prompt,
+                            n,
+                        )
+                        .await
+                    }
+                    None => {
+                        run_one_task(
+                            task,
+                            &format!("ollama:{}", args.model),
+                            Arc::clone(provider) as Arc<dyn Provider>,
+                            &actor,
+                            &frames,
+                            &notebook,
+                            Arc::clone(&audit),
+                            &mut oracle,
+                            &canvas_version,
+                            &font,
+                            &font_size,
+                            Some(&prompt),
+                        )
+                        .await
+                    }
+                };
                 record["http_timeout_secs"] = json!(args.ollama_timeout_secs);
                 let passed = record["pass"].as_bool().unwrap_or(false);
                 ollama_results.push((task.id.to_string(), passed));
@@ -639,6 +691,16 @@ mod gate {
                         ", not gating"
                     }
                 );
+                if let Some(bon) = record.get("best_of_n") {
+                    println!(
+                        "  best-of-n: n={} winner={:?} rule={} single_shot_pass={} stop_reason={:?}",
+                        bon["n"],
+                        bon["selection"]["winner"],
+                        bon["selection"]["rule"],
+                        bon["single_shot_pass"],
+                        bon["stop_reason"]
+                    );
+                }
             }
         }
 
@@ -708,7 +770,7 @@ mod gate {
                     "seed": 0,
                     "top_p": Value::Null,
                     "num_ctx": Value::Null,
-                    "note": "temperature=0 + seed=0 locked for drill/--ollama-tasks (F8.2-03); top_p/num_ctx stay at the Ollama default (not set by the harness)",
+                    "note": "temperature=0 + seed=0 locked for drill/--ollama-tasks (F8.2-03); top_p/num_ctx stay at the Ollama default (not set by the harness). When --best-of-n N is given, rollouts use temperature 0.7 with seeds base_seed + i instead (D-P83-2); per-task sampling is recorded in best_of_n.",
                     "session_reset_per_task": true,
                 }),
             };
@@ -1158,6 +1220,36 @@ mod gate {
         } else {
             "DEV (GT-01..GT-08)".to_string()
         };
+        // Best-of-N summary (P8.3): counts only over the records
+        // that actually ran Best-of-N; null when none did.
+        let bon_records: Vec<&Value> = ollama_records
+            .iter()
+            .filter(|r| r.get("best_of_n").is_some())
+            .copied()
+            .collect();
+        let best_of_n_summary = if bon_records.is_empty() {
+            Value::Null
+        } else {
+            let bon_pass = bon_records
+                .iter()
+                .filter(|r| r.get("pass").and_then(|p| p.as_bool()).unwrap_or(false))
+                .count();
+            let single_shot_pass = bon_records
+                .iter()
+                .filter(|r| {
+                    r.get("best_of_n")
+                        .and_then(|b| b.get("single_shot_pass"))
+                        .and_then(|p| p.as_bool())
+                        .unwrap_or(false)
+                })
+                .count();
+            json!({
+                "tasks": bon_records.len(),
+                "best_of_n_pass": bon_pass,
+                "single_shot_pass": single_shot_pass,
+                "note": "best_of_n_pass and single_shot_pass share the same sampling (temperature 0.7, seeds base+i) and are comparable with each other; neither compares with the temp-0 single-shot baseline (D-P83-2/7).",
+            })
+        };
         let (load_avg_1m, mem_free_mb) = load_context();
         let (latency_median, latency_p95) = median_p95(latencies);
         let (preflight_json, warmup_json) = match preflight {
@@ -1190,6 +1282,7 @@ mod gate {
             "commit_sha": extra.commit_sha,
             "seed_prompt_ref": extra.seed_prompt_ref,
             "exit_reason": extra.exit_reason,
+            "best_of_n": best_of_n_summary,
             "validation_set": "held-out sealed (phase5/HELDOUT-SEAL.md) — NOT used in this run",
             "summary": {
                 "harness": if harness_ok { "OK" } else { "ERROR" },
@@ -1289,20 +1382,31 @@ mod gate {
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn run_one_task(
-        task: &GoldenTask,
-        provider_name: &str,
+    /// One raw rollout: a fresh Brain + one turn + the oracle
+    /// clicks and input-frame hash it produced. Shared by
+    /// single-shot and Best-of-N so both measure the same thing
+    /// (P8.3).
+    struct TurnRun {
+        turn: Result<mimint_core::brain::TurnOutcome, MimintError>,
+        clicks: Vec<(i32, i32)>,
+        input_sha256: Option<String>,
+        latency_ms: u64,
+    }
+
+    /// Run one turn for one task with the given provider. The
+    /// oracle is reset first so the clicks read back belong to
+    /// this rollout only.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_turn_once(
         provider: Arc<dyn Provider>,
         actor: &BodyActor,
         frames: &Arc<FrameStore>,
         notebook: &Arc<Notebook>,
         audit: Arc<AuditLog>,
         oracle: &mut FileOracle,
-        canvas_version: &str,
-        font: &str,
-        font_size: &str,
-        prompt_override: Option<&str>,
-    ) -> Value {
+        prompt: &str,
+        turn_id: &str,
+    ) -> Result<TurnRun, String> {
         oracle.reset_events();
         let first_frame_before = frames.len();
         let mut registry = Registry::new();
@@ -1314,42 +1418,25 @@ mod gate {
         );
         let approver = Arc::new(AutoAllow);
         let registry = Arc::new(registry);
-        let mut brain = match Brain::new(
+        let mut brain = Brain::new(
             provider,
             registry,
             Some(approver),
             Arc::clone(&audit),
             Arc::clone(notebook),
-            format!("golden-{}", task.id),
+            turn_id,
             "agent-001",
             6,
-        ) {
-            Ok(brain) => brain,
-            Err(err) => {
-                return fail_record(
-                    task,
-                    provider_name,
-                    canvas_version,
-                    font,
-                    font_size,
-                    None,
-                    0,
-                    &format!("brain setup failed: {err}"),
-                );
-            }
-        };
+        )
+        .map_err(|err| format!("brain setup failed: {err}"))?;
         brain.set_step_verifier(Arc::new(BodyStepVerifier::new(
             actor.clone(),
             Arc::clone(frames),
         )));
-        let prompt = prompt_override
-            .map(str::to_string)
-            .unwrap_or_else(|| format!("Click the element: {}", task.ref_expr));
         let start = Instant::now();
-        let turn = brain.run(&prompt).await;
+        let turn = brain.run(prompt).await;
         let latency_ms = start.elapsed().as_millis() as u64;
         let clicks = oracle.received_clicks();
-        let predicted = clicks.last().copied();
         // The input image: the first frame stored during this task,
         // PNG-encoded and hashed. If the turn stored no frame, the
         // input hash is null and the task fails. Frame ids are
@@ -1364,6 +1451,65 @@ mod gate {
             None
         }
         .flatten();
+        Ok(TurnRun {
+            turn,
+            clicks,
+            input_sha256,
+            latency_ms,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn run_one_task(
+        task: &GoldenTask,
+        provider_name: &str,
+        provider: Arc<dyn Provider>,
+        actor: &BodyActor,
+        frames: &Arc<FrameStore>,
+        notebook: &Arc<Notebook>,
+        audit: Arc<AuditLog>,
+        oracle: &mut FileOracle,
+        canvas_version: &str,
+        font: &str,
+        font_size: &str,
+        prompt_override: Option<&str>,
+    ) -> Value {
+        let prompt = prompt_override
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("Click the element: {}", task.ref_expr));
+        let run = match run_turn_once(
+            provider,
+            actor,
+            frames,
+            notebook,
+            Arc::clone(&audit),
+            oracle,
+            &prompt,
+            &format!("golden-{}", task.id),
+        )
+        .await
+        {
+            Ok(run) => run,
+            Err(err) => {
+                return fail_record(
+                    task,
+                    provider_name,
+                    canvas_version,
+                    font,
+                    font_size,
+                    None,
+                    0,
+                    &err,
+                );
+            }
+        };
+        let TurnRun {
+            turn,
+            clicks,
+            input_sha256,
+            latency_ms,
+        } = run;
+        let predicted = clicks.last().copied();
         let (pass, fail_reason_code, reason) = classify_turn(
             turn.as_ref().err().map(|err| err.to_string()),
             clicks.len(),
@@ -1397,6 +1543,257 @@ mod gate {
         if let Ok(outcome) = &turn {
             record["tools_used"] = json!(outcome.tools_used);
             record["steps"] = json!(outcome.steps);
+        }
+        record
+    }
+
+    /// Fresh Ollama client for one Best-of-N rollout (P8.3).
+    /// The shared drill client is locked to temperature 0 / seed 0
+    /// and `ProviderClient` is not `Clone`, so each rollout builds
+    /// its own client with its own sampling (D-P83-2).
+    fn build_rollout_client(
+        base_url: &str,
+        model: &str,
+        timeout_secs: u64,
+        temperature: f64,
+        seed: u64,
+    ) -> Result<Arc<dyn Provider>, String> {
+        let http = GuardedHttpClient::new(
+            EgressPolicy::privacy_off(),
+            Duration::from_secs(timeout_secs),
+        )
+        .map_err(|err| format!("cannot build HTTP client: {err}"))?;
+        let mut client = ProviderClient::new(base_url, model, None, http)
+            .map_err(|err| format!("cannot build Ollama provider: {err}"))?;
+        client.set_sampling(temperature, seed);
+        Ok(Arc::new(client))
+    }
+
+    /// Best-of-N for one golden task (P8.3): N rollouts at
+    /// temperature 0.7 with seeds `base_seed + i`, then the
+    /// deterministic selection (oracle pass > majority > first).
+    /// The winner's point is graded by the SAME binary checker as
+    /// a single-shot turn; the report carries both the selected
+    /// pass and the single-shot (rollout 0) pass at the same
+    /// sampling, so the two are comparable (D-P83-7).
+    #[allow(clippy::too_many_arguments)]
+    async fn run_best_of_n_task(
+        task: &GoldenTask,
+        provider_name: &str,
+        base_url: &str,
+        model: &str,
+        timeout_secs: u64,
+        actor: &BodyActor,
+        frames: &Arc<FrameStore>,
+        notebook: &Arc<Notebook>,
+        audit: Arc<AuditLog>,
+        oracle: &mut FileOracle,
+        canvas_version: &str,
+        font: &str,
+        font_size: &str,
+        prompt: &str,
+        n: usize,
+    ) -> Value {
+        let config = match BestOfNConfig::new(n, DEFAULT_TOKEN_BUDGET) {
+            Ok(config) => config,
+            Err(err) => {
+                return fail_record(
+                    task,
+                    provider_name,
+                    canvas_version,
+                    font,
+                    font_size,
+                    None,
+                    0,
+                    &format!("best-of-n config rejected: {err}"),
+                );
+            }
+        };
+        let mut budget = BonBudget::new(&config, "agent-001");
+        let mut candidates: Vec<RolloutCandidate> = Vec::new();
+        let mut stop_reason: Option<String> = None;
+        for i in 0..config.n {
+            // Cost-cap stop (D-P83-4): a failed reserve ends the
+            // rollouts at once — never silently, never partially.
+            let reservation = match budget.reserve_rollout(BON_MAX_STEPS, DEFAULT_MAX_TOKENS) {
+                Ok(reservation) => reservation,
+                Err(err) => {
+                    stop_reason = Some(format!("cost_cap_exceeded: {err}"));
+                    break;
+                }
+            };
+            let rollout_provider = match build_rollout_client(
+                base_url,
+                model,
+                timeout_secs,
+                BestOfNConfig::rollout_temperature(),
+                config.rollout_seed(i),
+            ) {
+                Ok(provider) => provider,
+                Err(err) => {
+                    let _ = reservation.settle_unmeasured();
+                    candidates.push(RolloutCandidate {
+                        index: i,
+                        predicted: None,
+                        text: String::new(),
+                        tools_used: Vec::new(),
+                        steps: 0,
+                        latency_ms: 0,
+                        turn_error: Some(err),
+                        clicks_recorded: 0,
+                        has_frame: false,
+                        input_sha256: None,
+                    });
+                    continue;
+                }
+            };
+            let run = run_turn_once(
+                rollout_provider,
+                actor,
+                frames,
+                notebook,
+                Arc::clone(&audit),
+                &mut *oracle,
+                prompt,
+                &format!("golden-{}-bon{i}", task.id),
+            )
+            .await;
+            // Settle unmeasured: the full reserve is charged as an
+            // estimate, by design (D-P83-4) — the real Ollama usage
+            // does not travel through TurnOutcome.
+            let _ = reservation.settle_unmeasured();
+            match run {
+                Ok(run) => {
+                    let predicted = run.clicks.last().copied();
+                    let (text, tools_used, steps) = run
+                        .turn
+                        .as_ref()
+                        .map(|outcome| {
+                            (
+                                outcome.text.clone(),
+                                outcome.tools_used.clone(),
+                                outcome.steps,
+                            )
+                        })
+                        .unwrap_or_default();
+                    candidates.push(RolloutCandidate {
+                        index: i,
+                        predicted,
+                        text,
+                        tools_used,
+                        steps,
+                        latency_ms: run.latency_ms,
+                        turn_error: run.turn.as_ref().err().map(|err| err.to_string()),
+                        clicks_recorded: run.clicks.len(),
+                        has_frame: run.input_sha256.is_some(),
+                        input_sha256: run.input_sha256,
+                    });
+                }
+                Err(err) => {
+                    candidates.push(RolloutCandidate {
+                        index: i,
+                        predicted: None,
+                        text: String::new(),
+                        tools_used: Vec::new(),
+                        steps: 0,
+                        latency_ms: 0,
+                        turn_error: Some(err),
+                        clicks_recorded: 0,
+                        has_frame: false,
+                        input_sha256: None,
+                    });
+                }
+            }
+        }
+        if candidates.is_empty() {
+            return fail_record(
+                task,
+                provider_name,
+                canvas_version,
+                font,
+                font_size,
+                None,
+                0,
+                &format!(
+                    "best-of-n: no candidate collected ({})",
+                    stop_reason.unwrap_or_else(|| "unknown".to_string())
+                ),
+            );
+        }
+        let selection = select(&candidates, |point| in_box(point, task.box_));
+        let winner = &candidates[selection.winner.unwrap_or(0)];
+        // Grade the SELECTED point with the same binary checker.
+        let (pass, fail_reason_code, reason) = classify_turn(
+            winner.turn_error.clone(),
+            winner.clicks_recorded,
+            winner.predicted,
+            winner.has_frame,
+            task.box_,
+        );
+        // Single-shot (rollout 0 alone, same sampling) for the
+        // within-run comparison (D-P83-7).
+        let first = &candidates[0];
+        let (single_shot_pass, _, _) = classify_turn(
+            first.turn_error.clone(),
+            first.clicks_recorded,
+            first.predicted,
+            first.has_frame,
+            task.box_,
+        );
+        let (box_area_px2, box_area_pct) = box_area(task.box_);
+        let total_latency_ms: u64 = candidates.iter().map(|c| c.latency_ms).sum();
+        let mut record = json!({
+            "task": task.id,
+            "ref_expr": task.ref_expr,
+            "box": [task.box_.0, task.box_.1, task.box_.2, task.box_.3],
+            "box_area_px2": box_area_px2,
+            "box_area_pct": box_area_pct,
+            "predicted": winner.predicted.map(|(x, y)| json!([x, y])),
+            "clicks_recorded": winner.clicks_recorded,
+            "pass": pass,
+            "fail_reason_code": fail_reason_code,
+            "retry_count": 0,
+            "latency_ms": total_latency_ms,
+            "input_sha256": winner.input_sha256.clone(),
+            "canvas_version": canvas_version,
+            "font": font,
+            "font_size": font_size,
+            "provider": provider_name,
+            "display_size": [1024, 768],
+            "tools_used": winner.tools_used.clone(),
+            "steps": winner.steps,
+            "best_of_n": {
+                "enabled": true,
+                "n": config.n,
+                "temperature": BestOfNConfig::rollout_temperature(),
+                "base_seed": config.base_seed,
+                "candidates": candidates.iter().map(|c| json!({
+                    "index": c.index,
+                    "predicted": c.predicted.map(|(x, y)| json!([x, y])),
+                    "clicks_recorded": c.clicks_recorded,
+                    "latency_ms": c.latency_ms,
+                    "steps": c.steps,
+                    "tools_used": c.tools_used.clone(),
+                    "turn_error": c.turn_error.clone(),
+                    "input_sha256": c.input_sha256.clone(),
+                })).collect::<Vec<_>>(),
+                "selection": {
+                    "winner": selection.winner,
+                    "rule": selection.rule.as_str(),
+                    "oracle_passed": selection.oracle_passed,
+                    "votes": selection.votes.iter().map(|&(point, count)| json!({
+                        "point": point.map(|(x, y)| json!([x, y])),
+                        "votes": count,
+                    })).collect::<Vec<_>>(),
+                },
+                "single_shot_pass": single_shot_pass,
+                "token_budget": config.token_budget,
+                "tokens_reserved": budget.reserved_total(),
+                "stop_reason": stop_reason,
+            },
+        });
+        if let Some(reason) = reason {
+            record["fail_reason"] = json!(reason);
         }
         record
     }
@@ -1900,6 +2297,76 @@ mod gate {
             assert_eq!(median_p95(vec![10]), (10, 10));
             assert_eq!(median_p95(vec![10, 20, 30, 40]), (25, 40));
             assert_eq!(median_p95(vec![100, 200, 300]), (200, 300));
+        }
+
+        #[test]
+        fn parse_best_of_n_flag_and_bounds() {
+            let mut flags = base_flags();
+            flags.extend(["--best-of-n", "3"]);
+            assert_eq!(
+                parse_args_from(&args_of(&flags)).unwrap().best_of_n,
+                Some(3)
+            );
+            // Off by default.
+            assert_eq!(
+                parse_args_from(&args_of(&base_flags())).unwrap().best_of_n,
+                None
+            );
+            // N=1 is legal (equivalent to single-shot); 0, 6 and
+            // non-numbers are not.
+            let mut one = base_flags();
+            one.extend(["--best-of-n", "1"]);
+            assert_eq!(parse_args_from(&args_of(&one)).unwrap().best_of_n, Some(1));
+            for bad in ["0", "6", "abc"] {
+                let mut flags = base_flags();
+                flags.extend(["--best-of-n", bad]);
+                assert!(
+                    parse_args_from(&args_of(&flags)).is_err(),
+                    "--best-of-n {bad} must be rejected"
+                );
+            }
+        }
+
+        #[test]
+        fn report_includes_best_of_n_summary() {
+            let mut records = vec![sample_record("GT-01", true, 100, "aaa")];
+            records[0]["best_of_n"] = json!({
+                "enabled": true, "n": 3, "single_shot_pass": false,
+            });
+            let mut failed = sample_record("GT-05", false, 200, "aaa");
+            failed["best_of_n"] = json!({
+                "enabled": true, "n": 3, "single_shot_pass": true,
+            });
+            records.push(failed);
+            let report = build_report(
+                "drill",
+                "canvas-v1",
+                "DejaVuSans.ttf",
+                "16",
+                &None,
+                "qwen2.5:3b",
+                "http://127.0.0.1:11434/v1",
+                &records,
+                &test_extra(),
+            );
+            assert_eq!(report["best_of_n"]["tasks"], 2);
+            assert_eq!(report["best_of_n"]["best_of_n_pass"], 1);
+            assert_eq!(report["best_of_n"]["single_shot_pass"], 1);
+            // A run without any Best-of-N record carries a null
+            // summary instead of a fabricated count.
+            let plain = vec![sample_record("GT-01", true, 100, "aaa")];
+            let plain_report = build_report(
+                "drill",
+                "canvas-v1",
+                "DejaVuSans.ttf",
+                "16",
+                &None,
+                "qwen2.5:3b",
+                "http://127.0.0.1:11434/v1",
+                &plain,
+                &test_extra(),
+            );
+            assert!(plain_report["best_of_n"].is_null());
         }
     }
 } // mod gate

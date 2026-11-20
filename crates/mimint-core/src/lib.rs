@@ -11,6 +11,7 @@
 
 pub mod agents;
 pub mod audit;
+pub mod best_of_n;
 pub mod brain;
 pub mod cancel;
 pub mod claude;
