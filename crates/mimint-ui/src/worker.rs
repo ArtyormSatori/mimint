@@ -103,7 +103,10 @@ pub enum WorkerRequest {
     /// tool. The loop replies on `reply` when the child ends
     /// (or refuses at once when the limits forbid it).
     SpawnChild {
-        spec: ChildSpec,
+        // P8.5: boxed like TaskOutcome::Done — ChildSpec carries
+        // the parent TurnRuntime snapshot (~384 bytes) and trips
+        // `clippy::large_enum_variant` unboxed.
+        spec: Box<ChildSpec>,
         reply: Sender<ChildResult>,
     },
     /// Rebuild the provider chain with a new Privacy Mode and order.
@@ -1745,7 +1748,7 @@ impl LoopState {
                 self.handle_finished(runtime, &agent_id, outcome, backend);
             }
             WorkerRequest::SpawnChild { spec, reply } => {
-                self.handle_spawn_child(runtime, spec, reply);
+                self.handle_spawn_child(runtime, *spec, reply);
             }
             WorkerRequest::Rebuild { privacy_on, order } => {
                 // Privacy discipline (P4.6.6): the new mode takes
@@ -1881,7 +1884,7 @@ fn map_task_outcome(
     result: Result<Result<mimint_core::TurnOutcome, MimintError>, Box<dyn std::any::Any + Send>>,
 ) -> TaskOutcome {
     match result {
-        Ok(Ok(outcome)) => TaskOutcome::Done(outcome),
+        Ok(Ok(outcome)) => TaskOutcome::Done(Box::new(outcome)),
         Ok(Err(err)) if err.is_cancelled() => TaskOutcome::Cancelled,
         Ok(Err(err)) => {
             if let Some(scope) = err.budget_scope() {

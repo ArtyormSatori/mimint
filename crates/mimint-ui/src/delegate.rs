@@ -175,7 +175,7 @@ impl Tool for DelegateTool {
         };
         self.request_tx
             .send(WorkerRequest::SpawnChild {
-                spec,
+                spec: Box::new(spec),
                 reply: reply_tx,
             })
             .map_err(|_| Self::tool_error("subagent_unavailable: the worker loop is gone"))?;

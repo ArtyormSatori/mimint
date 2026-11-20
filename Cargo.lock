@@ -2100,6 +2100,7 @@ dependencies = [
  "mimint-core",
  "serde_json",
  "tokio",
+ "winit",
 ]
 
 [[package]]

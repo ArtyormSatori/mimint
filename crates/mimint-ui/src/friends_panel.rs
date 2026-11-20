@@ -1006,6 +1006,15 @@ impl FriendsPanel {
                     .selectable_label(self.view == view, view.label())
                     .clicked()
                 {
+                    // P8.5 wart (a): the status line is transient
+                    // feedback for the tab where the action
+                    // happened (e.g. "Đã tạo thẻ ... đang chờ peer
+                    // quyết định" from the Devices tab). Clear it
+                    // on a tab switch so it cannot leak under an
+                    // unrelated tab (e.g. Conflicts).
+                    if self.view != view {
+                        self.status.clear();
+                    }
                     self.view = view;
                 }
             }
@@ -1119,7 +1128,11 @@ impl FriendsPanel {
         }
         for peer in peers {
             ui.separator();
-            ui.horizontal(|ui| {
+            // P8.5 wart (b): `horizontal` never wraps, so the
+            // trust columns were cut off at the right edge of a
+            // 1024px window ("... key generatio..."). Wrap the
+            // peer row instead.
+            ui.horizontal_wrapped(|ui| {
                 ui.label(format!("{} ({:.8})", peer.name, peer.device_id));
                 // F7-21: the trust scale is the LOCAL grant —
                 // label it as such, and show what the peer

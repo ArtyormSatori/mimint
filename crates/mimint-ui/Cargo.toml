@@ -17,3 +17,13 @@ serde_json = "1"
 # Phase 6: `time` for the coordinator's bounded join (same crate,
 # 0 new packages).
 tokio = { version = "1", features = ["rt-multi-thread", "time"] }
+
+# P8.5 (F-P84-ANDROID-1): winit's android-activity dep ships with
+# neither game-activity nor native-activity enabled, so `cargo check`
+# for aarch64-linux-android fails to compile android-activity. Enable
+# native-activity (the standard path for a winit GUI app) via a direct
+# Android-only winit dep; cargo feature unification applies it to the
+# winit eframe already pulls in. Android-only: no effect on any other
+# target, and Cargo.lock changes only in feature flags.
+[target.'cfg(target_os = "android")'.dependencies]
+winit = { version = "=0.30.13", features = ["android-native-activity"] }

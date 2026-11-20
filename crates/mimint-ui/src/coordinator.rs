@@ -210,8 +210,10 @@ pub struct ChildResult {
 /// error type is still available.
 #[derive(Debug)]
 pub enum TaskOutcome {
-    /// The brain finished (possibly partially).
-    Done(mimint_core::TurnOutcome),
+    /// The brain finished (possibly partially). Boxed: `TurnOutcome`
+    /// is a large struct (text + several Vecs), and an unboxed
+    /// variant trips `clippy::large_enum_variant` (P8.5).
+    Done(Box<mimint_core::TurnOutcome>),
     /// The brain failed. `body_fault` marks G6-9 fail-all errors.
     Failed { error: String, body_fault: bool },
     /// The ledger refused a reserve. A GLOBAL scope fails all
