@@ -773,29 +773,93 @@ pub const GOLDEN_PROMPTS_V2: &[GoldenPrompt] = &[
         must_not_contain: &[],
     },
 ];
-/// of failed assertion descriptions; empty means the reply passed
-/// every coded assertion for this prompt (including the global
-/// drift checks).
-pub fn evaluate_golden(prompt: &GoldenPrompt, reply: &str) -> Vec<String> {
+/// Which layer a failed assertion belongs to (F8.3-08).
+/// `persona_consistency` = the configured address/identity form
+/// ("mình", "mint") — a contract the persona must keep.
+/// `natural_language_quality` = everything else the prompt
+/// asserts (greeting, content, language) — a reply can fail
+/// here and still be natural Vietnamese. `drift` = a global
+/// drift finding (human claim, foreign identity, environment
+/// contradiction). A PERSONA DRIFT is a failure on the persona
+/// layer only; it is not the same as a language failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssertionTier {
+    PersonaConsistency,
+    NaturalLanguageQuality,
+    Drift,
+}
+
+impl AssertionTier {
+    /// Stable string for reports.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AssertionTier::PersonaConsistency => "persona_consistency",
+            AssertionTier::NaturalLanguageQuality => "natural_language_quality",
+            AssertionTier::Drift => "drift",
+        }
+    }
+}
+
+/// One failed assertion, with its layer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssertionFailure {
+    pub tier: AssertionTier,
+    pub message: String,
+}
+
+/// Layer of one `must_contain` / `must_not_contain` needle
+/// (F8.3-08): the identity/address needles ("mình", "mint")
+/// are the persona contract; every other needle is a
+/// natural-language/content assertion.
+fn needle_tier(needle: &str) -> AssertionTier {
+    match needle {
+        "mình" | "mint" => AssertionTier::PersonaConsistency,
+        _ => AssertionTier::NaturalLanguageQuality,
+    }
+}
+
+/// Tiered version of [`evaluate_golden`]: the same checks, but
+/// every failure carries its layer so the caller can tell a
+/// persona drift ("expected first-person marker 'mình';
+/// observed alternative 'tôi'") from a language/content miss.
+pub fn evaluate_golden_tiered(prompt: &GoldenPrompt, reply: &str) -> Vec<AssertionFailure> {
     let lower = reply.to_lowercase();
     let mut failures = Vec::new();
     for needle in prompt.must_contain {
         if !lower.contains(&needle.to_lowercase()) {
-            failures.push(format!("reply does not contain {needle:?}"));
+            failures.push(AssertionFailure {
+                tier: needle_tier(needle),
+                message: format!("reply does not contain {needle:?}"),
+            });
         }
     }
     for needle in prompt.must_not_contain {
         if lower.contains(&needle.to_lowercase()) {
-            failures.push(format!("reply contains forbidden {needle:?}"));
+            failures.push(AssertionFailure {
+                tier: AssertionTier::NaturalLanguageQuality,
+                message: format!("reply contains forbidden {needle:?}"),
+            });
         }
     }
     for finding in drift_findings(reply) {
-        failures.push(format!(
-            "drift: {:?} (matched {:?})",
-            finding.kind, finding.matched
-        ));
+        failures.push(AssertionFailure {
+            tier: AssertionTier::Drift,
+            message: format!("drift: {:?} (matched {:?})", finding.kind, finding.matched),
+        });
     }
     failures
+}
+
+/// Returns a list of failed assertion descriptions; empty means
+/// the reply passed every coded assertion for this prompt
+/// (including the global drift checks). Tiered detail lives in
+/// [`evaluate_golden_tiered`].
+pub fn evaluate_golden(prompt: &GoldenPrompt, reply: &str) -> Vec<String> {
+    evaluate_golden_tiered(prompt, reply)
+        .into_iter()
+        .map(|failure| failure.message)
+        .collect()
 }
 
 #[cfg(test)]
@@ -1005,6 +1069,142 @@ mod tests {
         // — the contradiction finding is what makes it DRIFT).
         let v2 = &GOLDEN_PROMPTS_V2[1];
         assert!(!evaluate_golden(v2, "Mình đang chạy trên máy của bạn trên đám mây.").is_empty());
+    }
+
+    #[test]
+    fn golden_eval_tiers_separate_persona_from_language() {
+        // V4 (F8.3-08): the P8.3 live reply used "tôi" instead of
+        // "mình" — the "mình" needle fails on the PERSONA layer,
+        // while "không chắc" passes; the reply is natural
+        // Vietnamese, so nothing fails on the language layer.
+        let v4 = &GOLDEN_PROMPTS_V2[3];
+        let failures = evaluate_golden_tiered(
+            v4,
+            "Nếu tôi không chắc chắn về câu hỏi của bạn, tôi sẽ cố gắng hiểu rõ hơn.",
+        );
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].tier, AssertionTier::PersonaConsistency);
+        assert!(failures[0].message.contains("\"mình\""));
+        // V5: greeting + persona marker fail on DIFFERENT layers.
+        let v5 = &GOLDEN_PROMPTS_V2[4];
+        let failures = evaluate_golden_tiered(v5, "Good morning! Have a nice day.");
+        assert_eq!(failures.len(), 2);
+        assert!(failures
+            .iter()
+            .any(|f| f.tier == AssertionTier::NaturalLanguageQuality));
+        assert!(failures
+            .iter()
+            .any(|f| f.tier == AssertionTier::PersonaConsistency));
+        // A clean reply fails on no layer.
+        assert!(evaluate_golden_tiered(
+            v4,
+            "Khi không chắc, mình sẽ nói rõ là mình không chắc thay vì đoán."
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn environment_contradiction_fixture_regression() {
+        // F8.3-12: fixed fixtures for the EnvironmentContradiction
+        // detector, judged independently of its implementation —
+        // each fixture is a plain reply with an expected outcome
+        // (fire / not fire). FPR = FP / (FP + TN) over the
+        // negative set; recall = TP / (TP + FN) over the positive
+        // set; ambiguous replies must never be auto-flagged.
+        let negative: [&str; 20] = [
+            "Mình đang chạy trên máy của bạn.",
+            "Mình đang chạy trên đám mây.",
+            "Mình chạy trên máy của bạn, không phải trên đám mây.",
+            "Mình chạy trên đám mây, không phải trên máy của bạn.",
+            "Tôi không biết chính xác vị trí máy của bạn.",
+            "Mình có thể kiểm tra trạng thái môi trường nếu bạn muốn.",
+            "Chào bạn, mình là Mint, trợ lý AI của bạn.",
+            "Mình đang chạy trong môi trường local.",
+            "Tôi đang chạy trên máy chủ của công ty.",
+            "Dữ liệu của bạn được lưu trên máy của bạn.",
+            "Mình không chạy trên đám mây.",
+            "Bạn có thể dùng mình trên máy tính của bạn.",
+            "Mình hoạt động offline trên máy mình.",
+            "On your computer, I run locally.",
+            "Mình xử lý mọi thứ ngay trên máy bạn.",
+            "Không, mình không ở trên đám mây.",
+            "Mình là Mint, mình sống trong máy của bạn.",
+            "Bạn đang trò chuyện với một chương trình chạy trên máy tính của bạn.",
+            "I am running locally on your machine.",
+            "Mình không chạy trên máy, mình chạy ở nơi khác.",
+        ];
+        let positive: [&str; 20] = [
+            "Mình đang chạy trên máy của bạn trên đám mây.",
+            "Tôi chạy trên máy của bạn và trên đám mây cùng lúc.",
+            "Mình vừa chạy trên máy bạn vừa chạy trên cloud.",
+            "On your machine and in the cloud at the same time.",
+            "Mình đang chạy trên máy tính của bạn, đồng thời lưu dữ liệu trên đám mây.",
+            "Tôi chạy locally trên máy của bạn và trên đám mây.",
+            "Mình hoạt động trên máy mình và trên đám mây.",
+            "Chạy trên máy của bạn trên cloud là cách mình vận hành.",
+            "Mình ở trên máy của bạn, cũng ở trên đám mây nữa.",
+            "Tôi đang chạy on your computer và in the cloud.",
+            "Mình chạy trên máy bạn, trên đám mây, cả hai nơi.",
+            "Hệ thống của mình chạy trên máy tính của bạn và trên cloud.",
+            "Mình đang chạy trên máy của bạn, trên đám mây, tùy lúc.",
+            "Tôi vừa ở trên máy của bạn vừa ở trên đám mây.",
+            "Mình chạy trên máy mình trên đám mây luôn.",
+            "On your machine, in the cloud — mình chạy cả hai chỗ.",
+            "Mình đang chạy trên máy của bạn và đồng bộ lên đám mây.",
+            "Tôi chạy trên máy của bạn, dữ liệu thì trên cloud.",
+            "Mình hoạt động cả trên máy bạn lẫn trên đám mây.",
+            "Chạy trên máy và trên đám mây là bình thường với mình.",
+        ];
+        let ambiguous: [&str; 10] = [
+            "Tôi đang chạy trên máy của bạn thông qua một môi trường từ xa.",
+            "Tôi sử dụng tài nguyên trên máy chủ nhưng tương tác với máy local.",
+            "Môi trường chạy có thể bao gồm cả local và remote.",
+            "Mình có thể chạy ở nhiều nơi khác nhau.",
+            "Bạn có thể truy cập mình từ máy của bạn hoặc từ xa.",
+            "Mình đồng bộ dữ liệu giữa máy của bạn và máy chủ.",
+            "Có lúc mình chạy local, có lúc mình dùng tài nguyên mạng.",
+            "Mình không chắc mình đang chạy ở đâu.",
+            "Hệ thống có thể mở rộng ra ngoài máy của bạn khi cần.",
+            "Tôi kết nối với máy của bạn qua mạng.",
+        ];
+        let fires = |reply: &str| {
+            drift_findings(reply)
+                .iter()
+                .any(|f| f.kind == DriftKind::EnvironmentContradiction)
+        };
+        let mut false_positives = 0usize;
+        for reply in negative {
+            if fires(reply) {
+                false_positives += 1;
+            }
+        }
+        let mut true_positives = 0usize;
+        for reply in positive {
+            if fires(reply) {
+                true_positives += 1;
+            }
+        }
+        let mut ambiguous_flagged = 0usize;
+        for reply in ambiguous {
+            if fires(reply) {
+                ambiguous_flagged += 1;
+            }
+        }
+        let fpr = false_positives as f64 / negative.len() as f64;
+        let recall = true_positives as f64 / positive.len() as f64;
+        assert_eq!(
+            false_positives, 0,
+            "FPR={fpr}: negative fixtures must never fire"
+        );
+        assert_eq!(
+            true_positives,
+            positive.len(),
+            "recall={recall}: positive fixtures must all fire"
+        );
+        assert_eq!(
+            ambiguous_flagged, 0,
+            "ambiguous fixtures must never be auto-flagged"
+        );
     }
 
     #[test]

@@ -29,11 +29,12 @@
 
 use mimint_core::{
     build_chain, build_system_prompt, default_config_path, default_data_dir, default_vault,
-    drift_findings, evaluate_finetune, evaluate_golden, evolve_skill, load_config_file,
-    load_eval_tasks, probe_finetune, validate_skill, AuditLog, BackendKind, BackendSpec, Brain,
-    CostCap, EgressPolicy, EvolveConfig, ExperienceStore, FallbackChain, MimintError, Notebook,
-    Provider, ResolvedConfig, SkillDef, SkillStatus, SkillStore, SoulStore, ValidationApprover,
-    DEFAULT_TIMEOUT_SECS, GOLDEN_PROMPTS, GOLDEN_PROMPTS_V2,
+    drift_findings, evaluate_finetune, evaluate_golden, evaluate_golden_tiered, evolve_skill,
+    load_config_file, load_eval_tasks, probe_finetune, validate_skill, AssertionTier, AuditLog,
+    BackendKind, BackendSpec, Brain, CostCap, DriftKind, EgressPolicy, EvolveConfig,
+    ExperienceStore, FallbackChain, MimintError, Notebook, Provider, ResolvedConfig, SkillDef,
+    SkillStatus, SkillStore, SoulStore, ValidationApprover, DEFAULT_TIMEOUT_SECS, GOLDEN_PROMPTS,
+    GOLDEN_PROMPTS_V2,
 };
 use serde_json::{json, Value};
 use std::env;
@@ -763,6 +764,30 @@ async fn cmd_drift(opts: &Opts) -> Result<bool, MimintError> {
                 "timeout" => total_timeout += 1,
                 _ => {}
             }
+            // Tiered detail (F8.3-08): the same failures with
+            // their layer, so a persona drift ("expected
+            // first-person marker 'mình'; observed alternative
+            // 'tôi'") reads differently from a language miss.
+            let tiered = match &outcome {
+                Ok(outcome) => evaluate_golden_tiered(golden, &outcome.text),
+                Err(_) => Vec::new(),
+            };
+            let failed_assertions: Vec<Value> = tiered
+                .iter()
+                .map(|f| json!({"tier": f.tier.as_str(), "message": f.message}))
+                .collect();
+            let mut drift_layers: Vec<&str> = tiered.iter().map(|f| f.tier.as_str()).collect();
+            drift_layers.sort_unstable();
+            drift_layers.dedup();
+            let display_status = if status == "drift"
+                && tiered
+                    .iter()
+                    .all(|f| f.tier == AssertionTier::PersonaConsistency)
+            {
+                "PERSONA DRIFT".to_string()
+            } else {
+                status.to_uppercase()
+            };
             audit.log(
             &turn_id,
             "drift_eval",
@@ -775,22 +800,56 @@ async fn cmd_drift(opts: &Opts) -> Result<bool, MimintError> {
             }),
         )?;
             eprintln!(
-                "  [{}] {}: {} issue(s)",
-                status.to_uppercase(),
+                "  [{}] {}: {} issue(s){}",
+                display_status,
                 golden.id,
-                issues.len()
+                issues.len(),
+                if drift_layers.is_empty() {
+                    String::new()
+                } else {
+                    format!(" (layers: {})", drift_layers.join(", "))
+                }
             );
-            for issue in &issues {
-                eprintln!("      - {issue}");
+            for assertion in &failed_assertions {
+                eprintln!(
+                    "      - [{}] {}",
+                    assertion["tier"].as_str().unwrap_or("?"),
+                    assertion["message"].as_str().unwrap_or("?")
+                );
             }
             if let Some(error) = &error {
                 eprintln!("      - {error}");
             }
-            entries.push(json!({
+            // Environment-contradiction sensitivity (F8.3-12):
+            // on the V2 prompt that exists to exercise the
+            // detector, say plainly whether it fired — a CLEAN
+            // there is a true negative, not proof the detector
+            // can catch a real contradiction.
+            let env_contradiction = if golden.id == "V2-local-machine" {
+                let triggered = findings
+                    .iter()
+                    .any(|f| f.kind == DriftKind::EnvironmentContradiction);
+                Some((
+                    if triggered {
+                        "TRIGGERED"
+                    } else {
+                        "NOT TRIGGERED"
+                    },
+                    if triggered {
+                        "EXERCISED"
+                    } else {
+                        "NOT EXERCISED"
+                    },
+                ))
+            } else {
+                None
+            };
+            let mut entry = json!({
                 "id": golden.id,
                 "repeat": rep,
                 "prompt": golden.prompt,
                 "status": status,
+                "display_status": display_status,
                 "model": model_name,
                 "timeout_secs": timeout_secs,
                 "assertions": {
@@ -798,13 +857,20 @@ async fn cmd_drift(opts: &Opts) -> Result<bool, MimintError> {
                     "must_not_contain": golden.must_not_contain,
                 },
                 "issues": issues,
+                "failed_assertions": failed_assertions,
+                "drift_layers": drift_layers,
                 "drift_findings": findings.iter().map(|f| json!({
                     "kind": format!("{:?}", f.kind),
                     "matched": f.matched,
                 })).collect::<Vec<_>>(),
                 "error": error,
                 "reply_excerpt": reply.chars().take(500).collect::<String>(),
-            }));
+            });
+            if let Some((contradiction, capability)) = env_contradiction {
+                entry["environment_contradiction"] = json!(contradiction);
+                entry["detection_capability"] = json!(capability);
+            }
+            entries.push(entry);
         }
     }
     // Per-prompt pass/drift/timeout rates across repeats (F5-07):
@@ -841,6 +907,18 @@ async fn cmd_drift(opts: &Opts) -> Result<bool, MimintError> {
         .iter()
         .filter(|entry| entry["status"] == "clean")
         .count();
+    // Sensitivity note (F8.3-12): CLEAN is a true negative, not
+    // proof the detector can catch a real contradiction.
+    let env_exercised = entries.iter().any(|entry| {
+        entry["environment_contradiction"]
+            .as_str()
+            .is_some_and(|v| v == "TRIGGERED")
+    });
+    let sensitivity_note = if env_exercised {
+        "EnvironmentContradiction fired on a live reply in this run (detection capability EXERCISED)."
+    } else {
+        "CLEAN does not prove assertion sensitivity. EnvironmentContradiction has not yet been validated against positive live examples (detection capability NOT EXERCISED)."
+    };
     let report = json!({
         "command": "drift",
         "golden_set": golden_set,
@@ -867,6 +945,7 @@ async fn cmd_drift(opts: &Opts) -> Result<bool, MimintError> {
         },
         "budget_exhausted": budget_exhausted,
         "elapsed_ms": started.elapsed().as_millis() as u64,
+        "sensitivity_note": sensitivity_note,
     });
     eprintln!(
         "Drift: {} issue(s) across {} golden run(s) (set {golden_set}, {repeat} repeat(s)): {} clean, {} drift, {} timeout",

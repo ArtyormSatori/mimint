@@ -13,7 +13,7 @@ use crate::cancel::{CancelReport, CancelToken, KillLedger, WaitAnyCancelled};
 use crate::emotion::{handle_emotion_args, EmotionCode};
 use crate::error::MimintError;
 use crate::guards::{Approver, GuardedExecutor};
-use crate::ledger::{CostLedger, DEFAULT_MAX_TOKENS};
+use crate::ledger::{CostLedger, TokenUsage, DEFAULT_MAX_TOKENS};
 use crate::memory::ExperienceStore;
 use crate::notebook::Notebook;
 use crate::provider::{CallContext, ChatMessage, Provider};
@@ -73,6 +73,16 @@ pub struct TurnOutcome {
     /// these into a system note; cancelled turns produce no
     /// outcome and no note.
     pub sandbox_denied_paths: Vec<String>,
+    /// Measured token usage summed over this turn's provider
+    /// calls (F8.3-04): prompt + completion tokens the provider
+    /// actually reported. Zero when no call reported usage —
+    /// the caller then falls back to the reserve estimate.
+    pub tokens_measured: TokenUsage,
+    /// Provider calls that reported usage. Compare with
+    /// `steps`: when equal (and `steps` > 0) every call was
+    /// measured and the turn's token numbers are
+    /// provider-reported, not estimates.
+    pub usage_reported_calls: usize,
 }
 
 /// Maximum characters of any single retrieved section injected
@@ -606,6 +616,11 @@ impl Brain {
         let mut verified: Vec<(String, bool)> = Vec::new();
         let mut step_verifications: Vec<(String, VerificationStatus)> = Vec::new();
         let mut sandbox_denied_paths: Vec<String> = Vec::new();
+        // Measured token usage (F8.3-04): summed from the
+        // provider-reported `usage` on each chat reply, when the
+        // provider sends one. Zero when nothing was reported.
+        let mut tokens_measured = TokenUsage::default();
+        let mut usage_reported_calls: usize = 0;
         let mut pending: Vec<PendingVerification> = Vec::new();
         let mut emotions: Vec<EmotionCode> = Vec::new();
         let mut emotion_fallbacks: usize = 0;
@@ -694,6 +709,13 @@ impl Brain {
                     }
                 }
             };
+            // Measured usage travels on the reply (F8.3-04):
+            // sum it before the reply moves into the history.
+            if let Some(usage) = reply.usage {
+                tokens_measured.prompt_tokens += usage.prompt_tokens;
+                tokens_measured.completion_tokens += usage.completion_tokens;
+                usage_reported_calls += 1;
+            }
             let calls = reply.tool_calls.clone().unwrap_or_default();
             if calls.is_empty() {
                 let text = reply.content.clone().unwrap_or_default();
@@ -745,6 +767,8 @@ impl Brain {
                     verification_kind,
                     sandbox_denied_paths: sandbox_denied_paths.clone(),
                     step_verifications,
+                    tokens_measured,
+                    usage_reported_calls,
                 });
             }
             messages.push(reply);
@@ -1081,6 +1105,8 @@ impl Brain {
             verification_kind,
             sandbox_denied_paths,
             step_verifications,
+            tokens_measured,
+            usage_reported_calls,
         })
     }
 
@@ -2358,6 +2384,8 @@ mod tests {
             verification_kind: VerificationKind::None,
             sandbox_denied_paths: Vec::new(),
             skills_used: Vec::new(),
+            tokens_measured: TokenUsage::default(),
+            usage_reported_calls: 0,
         };
         let checker = crate::skills::Checker::Contains {
             needle: "sữa".to_string(),

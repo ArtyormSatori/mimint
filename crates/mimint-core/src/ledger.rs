@@ -87,6 +87,21 @@ impl TokenUsage {
             completion_tokens: completion,
         })
     }
+
+    /// Parse Ollama-native usage: top-level `prompt_eval_count`
+    /// / `eval_count` (the `/api/chat` and `/api/generate`
+    /// response shape). Returns `None` when either field is
+    /// missing or not a number — partial usage is not usage.
+    /// Ollama's OpenAI-compatible endpoint returns the OpenAI
+    /// shape instead; see [`TokenUsage::from_openai`].
+    pub fn from_ollama(value: &serde_json::Value) -> Option<Self> {
+        let prompt = value.get("prompt_eval_count")?.as_u64()?;
+        let completion = value.get("eval_count")?.as_u64()?;
+        Some(Self {
+            prompt_tokens: prompt,
+            completion_tokens: completion,
+        })
+    }
 }
 
 /// How tokens were charged by a settlement.
@@ -767,6 +782,17 @@ mod tests {
             })
         );
         assert_eq!(TokenUsage::from_claude(&serde_json::json!({})), None);
+        let ollama = serde_json::json!({"prompt_eval_count": 120, "eval_count": 45});
+        assert_eq!(
+            TokenUsage::from_ollama(&ollama),
+            Some(TokenUsage {
+                prompt_tokens: 120,
+                completion_tokens: 45
+            })
+        );
+        let partial_ollama = serde_json::json!({"prompt_eval_count": 120});
+        assert_eq!(TokenUsage::from_ollama(&partial_ollama), None);
+        assert_eq!(TokenUsage::from_ollama(&serde_json::json!({})), None);
     }
 
     #[test]

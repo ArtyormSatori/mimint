@@ -380,6 +380,32 @@ struct ChatCompletionResponse {
     /// Both fields must be present for the usage to count.
     #[serde(default)]
     usage: Option<OpenAiUsage>,
+    /// Ollama-native usage fields (top level), when the provider
+    /// sends those instead of (or next to) the OpenAI-style
+    /// block. The OpenAI block wins when both are present.
+    #[serde(default)]
+    prompt_eval_count: Option<u64>,
+    #[serde(default)]
+    eval_count: Option<u64>,
+}
+
+/// Pick the token usage out of a parsed chat-completions
+/// response (F8.3-04): the OpenAI-style `usage` block wins;
+/// Ollama's native top-level `prompt_eval_count` / `eval_count`
+/// is the fallback. `None` when neither shape is complete —
+/// partial usage is not usage.
+fn response_usage(response: &ChatCompletionResponse) -> Option<TokenUsage> {
+    response
+        .usage
+        .as_ref()
+        .and_then(|usage| usage.to_token_usage())
+        .or(match (response.prompt_eval_count, response.eval_count) {
+            (Some(prompt_tokens), Some(completion_tokens)) => Some(TokenUsage {
+                prompt_tokens,
+                completion_tokens,
+            }),
+            _ => None,
+        })
 }
 
 #[derive(Debug, Deserialize)]
@@ -596,17 +622,22 @@ impl ProviderClient {
             .json()
             .await
             .map_err(|e| MimintError::Provider(format!("cannot parse provider response: {e}")))?;
+        // Token usage first: reading it borrows `parsed`, and the
+        // choices move below.
+        let usage = response_usage(&parsed);
         let mut message = parsed
             .choices
             .into_iter()
             .next()
             .map(|choice| choice.message)
             .ok_or_else(|| MimintError::Provider("provider returned no choices".to_string()))?;
-        // Token usage (§3.3): attached to the message so the
-        // fallback chain can settle the attempt's reserve with
-        // measured usage. Absent or partial usage stays `None` —
-        // the chain then settles the reserve as an estimate.
-        message.usage = parsed.usage.and_then(|usage| usage.to_token_usage());
+        // Token usage (§3.3, F8.3-04): attached to the message
+        // so the caller can settle the attempt's reserve with
+        // measured usage. OpenAI-style `usage` wins; Ollama's
+        // native `prompt_eval_count` / `eval_count` is the
+        // fallback. Absent or partial usage stays `None` —
+        // the caller then settles the reserve as an estimate.
+        message.usage = usage;
         // Normalize tool-call arguments at intake so the history never
         // carries a value that breaks a later provider (see
         // `normalize_tool_call_args`).
@@ -887,6 +918,64 @@ mod tests {
         assert!(new_named_client("http://127.0.0.1:11434", None, false).is_ok());
         // Remote https with a key needs no plaintext opt-in.
         assert!(new_named_client("https://example.com", Some("k"), false).is_ok());
+    }
+
+    #[test]
+    fn response_usage_prefers_openai_block_over_ollama_native() {
+        let both = ChatCompletionResponse {
+            choices: vec![],
+            usage: Some(OpenAiUsage {
+                prompt_tokens: Some(10),
+                completion_tokens: Some(20),
+            }),
+            prompt_eval_count: Some(100),
+            eval_count: Some(200),
+        };
+        assert_eq!(
+            response_usage(&both),
+            Some(TokenUsage {
+                prompt_tokens: 10,
+                completion_tokens: 20
+            })
+        );
+        let native_only = ChatCompletionResponse {
+            choices: vec![],
+            usage: None,
+            prompt_eval_count: Some(100),
+            eval_count: Some(200),
+        };
+        assert_eq!(
+            response_usage(&native_only),
+            Some(TokenUsage {
+                prompt_tokens: 100,
+                completion_tokens: 200
+            })
+        );
+        // Partial in either shape is not usage.
+        let partial_native = ChatCompletionResponse {
+            choices: vec![],
+            usage: None,
+            prompt_eval_count: Some(100),
+            eval_count: None,
+        };
+        assert_eq!(response_usage(&partial_native), None);
+        let partial_openai = ChatCompletionResponse {
+            choices: vec![],
+            usage: Some(OpenAiUsage {
+                prompt_tokens: Some(10),
+                completion_tokens: None,
+            }),
+            prompt_eval_count: None,
+            eval_count: None,
+        };
+        assert_eq!(response_usage(&partial_openai), None);
+        let none = ChatCompletionResponse {
+            choices: vec![],
+            usage: None,
+            prompt_eval_count: None,
+            eval_count: None,
+        };
+        assert_eq!(response_usage(&none), None);
     }
 
     #[test]

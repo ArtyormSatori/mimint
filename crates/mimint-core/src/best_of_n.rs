@@ -32,18 +32,41 @@
 //! ([`MimintError::BudgetExhausted`]) stops the rollouts at once
 //! and the selection falls back to the candidates collected so far,
 //! flagged loudly (`stop_reason: "cost_cap_exceeded"`). The reserve
-//! is settled unmeasured at the end of the rollout (full reserve
-//! charged as an estimate — conservative by design: the real
-//! Ollama usage does not travel through `TurnOutcome`). Paid
-//! backends stay locked by the Phase 2 gate (`cap_usd = 0`); the
-//! runner additionally refuses a paid provider unless the caller
-//! explicitly passes `paid_ok = true`.
+//! is settled measured when the provider reported usage on every
+//! call of the rollout, otherwise unmeasured (full reserve charged
+//! as an estimate — conservative by design). The reserve is an
+//! ACCOUNTING assumption, not an enforced provider limit:
+//! `max_tokens` is NOT sent to the provider, so one real call may
+//! generate more than 4096 tokens while the reserve counts 4096.
+//! With the default budget the cap cannot trigger on reserves
+//! alone: N <= 5 reserves at most 5 * 24_576 = 122_880 tokens,
+//! below the 150_000 budget — the cap binds only with a smaller
+//! budget (see `budget_stops_rollouts_loudly`) or future retry
+//! accounting. Paid backends are refused by the runner through
+//! [`require_local_backend`]: Best-of-N with N > 1 runs only on a
+//! local (loopback) backend; N = 1 is the single-shot path and
+//! takes any backend the caller built.
+//!
+//! Consensus is NOT correctness: a text-only model has systematic
+//! default offsets (for example toward the screen center), so two
+//! rollouts can agree on the same WRONG point and outvote one
+//! right one. Majority is a tie-breaker among rollouts, never a
+//! verifier — only the oracle (or the ordinary checker grading
+//! the winner) can say a point is right.
+//!
+//! Wall-clock deadlines (F8.3-05): each rollout is bounded by
+//! [`BON_ROLLOUT_DEADLINE_SECS`] and each task by N times that
+//! (the runner enforces both with `tokio::time::timeout` around
+//! the rollout; a killed rollout is recorded as a turn error,
+//! never silently dropped). Rollouts run SEQUENTIALLY, never in
+//! parallel: N parallel local-model calls would saturate the
+//! machine they are measured on.
 //!
 //! Default is OFF: [`BestOfNConfig::disabled`]. Nothing in this
 //! module enables itself.
 
 use crate::error::MimintError;
-use crate::ledger::{CostLedger, PendingReservation};
+use crate::ledger::{CostLedger, PendingReservation, TokenUsage};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -63,6 +86,18 @@ pub const BON_TEMPERATURE: f64 = 0.7;
 pub const BON_MAX_STEPS: usize = 6;
 /// Default base seed; rollout `i` uses `base_seed + i`.
 pub const DEFAULT_BASE_SEED: u64 = 0;
+/// Majority cluster radius in pixels (F8.3-01): two predicted
+/// points within this Euclidean distance count as agreeing.
+/// 16px is small against the 1024x768 screen but large against
+/// the few-pixel jitter of a text-only model re-aiming at the
+/// same element.
+pub const MAJORITY_CLUSTER_RADIUS_PX: i32 = 16;
+/// Wall-clock deadline per rollout (F8.3-05): ~2x the median
+/// rollout latency measured in P8.3 (~95s). A rollout slower
+/// than this is killed by the runner and recorded as a turn
+/// error, never silently dropped. The per-task deadline is N
+/// times this (rollouts run sequentially).
+pub const BON_ROLLOUT_DEADLINE_SECS: u64 = 200;
 
 /// Configuration for one Best-of-N selection. Disabled by default.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -150,6 +185,28 @@ pub struct RolloutCandidate {
     pub has_frame: bool,
     /// SHA-256 of this rollout's input frame, if any.
     pub input_sha256: Option<String>,
+    /// Measured token usage for this rollout, when the provider
+    /// reported usage on every call of the turn (`Some`) — else
+    /// `None` and the report falls back to the reserve estimate
+    /// (F8.3-04).
+    pub tokens_measured: Option<TokenUsage>,
+}
+
+/// Refuse a paid backend for Best-of-N with N > 1 (F8.3-10).
+/// Allowlist, fail-closed: only a local (loopback) backend may
+/// run multiplied rollouts. The caller passes the RESOLVED
+/// backend's `is_paid()` (paid = non-loopback, decided at
+/// construction) — never a CLI flag or an assumption about the
+/// URL. N = 1 is the single-shot path and is always allowed
+/// here; the caller runs it without Best-of-N.
+pub fn require_local_backend(n: usize, is_paid: bool) -> Result<(), MimintError> {
+    if n > 1 && is_paid {
+        return Err(MimintError::Config(
+            "Best-of-N refused: paid backend (N>1 multiplies cost; Best-of-N runs on local backends only)"
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Which rule picked the winner. Recorded in every report so a
@@ -194,32 +251,64 @@ pub struct Selection {
     pub votes: Vec<(Option<(i32, i32)>, usize)>,
 }
 
-/// Majority point over predicted points: the point with strictly
-/// more votes than every other point, and at least 2 votes.
-/// `None` entries (no click) never vote. Ties and singletons
-/// return `None` — the caller falls back to `First`.
+/// Squared Euclidean distance between two points (i64 so the
+/// 1024x768 range can never overflow).
+fn distance_sq(a: (i32, i32), b: (i32, i32)) -> i64 {
+    let dx = i64::from(a.0) - i64::from(b.0);
+    let dy = i64::from(a.1) - i64::from(b.1);
+    dx * dx + dy * dy
+}
+
+/// Majority point over predicted points, by CLUSTERING (F8.3-01):
+/// points within [`MAJORITY_CLUSTER_RADIUS_PX`] of a cluster's
+/// first-seen point join that cluster (greedy, in rollout order);
+/// the largest cluster wins when it has at least 2 points and
+/// strictly more than every other cluster. The winner is the
+/// cluster's medoid: the point minimizing the sum of squared
+/// distances to the other members (ties go to the earliest
+/// rollout). `None` entries (no click) never vote. Ties and
+/// singletons return `None` — the caller falls back to `First`.
+///
+/// Exact-match agreement is DEAD for a text-only model: P8.3
+/// measured 3 distinct points on every task (votes 1/1/1), so
+/// the old exact-match rule never fired. Clustering by distance
+/// is what makes Majority a real rule instead of dead code.
 pub fn majority_point(points: &[Option<(i32, i32)>]) -> Option<(i32, i32)> {
-    let mut counts: Vec<(Option<(i32, i32)>, usize)> = Vec::new();
-    for point in points {
-        let Some(point) = point else {
-            continue;
-        };
-        match counts.iter_mut().find(|(p, _)| p.as_ref() == Some(point)) {
-            Some((_, count)) => *count += 1,
-            None => counts.push((Some(*point), 1)),
+    let mut clusters: Vec<Vec<(i32, i32)>> = Vec::new();
+    for point in points.iter().flatten() {
+        let point = *point;
+        let mut placed = false;
+        for cluster in clusters.iter_mut() {
+            let seed = cluster[0];
+            if distance_sq(point, seed) <= i64::from(MAJORITY_CLUSTER_RADIUS_PX).pow(2) {
+                cluster.push(point);
+                placed = true;
+                break;
+            }
+        }
+        if !placed {
+            clusters.push(vec![point]);
         }
     }
-    if counts.is_empty() {
+    if clusters.is_empty() {
         return None;
     }
-    counts.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-    let (top_point, top_count) = counts[0];
-    let second = counts.get(1).map(|(_, c)| *c).unwrap_or(0);
-    if top_count >= 2 && top_count > second {
-        top_point
-    } else {
-        None
+    clusters.sort_by_key(|a| std::cmp::Reverse(a.len()));
+    let top = &clusters[0];
+    let second = clusters.get(1).map(|c| c.len()).unwrap_or(0);
+    if top.len() < 2 || top.len() <= second {
+        return None;
     }
+    let mut best = top[0];
+    let mut best_sum = i64::MAX;
+    for &candidate in top {
+        let sum: i64 = top.iter().map(|&other| distance_sq(candidate, other)).sum();
+        if sum < best_sum {
+            best_sum = sum;
+            best = candidate;
+        }
+    }
+    Some(best)
 }
 
 /// Pick the winning candidate (D-P83-3). The oracle is an
@@ -295,12 +384,31 @@ pub fn select(candidates: &[RolloutCandidate], oracle: impl Fn((i32, i32)) -> bo
                 votes,
             }
         }
-        None => Selection {
-            winner: Some(candidates[0].index),
-            rule: SelectionRule::First,
-            oracle_passed,
-            votes,
-        },
+        None => {
+            // First = the earliest candidate WITH a point (F8.3-01):
+            // an errored rollout (predicted None) never wins by
+            // being first. When no rollout collected a point at
+            // all there is no winner — not even the first
+            // errored rollout.
+            match candidates
+                .iter()
+                .find(|c| c.predicted.is_some())
+                .map(|c| c.index)
+            {
+                Some(first_with_point) => Selection {
+                    winner: Some(first_with_point),
+                    rule: SelectionRule::First,
+                    oracle_passed,
+                    votes,
+                },
+                None => Selection {
+                    winner: None,
+                    rule: SelectionRule::NoneCollected,
+                    oracle_passed,
+                    votes,
+                },
+            }
+        }
     }
 }
 
@@ -375,6 +483,23 @@ mod tests {
             clicks_recorded: usize::from(predicted.is_some()),
             has_frame: true,
             input_sha256: None,
+            tokens_measured: None,
+        }
+    }
+
+    fn error_candidate(index: usize) -> RolloutCandidate {
+        RolloutCandidate {
+            index,
+            predicted: None,
+            text: String::new(),
+            tools_used: Vec::new(),
+            steps: 0,
+            latency_ms: 0,
+            turn_error: Some("rollout failed".to_string()),
+            clicks_recorded: 0,
+            has_frame: false,
+            input_sha256: None,
+            tokens_measured: None,
         }
     }
 
@@ -455,7 +580,7 @@ mod tests {
         let candidates = vec![
             candidate(0, Some((10, 10))),
             candidate(1, Some((10, 10))),
-            candidate(2, Some((20, 20))),
+            candidate(2, Some((200, 200))),
         ];
         let selection = select(&candidates, |_| false);
         assert_eq!(selection.winner, Some(0));
@@ -465,10 +590,11 @@ mod tests {
 
     #[test]
     fn select_first_when_no_majority() {
+        // Points spread far apart (> 16px): no cluster forms.
         let candidates = vec![
             candidate(0, Some((10, 10))),
-            candidate(1, Some((20, 20))),
-            candidate(2, Some((30, 30))),
+            candidate(1, Some((100, 100))),
+            candidate(2, Some((200, 200))),
         ];
         let selection = select(&candidates, |_| false);
         assert_eq!(selection.winner, Some(0));
@@ -476,31 +602,94 @@ mod tests {
     }
 
     #[test]
-    fn select_no_clicks_falls_back_to_first() {
-        let candidates = vec![candidate(0, None), candidate(1, None)];
+    fn select_first_skips_errored_rollout() {
+        // Rollout 0 errored (no point): First must not crown it.
+        let candidates = vec![
+            error_candidate(0),
+            candidate(1, Some((100, 100))),
+            candidate(2, Some((200, 200))),
+        ];
         let selection = select(&candidates, |_| false);
-        assert_eq!(selection.winner, Some(0));
+        assert_eq!(selection.winner, Some(1));
         assert_eq!(selection.rule, SelectionRule::First);
     }
 
     #[test]
+    fn select_all_errored_is_none_collected() {
+        // No rollout collected a point: there is no winner —
+        // not even the first errored rollout (F8.3-01, live
+        // canary: all three GT-05 rollouts hit the 200s
+        // deadline and the old fallback crowned rollout 0).
+        let candidates = vec![candidate(0, None), candidate(1, None)];
+        let selection = select(&candidates, |_| false);
+        assert_eq!(selection.winner, None);
+        assert_eq!(selection.rule, SelectionRule::NoneCollected);
+    }
+
+    #[test]
     fn majority_point_rules() {
+        // Exact duplicates still cluster.
         assert_eq!(
-            majority_point(&[Some((1, 1)), Some((1, 1)), Some((2, 2))]),
-            Some((1, 1))
+            majority_point(&[Some((100, 100)), Some((100, 100)), Some((200, 200))]),
+            Some((100, 100))
         );
+        // Points spread > 16px apart: no cluster, no majority.
         assert_eq!(
-            majority_point(&[Some((1, 1)), Some((2, 2)), Some((3, 3))]),
+            majority_point(&[Some((100, 100)), Some((200, 200)), Some((300, 300))]),
             None
         );
         // 2-2 tie: no majority.
         assert_eq!(
-            majority_point(&[Some((1, 1)), Some((1, 1)), Some((2, 2)), Some((2, 2))]),
+            majority_point(&[
+                Some((100, 100)),
+                Some((100, 100)),
+                Some((200, 200)),
+                Some((200, 200))
+            ]),
             None
         );
         // None never votes: a single real point is no majority.
-        assert_eq!(majority_point(&[None, None, Some((1, 1))]), None);
+        assert_eq!(majority_point(&[None, None, Some((100, 100))]), None);
         assert_eq!(majority_point(&[]), None);
+    }
+
+    #[test]
+    fn majority_point_clusters_near_misses() {
+        // Dola's example (P8.3 review): rollout 0 is clearly
+        // wrong, rollouts 1-2 nearly agree — the near-agreement
+        // must win over the lone first point.
+        assert_eq!(
+            majority_point(&[Some((10, 20)), Some((500, 400)), Some((501, 401))]),
+            Some((500, 400))
+        );
+        // Medoid tie goes to the earliest rollout.
+        assert_eq!(
+            majority_point(&[Some((500, 400)), Some((501, 401)), Some((10, 20))]),
+            Some((500, 400))
+        );
+        // Radius boundary: 16px counts as agreeing, 17px does not.
+        assert_eq!(majority_point(&[Some((0, 0)), Some((16, 0))]), Some((0, 0)));
+        assert_eq!(majority_point(&[Some((0, 0)), Some((17, 0))]), None);
+        // Three near points: the medoid is the middle one.
+        assert_eq!(
+            majority_point(&[Some((100, 100)), Some((110, 100)), Some((105, 100))]),
+            Some((105, 100))
+        );
+    }
+
+    #[test]
+    fn require_local_backend_allows_local_and_single_shot() {
+        // Local backend: any N is fine.
+        assert!(require_local_backend(5, false).is_ok());
+        // N = 1 is the single-shot path: no multiplication, so a
+        // paid backend is not refused here.
+        assert!(require_local_backend(1, true).is_ok());
+        // N > 1 on a paid backend: refused, fail-closed.
+        let err = require_local_backend(3, true).unwrap_err();
+        assert!(
+            err.to_string().contains("Best-of-N refused: paid backend"),
+            "{err}"
+        );
     }
 
     #[test]

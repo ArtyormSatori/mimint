@@ -46,12 +46,23 @@
 //! pipeline with a real model — and records the TRUE result
 //! even when the model misses: model quality is not a
 //! pipeline bug, and the two are distinguished in the log.
-//! Outside drill mode the Ollama task(s) do NOT gate the
-//! exit code; the stub tasks do. Exit 0 iff the harness ran
-//! clean AND every requested task passed; a stub or Ollama
-//! miss is a gate miss (exit 2), not an execution error.
-//! In drill mode the Ollama tasks DO gate: exit 0 iff every
-//! requested Ollama task passes (8/8 by default, n/n subset).
+//! Every requested Ollama task gates the exit code in EVERY
+//! mode (F8.3-02): a run that finished with a task FAIL exits 2,
+//! drill or not. `--no-gate` is the explicit opt-out for
+//! measurement-only runs (exit 0 when the harness ran clean,
+//! `exit_reason: "measured_ungated"`). In drill mode the Ollama
+//! tasks DO gate: exit 0 iff every requested Ollama task passes
+//! (8/8 by default, n/n subset).
+//!
+//! Best-of-N records (F8.3-03): a BoN task's `pass` is the BLIND
+//! pick (Majority/First only, no oracle) — the deployable result.
+//! The oracle-selected pass is recorded separately as
+//! `best_of_n.pass_at_n_oracle` ("oracle upper bound"): it is a
+//! ceiling, not deployable performance, because production has
+//! no oracle. `single_shot_pass` is rollout 0 alone at the same
+//! sampling (temperature 0.7), the fair baseline for the blind
+//! pick. Best-of-N numbers (temperature 0.7) must NOT be
+//! compared with the temperature-0 single-shot baseline.
 //!
 //! Approval: the gate runs headless with an auto-allow
 //! approver (the approval behavior itself is covered by the
@@ -77,7 +88,9 @@ mod gate {
     use mimint_control::verify::BodyStepVerifier;
     use mimint_core::{
         best_of_n::{
-            select, BestOfNConfig, BonBudget, RolloutCandidate, BON_MAX_STEPS, DEFAULT_TOKEN_BUDGET,
+            require_local_backend, select, BestOfNConfig, BonBudget, RolloutCandidate,
+            BON_MAX_STEPS, BON_ROLLOUT_DEADLINE_SECS, DEFAULT_BASE_SEED, DEFAULT_TOKEN_BUDGET,
+            MAJORITY_CLUSTER_RADIUS_PX,
         },
         ledger::DEFAULT_MAX_TOKENS,
         Approver, AuditLog, Brain, CallContext, ChatMessage, EgressPolicy, FunctionCall,
@@ -277,11 +290,12 @@ mod gate {
         model: String,
         ollama_timeout_secs: u64,
         best_of_n: Option<usize>,
+        no_gate: bool,
         font: Option<String>,
         font_size: Option<f32>,
     }
 
-    const USAGE: &str = "usage: golden --harness <evalharness-bin> --workdir <dir> --log <out.jsonl> [--tasks GT-01,GT-02,GT-03,GT-04|none] [--ollama-task GT-01|none] [--ollama-tasks GT-01,...,GT-08] [--drill] [--report <report.json>] [--base-url URL] [--model NAME] [--ollama-timeout-secs N] [--font <ttf>] [--font-size N] [--best-of-n N]\n       --best-of-n N runs each Ollama task N times (temperature 0.7, seeds 0..N-1) and picks the winner by oracle pass, then majority, then first; N must be 1..=5, default OFF. Best-of-N refuses a paid backend (cap_usd=0).\n       --drill runs all 8 tasks through real Ollama, writes a 4-section JSON report. Exit codes (F8.2-01): 0 = harness ran clean AND every requested task passed; 1 = system/config/connection/parse error; 2 = measured but below threshold (full drill 8/8, subset n/n).\n       --ollama-tasks (list) wins over legacy --ollama-task (single) when both are given.";
+    const USAGE: &str = "usage: golden --harness <evalharness-bin> --workdir <dir> --log <out.jsonl> [--tasks GT-01,GT-02,GT-03,GT-04|none] [--ollama-task GT-01|none] [--ollama-tasks GT-01,...,GT-08] [--drill] [--no-gate] [--report <report.json>] [--base-url URL] [--model NAME] [--ollama-timeout-secs N] [--font <ttf>] [--font-size N] [--best-of-n N]\n       --best-of-n N runs each Ollama task N times (temperature 0.7, seeds 0..N-1) and picks the winner by oracle pass, then majority (16px clusters), then first; N must be 1..=5, default OFF. Best-of-N refuses a paid backend (local backends only, N>1). A BoN task's pass is the blind pick (no oracle); the oracle-selected pass is recorded as pass_at_n_oracle (oracle upper bound). N=1 is a single rollout with no diversity benefit.\n       --drill runs all 8 tasks through real Ollama, writes a 4-section JSON report. Exit codes (F8.2-01, F8.3-02): 0 = harness ran clean AND every requested task passed (BoN tasks count by blind_pick_pass); 1 = system/config/connection/parse error; 2 = measured but below threshold (full drill 8/8, subset n/n). --no-gate measures without gating (exit 0 when the harness ran clean, exit_reason measured_ungated); it has no effect in --drill mode.\n       Best-of-N (temperature=0.7) must be compared against single-shot (temperature=0.7); do not compare with temperature=0 baselines.\n       --ollama-tasks (list) wins over legacy --ollama-task (single) when both are given.";
 
     fn parse_args() -> Result<GateArgs, String> {
         let args: Vec<String> = std::env::args().collect();
@@ -306,6 +320,7 @@ mod gate {
         // ~28s on vega); the default leaves room for a full turn.
         let mut ollama_timeout_secs: u64 = 600;
         let mut best_of_n: Option<usize> = None;
+        let mut no_gate = false;
         let mut font = None;
         let mut font_size = None;
         let mut i = 1;
@@ -344,6 +359,7 @@ mod gate {
                     ollama_tasks_explicit = true;
                 }
                 "--drill" => drill = true,
+                "--no-gate" => no_gate = true,
                 "--report" => report = Some(PathBuf::from(next(&mut i))),
                 "--base-url" => base_url = next(&mut i),
                 "--model" => model = next(&mut i),
@@ -415,6 +431,7 @@ mod gate {
             model,
             ollama_timeout_secs,
             best_of_n,
+            no_gate,
             font,
             font_size,
         })
@@ -616,18 +633,45 @@ mod gate {
 
         // Real-Ollama tasks: every one recorded, with its TRUE
         // result even when the model misses (model quality is not
-        // a pipeline bug). Outside drill mode they do not gate;
-        // in drill mode they do (exit 0 iff all PASS).
+        // a pipeline bug). Every requested task gates the exit
+        // code (F8.3-02) — drill or not — unless --no-gate opts
+        // out of gating for a measurement-only run.
         if let Some(provider) = &ollama_provider {
-            // Best-of-N refuses a paid backend outright (D-P83-4):
-            // the Phase 2 cap_usd=0 lock already blocks paid
-            // backends for turns; this is the explicit second check
-            // for the multiplied cost of N rollouts.
-            if args.best_of_n.is_some_and(|n| n > 1) && provider.is_paid() {
-                return Err(
-                    "Best-of-N refused: paid backend (cap_usd=0 locks paid backends; Best-of-N multiplies cost by N)"
-                        .to_string(),
-                );
+            // Best-of-N cost warning (F8.3-06/07): printed BEFORE
+            // any rollout, so the multiplied cost is visible
+            // before it is spent — never only in the report.
+            if let Some(n) = args.best_of_n {
+                if n > 1 {
+                    let reserve = BestOfNConfig::disabled()
+                        .reserve_per_rollout(BON_MAX_STEPS, DEFAULT_MAX_TOKENS);
+                    println!("BEST-OF-N ENABLED");
+                    println!(
+                        "  rollouts: {n} (temperature 0.7, seeds {}..{})",
+                        DEFAULT_BASE_SEED,
+                        DEFAULT_BASE_SEED + n as u64 - 1
+                    );
+                    println!("  backend: {} (model {})", args.base_url, args.model);
+                    println!(
+                        "  cost: compute may approach {n}x single-shot; token budget {DEFAULT_TOKEN_BUDGET} total, reserve {reserve} per rollout"
+                    );
+                    println!("  selection: oracle pass, then majority (16px clusters), then first");
+                    println!("  No model judge is used.");
+                    println!("  Best-of-N (temperature=0.7) must be compared against single-shot (temperature=0.7); do not compare with temperature=0 baselines.");
+                } else {
+                    println!("best-of-n 1: a single rollout, no diversity benefit (N=1)");
+                }
+            }
+            // Best-of-N refuses a paid backend outright (F8.3-10):
+            // the check lives in the library
+            // (`require_local_backend`) and runs on the RESOLVED
+            // backend (`is_paid()` = non-loopback). The harness
+            // builds the provider without an API key, so a remote
+            // endpoint already fails at construction; this is the
+            // explicit second check for the multiplied cost of N
+            // rollouts. (There is no `cap_usd` lock on the harness
+            // path — the old comment claiming one was wrong.)
+            if let Some(n) = args.best_of_n {
+                require_local_backend(n, provider.is_paid()).map_err(|err| err.to_string())?;
             }
             for task_id in &args.ollama_tasks {
                 let Some(task) = TASKS.iter().find(|t| t.id == task_id) else {
@@ -693,11 +737,14 @@ mod gate {
                 );
                 if let Some(bon) = record.get("best_of_n") {
                     println!(
-                        "  best-of-n: n={} winner={:?} rule={} single_shot_pass={} stop_reason={:?}",
+                        "  best-of-n: n={} winner={:?} rule={} pass_at_n_oracle={} blind_pick_pass={} single_shot_pass={} token_method={} stop_reason={:?}",
                         bon["n"],
                         bon["selection"]["winner"],
                         bon["selection"]["rule"],
+                        bon["pass_at_n_oracle"],
+                        bon["blind_pick_pass"],
                         bon["single_shot_pass"],
+                        bon["token_method"].as_str().unwrap_or("?"),
                         bon["stop_reason"]
                     );
                 }
@@ -718,6 +765,11 @@ mod gate {
             .filter(|(_, passed)| !passed)
             .map(|(id, _)| id.as_str())
             .collect();
+        // Exit semantics (F8.3-02): every requested task gates
+        // in EVERY mode — a finished run with a FAIL exits 2,
+        // drill or not. Only `--no-gate` opts out
+        // (measurement-only), and it has no effect in drill mode
+        // (drill always gates).
         let (exit_reason, outcome) = if args.drill {
             if ollama_failed.is_empty() && stub_failed.is_empty() {
                 ("ok".to_string(), RunOutcome::Pass)
@@ -731,19 +783,23 @@ mod gate {
                     )),
                 )
             }
-        } else if stub_failed.is_empty() {
-            // No stub task failed — that covers both "no stub
-            // tasks ran" and "every stub task passed".
+        } else if args.no_gate {
+            ("measured_ungated".to_string(), RunOutcome::Pass)
+        } else if ollama_failed.is_empty() && stub_failed.is_empty() {
             ("ok".to_string(), RunOutcome::Pass)
         } else {
             (
                 "gate_not_met".to_string(),
                 RunOutcome::GateNotMet(format!(
-                    "golden gate: stub tasks failed: {}",
+                    "golden gate: Ollama tasks failed: {}; stub tasks failed: {}",
+                    ollama_failed.join(", "),
                     stub_failed.join(", ")
                 )),
             )
         };
+        if args.drill && args.no_gate {
+            println!("note: --no-gate has no effect in --drill mode (drill always gates)");
+        }
         // Subset drill is labeled, never silent (F8.2-07): a
         // subset cannot satisfy the 8/8 gate.
         let subset = is_subset(&args.ollama_tasks);
@@ -758,6 +814,7 @@ mod gate {
         // also carries `summary` + `exit_reason` (F8.2-01/02).
         if let Some(report_path) = &args.report {
             let mode = if args.drill { "drill" } else { "gate" };
+            let gated = args.drill || (!args.no_gate && !ollama_results.is_empty());
             let extra = ReportExtra {
                 exit_reason: exit_reason.clone(),
                 subset,
@@ -765,14 +822,8 @@ mod gate {
                 timeout_secs: args.ollama_timeout_secs,
                 commit_sha: commit_sha(),
                 seed_prompt_ref: seed_prompt_ref(),
-                sampling: json!({
-                    "temperature": 0,
-                    "seed": 0,
-                    "top_p": Value::Null,
-                    "num_ctx": Value::Null,
-                    "note": "temperature=0 + seed=0 locked for drill/--ollama-tasks (F8.2-03); top_p/num_ctx stay at the Ollama default (not set by the harness). When --best-of-n N is given, rollouts use temperature 0.7 with seeds base_seed + i instead (D-P83-2); per-task sampling is recorded in best_of_n.",
-                    "session_reset_per_task": true,
-                }),
+                sampling: sampling_for_report(&records),
+                gated,
             };
             let report = build_report(
                 mode,
@@ -1000,6 +1051,11 @@ mod gate {
         commit_sha: String,
         seed_prompt_ref: Value,
         sampling: Value,
+        /// True when the exit code was gated on the requested
+        /// tasks' results (F8.3-09): drill always gates;
+        /// non-drill gates unless `--no-gate` was given or no
+        /// Ollama task ran.
+        gated: bool,
     }
 
     /// Box area (F8.2-06): inclusive pixel count + share of the
@@ -1121,6 +1177,38 @@ mod gate {
         (median, values[rank - 1])
     }
 
+    /// Sampling metadata for the report (F8.3-11): when any
+    /// record ran Best-of-N, the run used temperature 0.7 with
+    /// seeds base_seed + i — the report must say so instead of
+    /// the locked temp-0/seed-0 block. A BoN-free run keeps the
+    /// locked-sampling block.
+    fn sampling_for_report(records: &[Value]) -> Value {
+        let bon = records.iter().find(|r| r.get("best_of_n").is_some());
+        match bon {
+            Some(record) => {
+                let base_seed = record["best_of_n"]["base_seed"]
+                    .as_u64()
+                    .unwrap_or(DEFAULT_BASE_SEED);
+                json!({
+                    "temperature": 0.7,
+                    "seed": base_seed,
+                    "top_p": Value::Null,
+                    "num_ctx": Value::Null,
+                    "note": "Best-of-N rollouts use temperature 0.7 with seeds base_seed + i (F8.3-11); single-shot tasks in this run still use locked temperature=0 + seed=0. Best-of-N (temperature=0.7) must be compared against single-shot (temperature=0.7); do not compare with temperature=0 baselines.",
+                    "session_reset_per_task": true,
+                })
+            }
+            None => json!({
+                "temperature": 0,
+                "seed": 0,
+                "top_p": Value::Null,
+                "num_ctx": Value::Null,
+                "note": "temperature=0 + seed=0 locked for drill/--ollama-tasks (F8.2-03); top_p/num_ctx stay at the Ollama default (not set by the harness). When --best-of-n N is given, rollouts use temperature 0.7 with seeds base_seed + i instead (D-P83-2); per-task sampling is recorded in best_of_n.",
+                "session_reset_per_task": true,
+            }),
+        }
+    }
+
     /// The drill report: exactly the 4 sections of EVAL-PLAN §2,
     /// kept separate — never merged into a single number — plus
     /// `summary` + `exit_reason` (F8.2-01/02) and the
@@ -1212,16 +1300,23 @@ mod gate {
             "full-8/8".to_string()
         } else if mode == "drill" {
             format!("subset-{total}/{total}")
+        } else if total > 0 {
+            // Non-drill run with Ollama tasks: a subset by
+            // definition (F8.3-09) — the label says how many.
+            format!("subset-{total}/{total}")
         } else {
-            "gate".to_string()
+            // Stub-only run: no model evaluation happened.
+            "none".to_string()
         };
         let set = if extra.subset {
             format!("DEV-subset ({})", extra.tasks_requested.join(","))
         } else {
             "DEV (GT-01..GT-08)".to_string()
         };
-        // Best-of-N summary (P8.3): counts only over the records
-        // that actually ran Best-of-N; null when none did.
+        // Best-of-N summary (P8.3, F8.3-03/11): counts only over
+        // the records that actually ran Best-of-N; null when none
+        // did. `pass_at_n_oracle` is the oracle upper bound;
+        // `blind_pick_pass` is the deployable result.
         let bon_records: Vec<&Value> = ollama_records
             .iter()
             .filter(|r| r.get("best_of_n").is_some())
@@ -1230,24 +1325,41 @@ mod gate {
         let best_of_n_summary = if bon_records.is_empty() {
             Value::Null
         } else {
-            let bon_pass = bon_records
-                .iter()
-                .filter(|r| r.get("pass").and_then(|p| p.as_bool()).unwrap_or(false))
-                .count();
-            let single_shot_pass = bon_records
-                .iter()
-                .filter(|r| {
-                    r.get("best_of_n")
-                        .and_then(|b| b.get("single_shot_pass"))
-                        .and_then(|p| p.as_bool())
-                        .unwrap_or(false)
-                })
-                .count();
+            let count_bon_flag = |flag: &str| {
+                bon_records
+                    .iter()
+                    .filter(|r| {
+                        r.get("best_of_n")
+                            .and_then(|b| b.get(flag))
+                            .and_then(|p| p.as_bool())
+                            .unwrap_or(false)
+                    })
+                    .count()
+            };
+            let pass_at_n_oracle = count_bon_flag("pass_at_n_oracle");
+            let blind_pick_pass = count_bon_flag("blind_pick_pass");
+            let single_shot_pass = count_bon_flag("single_shot_pass");
+            let mut rule_counts = serde_json::Map::new();
+            for rule in ["oracle_pass", "majority", "first", "none_collected"] {
+                let count = bon_records
+                    .iter()
+                    .filter(|r| {
+                        r.get("best_of_n")
+                            .and_then(|b| b.get("selection"))
+                            .and_then(|s| s.get("rule"))
+                            .and_then(|v| v.as_str())
+                            .is_some_and(|v| v == rule)
+                    })
+                    .count();
+                rule_counts.insert(rule.to_string(), json!(count));
+            }
             json!({
                 "tasks": bon_records.len(),
-                "best_of_n_pass": bon_pass,
+                "pass_at_n_oracle": pass_at_n_oracle,
+                "blind_pick_pass": blind_pick_pass,
                 "single_shot_pass": single_shot_pass,
-                "note": "best_of_n_pass and single_shot_pass share the same sampling (temperature 0.7, seeds base+i) and are comparable with each other; neither compares with the temp-0 single-shot baseline (D-P83-2/7).",
+                "rule_counts": rule_counts,
+                "note": "pass_at_n_oracle is the oracle upper bound (the oracle-selected winner graded): a ceiling, not deployable performance, because production has no oracle. blind_pick_pass is the deployable result (Majority/First only). All three counts share the same sampling (temperature 0.7, seeds base+i) and are comparable with each other; none compares with the temp-0 single-shot baseline (D-P83-2/7). n=3 tasks cannot support a statistical claim (Fisher p=1.0 for 1/3 vs 0/3).",
             })
         };
         let (load_avg_1m, mem_free_mb) = load_context();
@@ -1271,7 +1383,7 @@ mod gate {
             ),
         };
         json!({
-            "schema_version": 2,
+            "schema_version": 3,
             "mode": mode,
             "timestamp_unix": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
             "timestamp_utc": utc_iso_now(),
@@ -1290,6 +1402,7 @@ mod gate {
                 "pass": ollama_pass,
                 "total": total,
                 "gate": gate,
+                "gated": extra.gated,
             },
             "harness": {
                 "ok": harness_ok,
@@ -1569,13 +1682,17 @@ mod gate {
         Ok(Arc::new(client))
     }
 
-    /// Best-of-N for one golden task (P8.3): N rollouts at
-    /// temperature 0.7 with seeds `base_seed + i`, then the
-    /// deterministic selection (oracle pass > majority > first).
-    /// The winner's point is graded by the SAME binary checker as
-    /// a single-shot turn; the report carries both the selected
-    /// pass and the single-shot (rollout 0) pass at the same
-    /// sampling, so the two are comparable (D-P83-7).
+    /// Best-of-N for one golden task (P8.3, F8.3-01..07): N
+    /// rollouts at temperature 0.7 with seeds `base_seed + i`
+    /// (sequential, each bounded by BON_ROLLOUT_DEADLINE_SECS,
+    /// the task by N times that), then the deterministic
+    /// selection (oracle pass > majority in 16px clusters >
+    /// first). The record's `pass` is the BLIND pick
+    /// (Majority/First only, no oracle) — the deployable result;
+    /// the oracle-selected pass is recorded separately as
+    /// `best_of_n.pass_at_n_oracle` (oracle upper bound), and
+    /// `single_shot_pass` is rollout 0 alone at the same
+    /// sampling, so the three are comparable (D-P83-7).
     #[allow(clippy::too_many_arguments)]
     async fn run_best_of_n_task(
         task: &GoldenTask,
@@ -1612,7 +1729,15 @@ mod gate {
         let mut budget = BonBudget::new(&config, "agent-001");
         let mut candidates: Vec<RolloutCandidate> = Vec::new();
         let mut stop_reason: Option<String> = None;
+        // Wall-clock task deadline (F8.3-05): N rollouts at
+        // BON_ROLLOUT_DEADLINE_SECS each, sequential.
+        let task_deadline =
+            Instant::now() + Duration::from_secs(BON_ROLLOUT_DEADLINE_SECS * config.n as u64);
         for i in 0..config.n {
+            if Instant::now() >= task_deadline {
+                stop_reason = Some("task_deadline_exceeded".to_string());
+                break;
+            }
             // Cost-cap stop (D-P83-4): a failed reserve ends the
             // rollouts at once — never silently, never partially.
             let reservation = match budget.reserve_rollout(BON_MAX_STEPS, DEFAULT_MAX_TOKENS) {
@@ -1643,29 +1768,39 @@ mod gate {
                         clicks_recorded: 0,
                         has_frame: false,
                         input_sha256: None,
+                        tokens_measured: None,
                     });
                     continue;
                 }
             };
-            let run = run_turn_once(
-                rollout_provider,
-                actor,
-                frames,
-                notebook,
-                Arc::clone(&audit),
-                &mut *oracle,
-                prompt,
-                &format!("golden-{}-bon{i}", task.id),
+            // Per-rollout wall-clock deadline (F8.3-05): the
+            // in-flight turn is dropped when it fires, and the
+            // rollout is recorded as a turn error (timeout) —
+            // never silently dropped.
+            let run = match tokio::time::timeout(
+                Duration::from_secs(BON_ROLLOUT_DEADLINE_SECS),
+                run_turn_once(
+                    rollout_provider,
+                    actor,
+                    frames,
+                    notebook,
+                    Arc::clone(&audit),
+                    &mut *oracle,
+                    prompt,
+                    &format!("golden-{}-bon{i}", task.id),
+                ),
             )
-            .await;
-            // Settle unmeasured: the full reserve is charged as an
-            // estimate, by design (D-P83-4) — the real Ollama usage
-            // does not travel through TurnOutcome.
-            let _ = reservation.settle_unmeasured();
+            .await
+            {
+                Ok(run) => run,
+                Err(_) => Err(format!(
+                    "rollout wall-clock deadline exceeded after {BON_ROLLOUT_DEADLINE_SECS}s (timeout)"
+                )),
+            };
             match run {
                 Ok(run) => {
                     let predicted = run.clicks.last().copied();
-                    let (text, tools_used, steps) = run
+                    let (text, tools_used, steps, tokens_measured) = run
                         .turn
                         .as_ref()
                         .map(|outcome| {
@@ -1673,9 +1808,31 @@ mod gate {
                                 outcome.text.clone(),
                                 outcome.tools_used.clone(),
                                 outcome.steps,
+                                // Measured only when the provider
+                                // reported usage on EVERY call of
+                                // the turn (F8.3-04); otherwise the
+                                // reserve estimate stands.
+                                if outcome.usage_reported_calls == outcome.steps
+                                    && outcome.steps > 0
+                                {
+                                    Some(outcome.tokens_measured)
+                                } else {
+                                    None
+                                },
                             )
                         })
                         .unwrap_or_default();
+                    // Settle measured when the turn reported usage
+                    // on every call; otherwise unmeasured (full
+                    // reserve charged as an estimate).
+                    match tokens_measured {
+                        Some(usage) => {
+                            let _ = reservation.settle_measured(usage);
+                        }
+                        None => {
+                            let _ = reservation.settle_unmeasured();
+                        }
+                    }
                     candidates.push(RolloutCandidate {
                         index: i,
                         predicted,
@@ -1687,9 +1844,11 @@ mod gate {
                         clicks_recorded: run.clicks.len(),
                         has_frame: run.input_sha256.is_some(),
                         input_sha256: run.input_sha256,
+                        tokens_measured,
                     });
                 }
                 Err(err) => {
+                    let _ = reservation.settle_unmeasured();
                     candidates.push(RolloutCandidate {
                         index: i,
                         predicted: None,
@@ -1701,6 +1860,7 @@ mod gate {
                         clicks_recorded: 0,
                         has_frame: false,
                         input_sha256: None,
+                        tokens_measured: None,
                     });
                 }
             }
@@ -1721,13 +1881,34 @@ mod gate {
             );
         }
         let selection = select(&candidates, |point| in_box(point, task.box_));
-        let winner = &candidates[selection.winner.unwrap_or(0)];
-        // Grade the SELECTED point with the same binary checker.
+        // Grade the ORACLE-selected winner: this is the ceiling
+        // (pass@N), recorded as pass_at_n_oracle — not the
+        // deployable result. When no winner exists (no rollout
+        // collected a point), rollout 0 stands in as the
+        // representative failure: its turn_error explains why
+        // nothing was collected, and every candidate's error is
+        // in the report. The verdict is FAIL either way.
+        let oracle_winner = &candidates[selection.winner.unwrap_or(0)];
+        let (pass_at_n_oracle, _, _) = classify_turn(
+            oracle_winner.turn_error.clone(),
+            oracle_winner.clicks_recorded,
+            oracle_winner.predicted,
+            oracle_winner.has_frame,
+            task.box_,
+        );
+        // The BLIND pick (F8.3-03): the same selection with the
+        // oracle disabled — Majority/First only. This is what
+        // production can actually do, so the record's pass, point
+        // and fail reason are the blind winner's. With no blind
+        // winner (NoneCollected) the record is graded from
+        // rollout 0 as the representative failure, as above.
+        let blind_selection = select(&candidates, |_| false);
+        let blind_winner = &candidates[blind_selection.winner.unwrap_or(0)];
         let (pass, fail_reason_code, reason) = classify_turn(
-            winner.turn_error.clone(),
-            winner.clicks_recorded,
-            winner.predicted,
-            winner.has_frame,
+            blind_winner.turn_error.clone(),
+            blind_winner.clicks_recorded,
+            blind_winner.predicted,
+            blind_winner.has_frame,
             task.box_,
         );
         // Single-shot (rollout 0 alone, same sampling) for the
@@ -1742,31 +1923,51 @@ mod gate {
         );
         let (box_area_px2, box_area_pct) = box_area(task.box_);
         let total_latency_ms: u64 = candidates.iter().map(|c| c.latency_ms).sum();
+        // Measured tokens (F8.3-04): summed over the rollouts
+        // that reported usage; the aggregate method is
+        // provider-reported only when every rollout did.
+        let tokens_measured_total: u64 = candidates
+            .iter()
+            .filter_map(|c| c.tokens_measured.map(|u| u.total()))
+            .sum();
+        let measured_rollouts = candidates
+            .iter()
+            .filter(|c| c.tokens_measured.is_some())
+            .count();
+        let token_method = if measured_rollouts == candidates.len() {
+            "provider-reported"
+        } else if measured_rollouts == 0 {
+            "reserved-estimate"
+        } else {
+            "mixed"
+        };
         let mut record = json!({
             "task": task.id,
             "ref_expr": task.ref_expr,
             "box": [task.box_.0, task.box_.1, task.box_.2, task.box_.3],
             "box_area_px2": box_area_px2,
             "box_area_pct": box_area_pct,
-            "predicted": winner.predicted.map(|(x, y)| json!([x, y])),
-            "clicks_recorded": winner.clicks_recorded,
+            "predicted": blind_winner.predicted.map(|(x, y)| json!([x, y])),
+            "clicks_recorded": blind_winner.clicks_recorded,
             "pass": pass,
             "fail_reason_code": fail_reason_code,
             "retry_count": 0,
             "latency_ms": total_latency_ms,
-            "input_sha256": winner.input_sha256.clone(),
+            "input_sha256": blind_winner.input_sha256.clone(),
             "canvas_version": canvas_version,
             "font": font,
             "font_size": font_size,
             "provider": provider_name,
             "display_size": [1024, 768],
-            "tools_used": winner.tools_used.clone(),
-            "steps": winner.steps,
+            "tools_used": blind_winner.tools_used.clone(),
+            "steps": blind_winner.steps,
             "best_of_n": {
                 "enabled": true,
                 "n": config.n,
                 "temperature": BestOfNConfig::rollout_temperature(),
                 "base_seed": config.base_seed,
+                "seeds_used": (0..config.n).map(|i| config.rollout_seed(i)).collect::<Vec<_>>(),
+                "cluster_radius_px": MAJORITY_CLUSTER_RADIUS_PX,
                 "candidates": candidates.iter().map(|c| json!({
                     "index": c.index,
                     "predicted": c.predicted.map(|(x, y)| json!([x, y])),
@@ -1776,6 +1977,8 @@ mod gate {
                     "tools_used": c.tools_used.clone(),
                     "turn_error": c.turn_error.clone(),
                     "input_sha256": c.input_sha256.clone(),
+                    "tokens_measured": c.tokens_measured.map(|u| u.total()),
+                    "token_method": if c.tokens_measured.is_some() { "provider-reported" } else { "reserved-estimate" },
                 })).collect::<Vec<_>>(),
                 "selection": {
                     "winner": selection.winner,
@@ -1786,9 +1989,17 @@ mod gate {
                         "votes": count,
                     })).collect::<Vec<_>>(),
                 },
+                "blind_selection": {
+                    "winner": blind_selection.winner,
+                    "rule": blind_selection.rule.as_str(),
+                },
+                "pass_at_n_oracle": pass_at_n_oracle,
+                "blind_pick_pass": pass,
                 "single_shot_pass": single_shot_pass,
                 "token_budget": config.token_budget,
                 "tokens_reserved": budget.reserved_total(),
+                "tokens_measured": tokens_measured_total,
+                "token_method": token_method,
                 "stop_reason": stop_reason,
             },
         });
@@ -2027,6 +2238,7 @@ mod gate {
                     "num_ctx": Value::Null,
                     "session_reset_per_task": true,
                 }),
+                gated: true,
             }
         }
 
@@ -2237,6 +2449,7 @@ mod gate {
             assert_eq!(report["summary"]["pass"], 1);
             assert_eq!(report["summary"]["total"], 3);
             assert_eq!(report["summary"]["gate"], "full-8/8");
+            assert_eq!(report["summary"]["gated"], true);
             assert_eq!(report["exit_reason"], "gate_not_met");
             assert_eq!(report["timeout_secs"], 600);
             assert_eq!(report["commit_sha"], "testsha");
@@ -2329,15 +2542,22 @@ mod gate {
 
         #[test]
         fn report_includes_best_of_n_summary() {
-            let mut records = vec![sample_record("GT-01", true, 100, "aaa")];
-            records[0]["best_of_n"] = json!({
-                "enabled": true, "n": 3, "single_shot_pass": false,
+            // Fixtures are honest BoN records: record["pass"] IS
+            // the blind pick (F8.3-03); the oracle ceiling lives
+            // in best_of_n.pass_at_n_oracle.
+            let mut oracle_win = sample_record("GT-01", false, 100, "aaa");
+            oracle_win["best_of_n"] = json!({
+                "enabled": true, "n": 3,
+                "pass_at_n_oracle": true, "blind_pick_pass": false, "single_shot_pass": false,
+                "selection": {"rule": "oracle_pass"},
             });
-            let mut failed = sample_record("GT-05", false, 200, "aaa");
-            failed["best_of_n"] = json!({
-                "enabled": true, "n": 3, "single_shot_pass": true,
+            let mut blind_win = sample_record("GT-05", true, 200, "aaa");
+            blind_win["best_of_n"] = json!({
+                "enabled": true, "n": 3,
+                "pass_at_n_oracle": false, "blind_pick_pass": true, "single_shot_pass": true,
+                "selection": {"rule": "first"},
             });
-            records.push(failed);
+            let records = vec![oracle_win, blind_win];
             let report = build_report(
                 "drill",
                 "canvas-v1",
@@ -2350,8 +2570,16 @@ mod gate {
                 &test_extra(),
             );
             assert_eq!(report["best_of_n"]["tasks"], 2);
-            assert_eq!(report["best_of_n"]["best_of_n_pass"], 1);
+            assert_eq!(report["best_of_n"]["pass_at_n_oracle"], 1);
+            assert_eq!(report["best_of_n"]["blind_pick_pass"], 1);
             assert_eq!(report["best_of_n"]["single_shot_pass"], 1);
+            assert_eq!(report["best_of_n"]["rule_counts"]["oracle_pass"], 1);
+            assert_eq!(report["best_of_n"]["rule_counts"]["first"], 1);
+            assert_eq!(report["best_of_n"]["rule_counts"]["majority"], 0);
+            assert_eq!(report["best_of_n"]["rule_counts"]["none_collected"], 0);
+            // tasks.pass counts the blind pick (record pass), not
+            // the oracle ceiling.
+            assert_eq!(report["tasks"]["pass"], 1);
             // A run without any Best-of-N record carries a null
             // summary instead of a fabricated count.
             let plain = vec![sample_record("GT-01", true, 100, "aaa")];
@@ -2367,6 +2595,66 @@ mod gate {
                 &test_extra(),
             );
             assert!(plain_report["best_of_n"].is_null());
+        }
+
+        #[test]
+        fn parse_no_gate_flag() {
+            let mut flags = base_flags();
+            flags.push("--no-gate");
+            assert!(parse_args_from(&args_of(&flags)).unwrap().no_gate);
+            assert!(!parse_args_from(&args_of(&base_flags())).unwrap().no_gate);
+        }
+
+        #[test]
+        fn report_gate_label_is_meaningful_outside_drill() {
+            // Non-drill run with Ollama tasks: subset-n/n + gated
+            // (F8.3-09) — never the bare mode string "gate".
+            let records = vec![sample_record("GT-01", true, 100, "aaa")];
+            let report = build_report(
+                "gate",
+                "canvas-v1",
+                "DejaVuSans.ttf",
+                "16",
+                &None,
+                "qwen2.5:3b",
+                "http://127.0.0.1:11434/v1",
+                &records,
+                &test_extra(),
+            );
+            assert_eq!(report["summary"]["gate"], "subset-1/1");
+            assert_eq!(report["summary"]["gated"], true);
+            // Stub-only run: no model evaluation happened.
+            let mut ungated = test_extra();
+            ungated.gated = false;
+            let stub_only = build_report(
+                "gate",
+                "canvas-v1",
+                "DejaVuSans.ttf",
+                "16",
+                &None,
+                "qwen2.5:3b",
+                "http://127.0.0.1:11434/v1",
+                &[],
+                &ungated,
+            );
+            assert_eq!(stub_only["summary"]["gate"], "none");
+            assert_eq!(stub_only["summary"]["gated"], false);
+        }
+
+        #[test]
+        fn sampling_for_report_records_bon_sampling() {
+            // BoN-free run: locked temp-0/seed-0.
+            let plain = vec![sample_record("GT-01", true, 100, "aaa")];
+            let sampling = sampling_for_report(&plain);
+            assert_eq!(sampling["temperature"], 0);
+            assert_eq!(sampling["seed"], 0);
+            // BoN run: temperature 0.7 + base_seed, not the
+            // locked block (F8.3-11).
+            let mut bon = sample_record("GT-01", false, 100, "aaa");
+            bon["best_of_n"] = json!({"base_seed": 7, "n": 3});
+            let sampling = sampling_for_report(&[bon]);
+            assert_eq!(sampling["temperature"], 0.7);
+            assert_eq!(sampling["seed"], 7);
         }
     }
 } // mod gate

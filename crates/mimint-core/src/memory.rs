@@ -707,6 +707,8 @@ mod tests {
             verification: None,
             verification_kind: crate::routing::VerificationKind::None,
             sandbox_denied_paths: Vec::new(),
+            tokens_measured: crate::ledger::TokenUsage::default(),
+            usage_reported_calls: 0,
         }
     }
 
