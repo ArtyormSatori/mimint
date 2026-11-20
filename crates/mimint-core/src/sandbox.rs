@@ -800,8 +800,8 @@ pub(crate) fn spawn_bwrap_child(
         // RLIMIT_FSIZE + RLIMIT_AS only. NEVER RLIMIT_NPROC
         // before bwrap (negative result, 05-rlimit-scope.log).
         cmd.pre_exec(move || {
-            set_rlimit(libc::RLIMIT_FSIZE, fsize)?;
-            set_rlimit(libc::RLIMIT_AS, as_bytes)?;
+            set_rlimit(libc::RLIMIT_FSIZE as libc::c_int, fsize)?;
+            set_rlimit(libc::RLIMIT_AS as libc::c_int, as_bytes)?;
             Ok(())
         });
     }
@@ -938,12 +938,12 @@ fn run_sandboxed_once(
 }
 
 #[cfg(unix)]
-fn set_rlimit(resource: u32, value: u64) -> std::io::Result<()> {
+fn set_rlimit(resource: libc::c_int, value: u64) -> std::io::Result<()> {
     let limit = libc::rlimit {
         rlim_cur: value,
         rlim_max: value,
     };
-    let rc = unsafe { libc::setrlimit(resource, &limit) };
+    let rc = unsafe { libc::setrlimit(resource as _, &limit) };
     if rc == 0 {
         Ok(())
     } else {

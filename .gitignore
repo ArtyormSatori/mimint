@@ -7,3 +7,4 @@ mimint-audit.jsonl
 # the global gitignore (*.pem) must not swallow them again.
 !crates/mimint-body/tests/fixtures/android-test-cert.pem
 !crates/mimint-body/tests/fixtures/android-test-key.pem
+/dist/
