@@ -647,6 +647,89 @@ mod tests {
             .write_all(&raw_client_frame(0x1, false, b"Hel", [1, 2, 3, 4]))
             .unwrap();
         assert!(matches!(server.read_frame(), Err(WsError::Unsupported(_))));
+        // Reserved opcodes 0x3 and 0xB: refused (fresh
+        // connection per case — a refusal kills it).
+        for opcode in [0x3u8, 0xBu8] {
+            let port = free_port();
+            let listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
+            let handle = std::thread::spawn(move || serve_once(listener));
+            let mut client = client_handshake(port);
+            let mut server = handle.join().unwrap();
+            client
+                .write_all(&raw_client_frame(opcode, true, b"x", [1, 2, 3, 4]))
+                .unwrap();
+            let err = server.read_frame().unwrap_err();
+            assert!(
+                matches!(err, WsError::Unsupported(_)),
+                "reserved opcode 0x{opcode:02x} must be Unsupported, got {err:?}"
+            );
+        }
+        // Unmasked frame from a client: refused.
+        let port = free_port();
+        let listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
+        let handle = std::thread::spawn(move || serve_once(listener));
+        let mut client = client_handshake(port);
+        let mut server = handle.join().unwrap();
+        client
+            .write_all(&[0x81, 0x05, b'H', b'e', b'l', b'l', b'o'])
+            .unwrap();
+        let err = server.read_frame().unwrap_err();
+        assert!(
+            matches!(err, WsError::Unsupported(_)),
+            "unmasked frame must be Unsupported, got {err:?}"
+        );
+    }
+
+    /// m6: a close payload of 0 bytes decodes to
+    /// `Close(None)`; 1 byte is a Protocol error (a close code
+    /// needs 2 bytes).
+    #[test]
+    fn ws_close_payload_zero_and_one_byte() {
+        // 0-byte close: accepted as Close(None).
+        let port = free_port();
+        let listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
+        let handle = std::thread::spawn(move || serve_once(listener));
+        let mut client = client_handshake(port);
+        let mut server = handle.join().unwrap();
+        client
+            .write_all(&raw_client_frame(0x8, true, b"", [1, 2, 3, 4]))
+            .unwrap();
+        assert_eq!(server.read_frame().unwrap(), WsFrame::Close(None));
+        // 1-byte close: Protocol error (fresh connection).
+        let port = free_port();
+        let listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
+        let handle = std::thread::spawn(move || serve_once(listener));
+        let mut client = client_handshake(port);
+        let mut server = handle.join().unwrap();
+        client
+            .write_all(&raw_client_frame(0x8, true, b"\x03", [1, 2, 3, 4]))
+            .unwrap();
+        let err = server.read_frame().unwrap_err();
+        assert!(
+            matches!(err, WsError::Protocol(ref msg) if msg.contains("shorter than 2 bytes")),
+            "1-byte close must be a Protocol error, got {err:?}"
+        );
+    }
+
+    /// m6: a single unfragmented (FIN=1) frame over the 256 KiB
+    /// cap is refused — previously only fragmented oversize
+    /// frames had a vector test.
+    #[test]
+    fn ws_rejects_single_frame_over_256kib() {
+        let port = free_port();
+        let listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
+        let handle = std::thread::spawn(move || serve_once(listener));
+        let mut client = client_handshake(port);
+        let mut server = handle.join().unwrap();
+        let big = vec![b'x'; 300 * 1024];
+        client
+            .write_all(&raw_client_frame(0x2, true, &big, [1, 2, 3, 4]))
+            .unwrap();
+        let err = server.read_frame().unwrap_err();
+        assert!(
+            matches!(err, WsError::Unsupported(ref msg) if msg.contains("256 KiB")),
+            "300 KiB single frame must be Unsupported, got {err:?}"
+        );
     }
 
     /// F7-19 vector 1: a LARGE first fragment is refused just

@@ -45,7 +45,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-pub const FRIENDS_USAGE: &str = "mimint-cli friends: Phase 7 paired-body operations.\n\nUsage:\n  mimint-cli friends [--data-dir DIR] [--config PATH] [--db PATH] [--audit PATH] <command> [args]\n\nCommands:\n  devices                              List paired devices (trust, pairing state)\n  pair <addr> [--typing] [--guest] [--auto-confirm]\n                                         Pair with the hub at <addr> (initiator side;\n                                         the peer runs `friends hub --allow-pairing`)\n  sync <device-id> --addr <addr>         Two-way sync with a paired peer\n  revoke <device-id>                     Revoke a peer (keeps the entry; access cut)\n  delete <device-id>                     Delete a peer entry entirely\n  rename <device-id> <name>             Rename a peer\n  trust <device-id> <owner|guest>        Change the trust granted to a peer\n  reset-identity                         Rotate this body's identity key (old key refused at once)\n  approve-opt-in <device-id> --on|--off  Let a peer approve actions (default off)\n  hub [--lan] [--lab] [--allow-pairing] [--auto-confirm]\n                                         Run the hub in the foreground (brain: Ollama qwen2.5:3b)\n  handoff --to <id> --addr <addr> --task <text> [--next <text>] [--wait-secs N]\n                                         Offer a task handoff to a peer (the receiver's user decides;\n                                         this waits up to the 10-minute lease TTL for the answer)\n  handoff list                           List handoff packages waiting for this body's user\n  handoff accept <package-id>            Accept a pending handoff (lease + handoff_accept)\n  handoff reject <package-id>            Decline a pending handoff (lease stays with the sender)\n  conflicts                              List unresolved sync conflicts with diffs\n  pending-approvals                      List SoulFile/profile records held for your approval (F7-02)\n  approve-sync <sync-id>                 Approve a held SoulFile/profile record (applies it)\n  reject-sync <sync-id>                  Reject a held SoulFile/profile record (drops it)\n  resolve <id> --keep-local|--keep-remote|--keep-both\n                                         Resolve one conflict\n  fake-esp32 --path xiaozhi|v2 --addr <host:port> --uuid <uuid> [--text <text>] [--ota-addr <host:port>]\n                                         Run a fake ESP32 device against a hub\n  bench [--quick]                        Measure budgets B1–B8 for real (isolated temp dirs)\n  approve-wait --addr <host:port>       Wait for a peer approval card on this hub session, show its full origin, and decide\n  help                                   Show this help\n\nPairing mode is process-scoped: start the peer hub with --allow-pairing.\n--auto-confirm is demo-only (auto-answers the SAS prompts) and prints a warning.\nThe hub has no body attached: driver methods are refused until the GUI wires one.\n";
+pub const FRIENDS_USAGE: &str = "mimint-cli friends: Phase 7 paired-body operations.\n\nUsage:\n  mimint-cli friends [--data-dir DIR] [--config PATH] [--db PATH] [--audit PATH] <command> [args]\n\nCommands:\n  devices                              List paired devices (trust, pairing state)\n  pair <addr> [--typing] [--guest] [--auto-confirm]\n                                         Pair with the hub at <addr> (initiator side;\n                                         the peer runs `friends hub --allow-pairing`)\n  sync <device-id> --addr <addr>         Two-way sync with a paired peer\n  revoke <device-id>                     Revoke a peer (keeps the entry; access cut)\n  delete <device-id>                     Delete a peer entry entirely\n  rename <device-id> <name>             Rename a peer\n  trust <device-id> <owner|guest>        Change the trust granted to a peer\n  reset-identity                         Rotate this body's identity key (old key refused at once)\n  approve-opt-in <device-id> --on|--off  Let a peer approve actions (default off)\n  hub [--lan] [--lab] [--allow-pairing] [--auto-confirm]\n                                         Run the hub in the foreground (brain: Ollama qwen2.5:3b)\n  handoff --to <id> --addr <addr> --task <text> [--next <text>] [--wait-secs N]\n                                         Offer a task handoff to a peer (the receiver's user decides;\n                                         this waits up to the 10-minute lease TTL for the answer)\n  handoff list                           List handoff packages waiting for this body's user\n  handoff accept <package-id>            Accept a pending handoff (lease + handoff_accept)\n  handoff reject <package-id>            Decline a pending handoff (lease stays with the sender)\n  conflicts                              List unresolved sync conflicts with diffs\n  pending-approvals                      List SoulFile/profile records held for your approval (F7-02)\n  approve-sync <sync-id>                 Approve a held SoulFile/profile record (applies it)\n  reject-sync <sync-id>                  Reject a held SoulFile/profile record (drops it)\n  resolve <id> --keep-local|--keep-remote|--keep-both\n                                         Resolve one conflict\n  fake-esp32 --path xiaozhi|v2 --addr <host:port> --uuid <uuid> [--text <text>] [--ota-addr <host:port>]\n                                         Run a fake ESP32 device against a hub\n  bench [--quick]                        Measure budgets B1–B8 for real (isolated temp dirs)\n  approve-wait --addr <host:port>       Wait for a peer approval card on this hub session, show its full origin, and decide\n  help                                   Show this help\n\nPairing mode is process-scoped: start the peer hub with --allow-pairing.\n--auto-confirm is demo-only (auto-answers the SAS prompts) and prints a warning.\nIt is refused unless MIMINT_DEMO_ALLOW_AUTO_CONFIRM=1 is set in the environment.\nThe hub has no body attached: driver methods are refused until the GUI wires one.\n";
 
 /// The CLI's driver backend: there is no body in this process,
 /// so every driver method is refused with a clear error rather
@@ -306,6 +306,21 @@ fn cmd_devices(args: &FriendsArgs) -> Result<(), MimintError> {
     Ok(())
 }
 
+/// `--auto-confirm` is demo-only and must stay out of real
+/// use: it only works when the operator explicitly opts in
+/// with `MIMINT_DEMO_ALLOW_AUTO_CONFIRM=1` (m5). Without the
+/// variable the command is refused before any network or
+/// pairing action.
+fn require_demo_auto_confirm() -> Result<(), MimintError> {
+    match std::env::var("MIMINT_DEMO_ALLOW_AUTO_CONFIRM") {
+        Ok(value) if value == "1" => Ok(()),
+        _ => Err(MimintError::Config(
+            "--auto-confirm is demo-only: set MIMINT_DEMO_ALLOW_AUTO_CONFIRM=1 to allow it"
+                .to_string(),
+        )),
+    }
+}
+
 fn cmd_pair(args: &FriendsArgs, rest: &[String]) -> Result<(), MimintError> {
     let addr = need_positional(rest, 0, "peer address (host:port)")?;
     let (ctx, _) = open_context(args)?;
@@ -321,6 +336,7 @@ fn cmd_pair(args: &FriendsArgs, rest: &[String]) -> Result<(), MimintError> {
     };
     let auto = has_flag(rest, "--auto-confirm");
     if auto {
+        require_demo_auto_confirm()?;
         println!("WARNING: --auto-confirm is demo-only: it auto-answers the SAS prompts.");
     }
     let mut stream = TcpStream::connect(&addr)
@@ -522,6 +538,7 @@ fn cmd_hub(args: &FriendsArgs, rest: &[String]) -> Result<(), MimintError> {
     // prompts itself (no human at the terminal).
     let auto = has_flag(rest, "--auto-confirm");
     if auto {
+        require_demo_auto_confirm()?;
         println!("WARNING: --auto-confirm is demo-only: the hub auto-answers the SAS prompts.");
     }
     let ui: Option<Arc<dyn mimint_core::friends::pairing::ListenerUi>> = if auto {
@@ -1297,4 +1314,36 @@ pub fn handshake_in_process(a: &FriendsContext, b: &FriendsContext) -> Result<()
             .map_err(|_| MimintError::Config("handshake listener thread panicked".to_string()))??;
         Ok(())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auto_confirm_gate_requires_env_opt_in() {
+        // One test holds the variable for all cases: env is
+        // process-global and tests run on parallel threads.
+        let key = "MIMINT_DEMO_ALLOW_AUTO_CONFIRM";
+        let saved = std::env::var(key).ok();
+        std::env::remove_var(key);
+        assert!(
+            require_demo_auto_confirm().is_err(),
+            "unset var must refuse --auto-confirm"
+        );
+        std::env::set_var(key, "yes");
+        assert!(
+            require_demo_auto_confirm().is_err(),
+            "a non-\"1\" value must refuse --auto-confirm"
+        );
+        std::env::set_var(key, "1");
+        assert!(
+            require_demo_auto_confirm().is_ok(),
+            "\"1\" must allow --auto-confirm"
+        );
+        match saved {
+            Some(value) => std::env::set_var(key, value),
+            None => std::env::remove_var(key),
+        }
+    }
 }

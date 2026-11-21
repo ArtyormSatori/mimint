@@ -2335,6 +2335,68 @@ fn sync_canary_secret_never_in_payload() {
 }
 
 #[test]
+fn sync_shared_note_arrives_shared_under_agent_default() {
+    // Dola notebook isolation (§5): a shared note received
+    // via apply_push lands as shared under AGENT_DEFAULT, and
+    // no private note of any agent is created or modified.
+    let a = Node::new("sna-a");
+    let b = Node::new("snb-b");
+    pair_nodes(&a, &b, SasFlow::Compare);
+    // B's private note (control): must be untouched.
+    let (_, b_private_id) = add_private_note(&b, "b-private", "b private body");
+    let b_private_before = note_body(&b, &b_private_id).unwrap();
+    let b_count_before = b.notebook.count().unwrap();
+    // A shares one note; B receives it via a plain push
+    // (no session exchange — apply_push is the unit under test).
+    let (_, shared_id) = add_shared_note(&a, "shared", "shared body");
+    let kinds = SyncKinds::all();
+    let offer = a.engine.build_offer(&kinds).unwrap();
+    let request = b
+        .engine
+        .handle_offer(&a.device_id(), &offer, &kinds)
+        .unwrap();
+    let push = a
+        .engine
+        .build_push(&b.device_id(), &request, &kinds)
+        .unwrap();
+    assert!(!push.records.is_empty(), "push must carry the shared note");
+    let outcomes = b.engine.apply_push(&a.device_id(), &push, &kinds).unwrap();
+    assert!(
+        outcomes.iter().any(|(id, _)| id == &shared_id),
+        "push outcomes must include the shared note"
+    );
+    let note = b
+        .notebook
+        .get_note_by_sync_id(&shared_id)
+        .unwrap()
+        .expect("shared note must arrive on B");
+    assert_eq!(note.body, "shared body");
+    assert!(note.shared, "received note must be shared");
+    assert_eq!(
+        note.owner_agent_id,
+        mimint_core::agents::AGENT_DEFAULT,
+        "received note must belong to AGENT_DEFAULT"
+    );
+    // No private note created or modified: exactly one note
+    // added (the shared one), same private body.
+    assert_eq!(b.notebook.count().unwrap(), b_count_before + 1);
+    assert_eq!(
+        note_body(&b, &b_private_id).as_deref(),
+        Some(b_private_before.as_str()),
+        "B's private note must be untouched"
+    );
+    let titles: Vec<String> = b
+        .notebook
+        .all_notes()
+        .unwrap()
+        .iter()
+        .map(|n| n.title.clone())
+        .collect();
+    assert!(titles.contains(&"b-private".to_string()));
+    assert!(titles.contains(&"shared".to_string()));
+}
+
+#[test]
 fn sync_private_notes_never_leave() {
     let a = Node::new("pnl-a");
     let b = Node::new("pnl-b");
@@ -3981,6 +4043,150 @@ fn handoff_complete_ack_returns_lease() {
     hub_b.stop();
 }
 
+#[test]
+fn handoff_complete_from_guest_refused() {
+    // m2: a Guest's HandoffComplete must not release the
+    // sender's lease — the hub refuses it with
+    // `handoff_refused_guest` and the package stays handed off.
+    let a = Node::new("hcg-a");
+    let b = Node::new("hcg-b");
+    // A pairs B as Guest from the ceremony (m2 needs a real
+    // Guest session: the confirm claim must match the grant,
+    // so a post-hoc downgrade cannot be used here).
+    let init_ui = ScriptedInitiatorUi {
+        decision: InitiatorDecision {
+            confirmed: true,
+            trust_granted: Trust::Guest,
+            fingerprint_confirmed: true,
+            fingerprint_skipped_with_warning: false,
+        },
+    };
+    let list_ui = ScriptedListenerUi {
+        decision: ListenerDecision {
+            sas_outcome: SasOutcome::Matched,
+            trust_granted: Trust::Owner,
+            fingerprint_confirmed: true,
+            fingerprint_skipped_with_warning: false,
+        },
+    };
+    let (ra, rb) = ceremony_with(&a, &b, SasFlow::Compare, &init_ui, &list_ui, None, None);
+    assert!(ra.is_ok() && rb.is_ok());
+    assert_eq!(
+        a.registry.get_peer(&b.device_id()).unwrap().unwrap().trust,
+        Trust::Guest
+    );
+    let backend = MockBackend::new();
+    let (hub_a, hub_b) = start_two_hubs(&a, &b, backend);
+    let package = make_package(&a, &b, "task");
+    let mut session_ab = handshake_to_hub(&a, &hub_b);
+    offer_over_session(&mut session_ab, &package);
+    assert!(!reply_waiting(&session_ab, 500));
+    hub_b.decide_handoff(&package.package_id, true).unwrap();
+    assert!(reply_waiting(&session_ab, 5_000));
+    let (kind, payload) = session_ab.recv().unwrap();
+    assert_eq!(kind, MessageKind::HandoffAccept);
+    let accept: HandoffAccept = serde_json::from_slice(&payload).unwrap();
+    a.handoff.mark_handed_off(&package.package_id);
+    assert!(a.handoff.is_handed_off(&package.package_id));
+    assert!(b.handoff.lease_for("body").is_some());
+    // B finishes the task and sends the complete ack to A's hub.
+    assert!(b.handoff.release_lease_by_id(&accept.lease_id));
+    let complete = HandoffComplete {
+        v: PROTOCOL_VERSION,
+        kind: "handoff_complete".to_string(),
+        package_id: package.package_id.clone(),
+        lease_id: accept.lease_id.clone(),
+    };
+    let mut session_ba = handshake_to_hub(&b, &hub_a);
+    session_ba
+        .send(
+            MessageKind::HandoffComplete,
+            &serde_json::to_vec(&complete).unwrap(),
+        )
+        .unwrap();
+    // A's hub refuses the Guest complete: the package stays
+    // handed off (the lease does not return) and the refusal
+    // is audited.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert!(
+        a.handoff.is_handed_off(&package.package_id),
+        "Guest complete must not return the lease"
+    );
+    assert!(
+        poll_audit_contains(&a, "handoff_refused_guest", 20),
+        "Guest complete must be audited as refused"
+    );
+    hub_a.stop();
+    hub_b.stop();
+}
+
+#[test]
+fn handoff_reject_from_guest_refused() {
+    // m2: a Guest's HandoffReject must not mark the sender's
+    // package rejected — the hub refuses it with
+    // `handoff_refused_guest`.
+    let a = Node::new("hrg-a");
+    let b = Node::new("hrg-b");
+    // A pairs B as Guest from the ceremony (m2 needs a real
+    // Guest session: the confirm claim must match the grant,
+    // so a post-hoc downgrade cannot be used here).
+    let init_ui = ScriptedInitiatorUi {
+        decision: InitiatorDecision {
+            confirmed: true,
+            trust_granted: Trust::Guest,
+            fingerprint_confirmed: true,
+            fingerprint_skipped_with_warning: false,
+        },
+    };
+    let list_ui = ScriptedListenerUi {
+        decision: ListenerDecision {
+            sas_outcome: SasOutcome::Matched,
+            trust_granted: Trust::Owner,
+            fingerprint_confirmed: true,
+            fingerprint_skipped_with_warning: false,
+        },
+    };
+    let (ra, rb) = ceremony_with(&a, &b, SasFlow::Compare, &init_ui, &list_ui, None, None);
+    assert!(ra.is_ok() && rb.is_ok());
+    assert_eq!(
+        a.registry.get_peer(&b.device_id()).unwrap().unwrap().trust,
+        Trust::Guest
+    );
+    let backend = MockBackend::new();
+    let (hub_a, hub_b) = start_two_hubs(&a, &b, backend);
+    let package = make_package(&a, &b, "task");
+    a.handoff.mark_handed_off(&package.package_id);
+    assert!(a.handoff.is_handed_off(&package.package_id));
+    let reject = HandoffReject {
+        v: PROTOCOL_VERSION,
+        kind: MessageKind::HandoffReject.as_str().to_string(),
+        package_id: package.package_id.clone(),
+        reason: "rejected_by_user".to_string(),
+    };
+    let mut session_ba = handshake_to_hub(&b, &hub_a);
+    session_ba
+        .send(
+            MessageKind::HandoffReject,
+            &serde_json::to_vec(&reject).unwrap(),
+        )
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert!(
+        !a.handoff.was_rejected(&package.package_id),
+        "Guest reject must not mark the package rejected"
+    );
+    assert!(
+        a.handoff.is_handed_off(&package.package_id),
+        "package must stay handed off after a refused Guest reject"
+    );
+    assert!(
+        poll_audit_contains(&a, "handoff_refused_guest", 20),
+        "Guest reject must be audited as refused"
+    );
+    hub_a.stop();
+    hub_b.stop();
+}
+
 // ----------------------------------------------------------------
 // §8.7 / §9.4 helpers
 // ----------------------------------------------------------------
@@ -5287,6 +5493,118 @@ fn session_rekey_flood_rate_limited_receiver_stays_open() {
     );
     let sb_rekeys = pump.join().unwrap();
     assert_eq!(sb_rekeys, 1, "receiver rekey count bounded");
+}
+
+/// m4: only side A initiates rekeys. When B hits the rekey
+/// threshold, `send` reports RekeyRequired and keeps the
+/// session open (no auto-rekey, no fail_session); after A
+/// initiates a rekey, B can send again.
+#[test]
+fn session_rekey_only_a_initiates() {
+    let a = Node::new("rka-a");
+    let b = Node::new("rka-b");
+    pair_nodes(&a, &b, SasFlow::Compare);
+    // Two messages per side before a rekey is due (the
+    // handshake confirm is itself a sealed message, so the
+    // first post-handshake send is message #2), and a short
+    // rekey timeout so a stuck rekey fails fast.
+    let config = SessionConfig {
+        rekey_after_messages: 2,
+        rekey_timeout_ms: 800,
+        idle_timeout_ms: 5_000,
+        ..SessionConfig::default()
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let b_id = Arc::clone(&b.identity);
+    let b_reg = Arc::clone(&b.registry);
+    let b_clock = b.clock.clone();
+    let cfg_b = config.clone();
+    let b_audit = Arc::clone(&b.audit);
+    let handle = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        handshake_listener(stream, &b_id, &b_reg, &cfg_b, &b_clock, Some(b_audit)).unwrap()
+    });
+    let stream = TcpStream::connect(addr).unwrap();
+    let sa =
+        handshake_initiator(stream, &a.identity, &a.registry, &config, &a.clock, None).unwrap();
+    let sb = handle.join().unwrap();
+    // Side B is whichever node has the larger device id
+    // (device ids are random; A/B is decided by comparison).
+    let sa = Arc::new(Mutex::new(sa));
+    let sb = Arc::new(Mutex::new(sb));
+    let (b_session, a_session) = if a.device_id() < b.device_id() {
+        (Arc::clone(&sb), Arc::clone(&sa))
+    } else {
+        (Arc::clone(&sa), Arc::clone(&sb))
+    };
+    // B sends until the threshold bites (the handshake
+    // confirm already sealed one message, so the exact count
+    // is not assumed): the failing send must report
+    // RekeyRequired and the session must stay open.
+    {
+        let mut b = b_session.lock().unwrap();
+        let mut sent_ok = 0;
+        let err = loop {
+            match b.send(MessageKind::SyncPush, b"ping") {
+                Ok(()) => {
+                    sent_ok += 1;
+                    if sent_ok > 5 {
+                        panic!("B never hit the rekey threshold");
+                    }
+                }
+                Err(err) => break err,
+            }
+        };
+        assert!(
+            sent_ok >= 1,
+            "B must send at least once before the threshold"
+        );
+        assert!(
+            err.to_string().contains("rekey required"),
+            "B at threshold must get RekeyRequired, got {err}"
+        );
+        assert!(
+            !b.is_closed(),
+            "B session must stay open after refused rekey"
+        );
+    }
+    // B pumps incoming messages on a thread: it answers A's
+    // ping with a pong, which proves B can send again after
+    // A rekeys.
+    let b_pump = Arc::clone(&b_session);
+    let pump = std::thread::spawn(move || {
+        let mut b = b_pump.lock().unwrap();
+        loop {
+            match b.recv() {
+                Ok((MessageKind::SyncPush, payload)) if payload.as_slice() == b"ping" => {
+                    b.send(MessageKind::SyncPush, b"pong").unwrap();
+                    return;
+                }
+                Ok(_) => continue,
+                Err(err) => panic!("B pump recv failed: {err}"),
+            }
+        }
+    });
+    {
+        let mut a = a_session.lock().unwrap();
+        a.initiate_rekey().unwrap();
+        a.send(MessageKind::SyncPush, b"ping").unwrap();
+        // B's pre-rekey pings were queued by run_rekey's wait
+        // loop; drain them until the pong arrives.
+        let mut got_pong = false;
+        for _ in 0..8 {
+            let (kind, payload) = a.recv().unwrap();
+            assert_eq!(kind, MessageKind::SyncPush);
+            if payload.as_slice() == b"pong" {
+                got_pong = true;
+                break;
+            }
+            assert_eq!(payload.as_slice(), b"ping");
+        }
+        assert!(got_pong, "B must answer after A rekeys");
+    }
+    pump.join().unwrap();
 }
 
 /// F7-11: a handoff turn is visible while Running, its

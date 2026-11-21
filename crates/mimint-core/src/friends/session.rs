@@ -295,8 +295,32 @@ impl SessionCrypto {
         kind: MessageKind,
         plaintext: &[u8],
     ) -> Result<SealedMessage, CryptoError> {
+        self.seal_inner(kind, plaintext, true)
+    }
+
+    /// Seal a rekey-protocol message (the responder's
+    /// RekeyAck): part of the rekey exchange itself, so the
+    /// rekey-due gate must not block it. The responder is
+    /// often due at the same moment as the initiator (same
+    /// age threshold, same start); blocking the ack would
+    /// deadlock the rekey — the initiator times out and both
+    /// sides fail (m4).
+    pub fn seal_rekey(
+        &mut self,
+        kind: MessageKind,
+        plaintext: &[u8],
+    ) -> Result<SealedMessage, CryptoError> {
+        self.seal_inner(kind, plaintext, false)
+    }
+
+    fn seal_inner(
+        &mut self,
+        kind: MessageKind,
+        plaintext: &[u8],
+        check_due: bool,
+    ) -> Result<SealedMessage, CryptoError> {
         self.drop_expired_old_key();
-        if self.rekey_due() {
+        if check_due && self.rekey_due() {
             return Err(CryptoError::RekeyRequired);
         }
         let direction = Direction::for_sender(self.local_is_a);
@@ -1170,8 +1194,17 @@ impl Session {
         match self.send_encrypted(kind, plaintext) {
             Ok(()) => Ok(()),
             Err(err) if err.to_string().contains("rekey required") => {
-                self.run_rekey()?;
-                self.send_encrypted(kind, plaintext)
+                // Only side A initiates rekeys (§2.4 step 6):
+                // both sides hit the threshold independently,
+                // so B must not start its own rekey. B reports
+                // the error and keeps the session open; the
+                // caller retries after A rekeys (m4).
+                if self.crypto.local_is_a {
+                    self.run_rekey()?;
+                    self.send_encrypted(kind, plaintext)
+                } else {
+                    Err(err)
+                }
             }
             Err(err) => {
                 self.fail_session(&err);
@@ -1348,7 +1381,10 @@ impl Session {
         };
         let ack_bytes = serde_json::to_vec(&ack).unwrap();
         // Ack with the OLD key, then switch the send key.
-        self.send_encrypted(MessageKind::RekeyAck, &ack_bytes)?;
+        // The ack bypasses the rekey-due gate (see
+        // seal_rekey): the responder is often due itself
+        // when the initiator rekeys.
+        self.send_encrypted_rekey(MessageKind::RekeyAck, &ack_bytes)?;
         self.crypto.switch_after_ack_sent(keys);
         Ok(())
     }
@@ -1359,6 +1395,29 @@ impl Session {
             CryptoError::RekeyRequired => MimintError::Config("friends rekey required".to_string()),
             other => MimintError::Config(format!("friends seal failed: {other}")),
         })?;
+        self.write_sealed(&sealed)
+    }
+
+    /// Seal + write a rekey-protocol message (RekeyAck): the
+    /// rekey-due gate must not block it — see seal_rekey (m4).
+    fn send_encrypted_rekey(
+        &mut self,
+        kind: MessageKind,
+        plaintext: &[u8],
+    ) -> Result<(), MimintError> {
+        let sealed = self
+            .crypto
+            .seal_rekey(kind, plaintext)
+            .map_err(|err| match err {
+                CryptoError::RekeyRequired => {
+                    MimintError::Config("friends rekey required".to_string())
+                }
+                other => MimintError::Config(format!("friends seal failed: {other}")),
+            })?;
+        self.write_sealed(&sealed)
+    }
+
+    fn write_sealed(&mut self, sealed: &SealedMessage) -> Result<(), MimintError> {
         let header_json = serde_json::to_vec(&sealed.header).unwrap();
         write_frame(&mut self.stream, &header_json, &sealed.ciphertext)?;
         Ok(())

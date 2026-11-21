@@ -1424,6 +1424,16 @@ impl Hub {
                     }
                 }
                 MessageKind::HandoffReject => {
+                    // Guests never send handoffs (§3.5, §7):
+                    // a Guest reject/complete must not touch the
+                    // sender's lease (m2).
+                    if peer.trust == Trust::Guest {
+                        self.audit(
+                            "handoff_refused_guest",
+                            serde_json::json!({"peer_device_id": peer_device_id}),
+                        );
+                        return Ok(());
+                    }
                     if let Ok(reject) = serde_json::from_slice::<HandoffReject>(&payload) {
                         self.audit(
                             "handoff_rejected_by_peer",
@@ -1439,6 +1449,16 @@ impl Hub {
                     }
                 }
                 MessageKind::HandoffComplete => {
+                    // Guests never send handoffs (§3.5, §7):
+                    // a Guest reject/complete must not touch the
+                    // sender's lease (m2).
+                    if peer.trust == Trust::Guest {
+                        self.audit(
+                            "handoff_refused_guest",
+                            serde_json::json!({"peer_device_id": peer_device_id}),
+                        );
+                        return Ok(());
+                    }
                     if let Ok(complete) = serde_json::from_slice::<HandoffComplete>(&payload) {
                         // The complete message carries no
                         // actuator: release by lease id, and
