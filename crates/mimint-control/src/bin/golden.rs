@@ -64,6 +64,22 @@
 //! pick. Best-of-N numbers (temperature 0.7) must NOT be
 //! compared with the temperature-0 single-shot baseline.
 //!
+//! Stub verification (`--stub-verify`, gap-verify P8): the
+//! deterministic stub can serve the Ollama task slots instead
+//! of the real model, to prove a code path LIVE that the real
+//! model never reaches — `drill-pass` (all 8 drill tasks click
+//! their box centers, so the drill exit-0 path is exercised),
+//! `bon-in-box` / `bon-out-of-box` (BoN rollouts click three
+//! points clustered within 16px, so the Majority rule fires
+//! live). ONLY the provider is swapped: the brain, guards,
+//! body, oracle, checker, exit logic and report are unchanged,
+//! and the report carries `verification_mode` + the records say
+//! provider `ollama:stub-verify`, so a stub-verify run can
+//! never be mistaken for a model measurement. What it proves
+//! is the PATH (exit code / rule / report); it does NOT prove
+//! the real model can pass — the Ollama numbers (0/8 drill,
+//! 0 majority activations) stand as measured.
+//!
 //! Approval: the gate runs headless with an auto-allow
 //! approver (the approval behavior itself is covered by the
 //! safety gate and the UI tests, not here). Every decision is
@@ -161,6 +177,29 @@ mod gate {
 
     fn in_box(point: (i32, i32), box_: (i32, i32, i32, i32)) -> bool {
         point.0 >= box_.0 && point.0 <= box_.2 && point.1 >= box_.1 && point.1 <= box_.3
+    }
+
+    /// Scripted cluster points for stub-verified Best-of-N
+    /// (gap-verify P8): three points on one horizontal line
+    /// through the box center, pairwise at most 16px apart so
+    /// they form a single Majority cluster (the greedy cluster
+    /// compares every point to the seed; the farthest pair is
+    /// 16px out-of-box and 2d <= 16px in-box). The MEDOID is
+    /// rollout 1 — never rollout 0 — so a Majority win is
+    /// distinguishable from First. `in_box = true`: all three
+    /// inside the box (`d` shrinks for narrow boxes, so even
+    /// GT-06's 17px-wide box fits); `false`: all three left of
+    /// the box (there is always room — the smallest box starts
+    /// at x = 100).
+    fn stub_cluster_points(task: &GoldenTask, in_box: bool) -> [(i32, i32); 3] {
+        let (cx, cy) = box_center(task.box_);
+        if in_box {
+            let d = ((task.box_.2 - task.box_.0) / 4).clamp(1, 8);
+            [(cx - d, cy), (cx, cy), (cx + d, cy)]
+        } else {
+            let dx = (cx - task.box_.0) + 8;
+            [(cx - dx, cy), (cx - dx - 8, cy), (cx - dx - 16, cy)]
+        }
     }
 
     /// The deterministic stub: screenshot, then one click at the
@@ -277,6 +316,40 @@ mod gate {
         }
     }
 
+    /// Stub-verification mode (gap-verify P8): when set, the
+    /// deterministic stub serves the Ollama task slots instead
+    /// of the real model, to prove a code path live that the
+    /// real model never reaches. `drill-pass` needs `--drill`;
+    /// `bon-in-box` / `bon-out-of-box` need `--best-of-n 3`
+    /// (exactly 3 scripted cluster points) and no `--drill`.
+    /// The Ollama preflight is skipped in this mode (no model
+    /// is contacted); the report records `verification_mode`.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum StubVerifyMode {
+        DrillPass,
+        BonInBox,
+        BonOutOfBox,
+    }
+
+    impl StubVerifyMode {
+        fn parse(value: &str) -> Option<StubVerifyMode> {
+            match value {
+                "drill-pass" => Some(StubVerifyMode::DrillPass),
+                "bon-in-box" => Some(StubVerifyMode::BonInBox),
+                "bon-out-of-box" => Some(StubVerifyMode::BonOutOfBox),
+                _ => None,
+            }
+        }
+
+        fn as_str(&self) -> &'static str {
+            match self {
+                StubVerifyMode::DrillPass => "drill-pass",
+                StubVerifyMode::BonInBox => "bon-in-box",
+                StubVerifyMode::BonOutOfBox => "bon-out-of-box",
+            }
+        }
+    }
+
     struct GateArgs {
         harness: PathBuf,
         workdir: PathBuf,
@@ -291,11 +364,12 @@ mod gate {
         ollama_timeout_secs: u64,
         best_of_n: Option<usize>,
         no_gate: bool,
+        stub_verify: Option<StubVerifyMode>,
         font: Option<String>,
         font_size: Option<f32>,
     }
 
-    const USAGE: &str = "usage: golden --harness <evalharness-bin> --workdir <dir> --log <out.jsonl> [--tasks GT-01,GT-02,GT-03,GT-04|none] [--ollama-task GT-01|none] [--ollama-tasks GT-01,...,GT-08] [--drill] [--no-gate] [--report <report.json>] [--base-url URL] [--model NAME] [--ollama-timeout-secs N] [--font <ttf>] [--font-size N] [--best-of-n N]\n       --best-of-n N runs each Ollama task N times (temperature 0.7, seeds 0..N-1) and picks the winner by oracle pass, then majority (16px clusters), then first; N must be 1..=5, default OFF. Best-of-N refuses a paid backend (local backends only, N>1). A BoN task's pass is the blind pick (no oracle); the oracle-selected pass is recorded as pass_at_n_oracle (oracle upper bound). N=1 is a single rollout with no diversity benefit.\n       --drill runs all 8 tasks through real Ollama, writes a 4-section JSON report. Exit codes (F8.2-01, F8.3-02): 0 = harness ran clean AND every requested task passed (BoN tasks count by blind_pick_pass); 1 = system/config/connection/parse error; 2 = measured but below threshold (full drill 8/8, subset n/n). --no-gate measures without gating (exit 0 when the harness ran clean, exit_reason measured_ungated); it has no effect in --drill mode.\n       Best-of-N (temperature=0.7) must be compared against single-shot (temperature=0.7); do not compare with temperature=0 baselines.\n       --ollama-tasks (list) wins over legacy --ollama-task (single) when both are given.";
+    const USAGE: &str = "usage: golden --harness <evalharness-bin> --workdir <dir> --log <out.jsonl> [--tasks GT-01,GT-02,GT-03,GT-04|none] [--ollama-task GT-01|none] [--ollama-tasks GT-01,...,GT-08] [--drill] [--no-gate] [--report <report.json>] [--base-url URL] [--model NAME] [--ollama-timeout-secs N] [--font <ttf>] [--font-size N] [--best-of-n N] [--stub-verify MODE]\n       --stub-verify MODE serves the Ollama task slots with the deterministic stub (no model contacted, Ollama preflight skipped) to prove a code path live: drill-pass (with --drill, no --best-of-n) clicks every box center so the drill exit-0 path is exercised; bon-in-box / bon-out-of-box (with --best-of-n 3, no --drill) run BoN rollouts that click three points clustered within 16px (medoid = rollout 1) so the Majority rule fires live - in-box points sit inside the task box (blind pick passes), out-of-box points sit left of it (Majority still fires, task fails OUT_OF_BOX). Only the provider is swapped; exit logic, oracle, checker and report are unchanged, and the report records verification_mode + provider ollama:stub-verify. This proves the PATH, not model capability.\n       --best-of-n N runs each Ollama task N times (temperature 0.7, seeds 0..N-1) and picks the winner by oracle pass, then majority (16px clusters), then first; N must be 1..=5, default OFF. Best-of-N refuses a paid backend (local backends only, N>1). A BoN task's pass is the blind pick (no oracle); the oracle-selected pass is recorded as pass_at_n_oracle (oracle upper bound). N=1 is a single rollout with no diversity benefit.\n       --drill runs all 8 tasks through real Ollama, writes a 4-section JSON report. Exit codes (F8.2-01, F8.3-02): 0 = harness ran clean AND every requested task passed (BoN tasks count by blind_pick_pass); 1 = system/config/connection/parse error; 2 = measured but below threshold (full drill 8/8, subset n/n). --no-gate measures without gating (exit 0 when the harness ran clean, exit_reason measured_ungated); it has no effect in --drill mode.\n       Best-of-N (temperature=0.7) must be compared against single-shot (temperature=0.7); do not compare with temperature=0 baselines.\n       --ollama-tasks (list) wins over legacy --ollama-task (single) when both are given.";
 
     fn parse_args() -> Result<GateArgs, String> {
         let args: Vec<String> = std::env::args().collect();
@@ -321,6 +395,7 @@ mod gate {
         let mut ollama_timeout_secs: u64 = 600;
         let mut best_of_n: Option<usize> = None;
         let mut no_gate = false;
+        let mut stub_verify: Option<StubVerifyMode> = None;
         let mut font = None;
         let mut font_size = None;
         let mut i = 1;
@@ -360,6 +435,17 @@ mod gate {
                 }
                 "--drill" => drill = true,
                 "--no-gate" => no_gate = true,
+                "--stub-verify" => {
+                    let value = next(&mut i);
+                    match StubVerifyMode::parse(&value) {
+                        Some(mode) => stub_verify = Some(mode),
+                        None => {
+                            return Err(format!(
+                                "--stub-verify MODE must be drill-pass, bon-in-box or bon-out-of-box, got {value}\n{USAGE}"
+                            ))
+                        }
+                    }
+                }
                 "--report" => report = Some(PathBuf::from(next(&mut i))),
                 "--base-url" => base_url = next(&mut i),
                 "--model" => model = next(&mut i),
@@ -411,6 +497,35 @@ mod gate {
                 "--drill needs at least one Ollama task (remove --ollama-tasks none)".to_string(),
             );
         }
+        // Stub-verify mode combinations (gap-verify P8): each
+        // mode proves exactly one code path, so the combinations
+        // are strict — a mixed invocation would prove nothing
+        // clearly. drill-pass serves the drill slots at box
+        // centers; bon-* serve BoN rollouts with exactly 3
+        // scripted cluster points (one per rollout).
+        if let Some(mode) = stub_verify {
+            match mode {
+                StubVerifyMode::DrillPass => {
+                    if !drill {
+                        return Err("--stub-verify drill-pass needs --drill".to_string());
+                    }
+                    if best_of_n.is_some() {
+                        return Err("--stub-verify drill-pass takes no --best-of-n".to_string());
+                    }
+                }
+                StubVerifyMode::BonInBox | StubVerifyMode::BonOutOfBox => {
+                    if drill {
+                        return Err(format!("--stub-verify {} takes no --drill", mode.as_str()));
+                    }
+                    if best_of_n != Some(3) {
+                        return Err(format!(
+                            "--stub-verify {} needs --best-of-n 3 (exactly 3 scripted cluster points)",
+                            mode.as_str()
+                        ));
+                    }
+                }
+            }
+        }
         let report = report.or_else(|| {
             if drill {
                 Some(PathBuf::from(&workdir).join("drill-report.json"))
@@ -432,6 +547,7 @@ mod gate {
             ollama_timeout_secs,
             best_of_n,
             no_gate,
+            stub_verify,
             font,
             font_size,
         })
@@ -555,9 +671,18 @@ mod gate {
         // + preflight: the server must answer AND carry the model
         // before any measurement starts. A dead server or a missing
         // model is BLOCKED, not a silent stub substitution.
+        // Stub-verify mode skips this whole block by design: no
+        // model is contacted, the deterministic stub serves the
+        // task slots, and the report says so (verification_mode).
         let mut ollama_provider: Option<Arc<ProviderClient>> = None;
         let mut preflight: Option<OllamaPreflight> = None;
-        if !args.ollama_tasks.is_empty() {
+        if let Some(mode) = args.stub_verify {
+            println!(
+                "STUB-VERIFY MODE: {} — the deterministic stub serves the Ollama task slots (no model contacted, Ollama preflight skipped). Only the provider is swapped; exit logic, oracle, checker and report are unchanged. This proves the PATH, not model capability.",
+                mode.as_str()
+            );
+        }
+        if !args.ollama_tasks.is_empty() && args.stub_verify.is_none() {
             let http = GuardedHttpClient::new(
                 EgressPolicy::privacy_off(),
                 Duration::from_secs(args.ollama_timeout_secs),
@@ -635,30 +760,41 @@ mod gate {
         // result even when the model misses (model quality is not
         // a pipeline bug). Every requested task gates the exit
         // code (F8.3-02) — drill or not — unless --no-gate opts
-        // out of gating for a measurement-only run.
-        if let Some(provider) = &ollama_provider {
+        // out of gating for a measurement-only run. In
+        // stub-verify mode the same loop runs with the
+        // deterministic stub in the Ollama slots (the guard
+        // admits the run on `stub_verify` alone; the provider
+        // name becomes `ollama:stub-verify`).
+        if ollama_provider.is_some() || args.stub_verify.is_some() {
             // Best-of-N cost warning (F8.3-06/07): printed BEFORE
             // any rollout, so the multiplied cost is visible
             // before it is spent — never only in the report.
+            // Skipped in stub-verify mode: no model is contacted
+            // and no cost is spent; the STUB-VERIFY banner above
+            // already says so.
             if let Some(n) = args.best_of_n {
-                if n > 1 {
-                    let reserve = BestOfNConfig::disabled()
-                        .reserve_per_rollout(BON_MAX_STEPS, DEFAULT_MAX_TOKENS);
-                    println!("BEST-OF-N ENABLED");
-                    println!(
-                        "  rollouts: {n} (temperature 0.7, seeds {}..{})",
-                        DEFAULT_BASE_SEED,
-                        DEFAULT_BASE_SEED + n as u64 - 1
-                    );
-                    println!("  backend: {} (model {})", args.base_url, args.model);
-                    println!(
-                        "  cost: compute may approach {n}x single-shot; token budget {DEFAULT_TOKEN_BUDGET} total, reserve {reserve} per rollout"
-                    );
-                    println!("  selection: oracle pass, then majority (16px clusters), then first");
-                    println!("  No model judge is used.");
-                    println!("  Best-of-N (temperature=0.7) must be compared against single-shot (temperature=0.7); do not compare with temperature=0 baselines.");
-                } else {
-                    println!("best-of-n 1: a single rollout, no diversity benefit (N=1)");
+                if args.stub_verify.is_none() {
+                    if n > 1 {
+                        let reserve = BestOfNConfig::disabled()
+                            .reserve_per_rollout(BON_MAX_STEPS, DEFAULT_MAX_TOKENS);
+                        println!("BEST-OF-N ENABLED");
+                        println!(
+                            "  rollouts: {n} (temperature 0.7, seeds {}..{})",
+                            DEFAULT_BASE_SEED,
+                            DEFAULT_BASE_SEED + n as u64 - 1
+                        );
+                        println!("  backend: {} (model {})", args.base_url, args.model);
+                        println!(
+                            "  cost: compute may approach {n}x single-shot; token budget {DEFAULT_TOKEN_BUDGET} total, reserve {reserve} per rollout"
+                        );
+                        println!(
+                            "  selection: oracle pass, then majority (16px clusters), then first"
+                        );
+                        println!("  No model judge is used.");
+                        println!("  Best-of-N (temperature=0.7) must be compared against single-shot (temperature=0.7); do not compare with temperature=0 baselines.");
+                    } else {
+                        println!("best-of-n 1: a single rollout, no diversity benefit (N=1)");
+                    }
                 }
             }
             // Best-of-N refuses a paid backend outright (F8.3-10):
@@ -670,19 +806,46 @@ mod gate {
             // explicit second check for the multiplied cost of N
             // rollouts. (There is no `cap_usd` lock on the harness
             // path — the old comment claiming one was wrong.)
+            // In stub-verify mode there is no Ollama provider to
+            // check: the stub is local by construction.
             if let Some(n) = args.best_of_n {
-                require_local_backend(n, provider.is_paid()).map_err(|err| err.to_string())?;
+                if let Some(provider) = &ollama_provider {
+                    require_local_backend(n, provider.is_paid()).map_err(|err| err.to_string())?;
+                }
             }
             for task_id in &args.ollama_tasks {
                 let Some(task) = TASKS.iter().find(|t| t.id == task_id) else {
                     return Err(format!("unknown ollama task: {task_id}"));
                 };
                 let prompt = ollama_prompt(task);
+                // Stub-verify records say provider
+                // `ollama:stub-verify` so they count in the
+                // report's Ollama section (pass/total, gate) while
+                // staying unmistakable as stub runs; the report
+                // also carries `verification_mode`.
+                let provider_name = if args.stub_verify.is_some() {
+                    "ollama:stub-verify".to_string()
+                } else {
+                    format!("ollama:{}", args.model)
+                };
                 let mut record = match args.best_of_n.filter(|&n| n > 1) {
                     Some(n) => {
+                        // Stub-verify BoN: each rollout clicks one
+                        // scripted cluster point (medoid = rollout
+                        // 1); the real path builds an Ollama client
+                        // per rollout instead.
+                        let stub_points = match args.stub_verify {
+                            Some(StubVerifyMode::BonInBox) => {
+                                Some(stub_cluster_points(task, true).to_vec())
+                            }
+                            Some(StubVerifyMode::BonOutOfBox) => {
+                                Some(stub_cluster_points(task, false).to_vec())
+                            }
+                            _ => None,
+                        };
                         run_best_of_n_task(
                             task,
-                            &format!("ollama:{}", args.model),
+                            &provider_name,
                             &args.base_url,
                             &args.model,
                             args.ollama_timeout_secs,
@@ -696,14 +859,27 @@ mod gate {
                             &font_size,
                             &prompt,
                             n,
+                            stub_points.as_deref(),
                         )
                         .await
                     }
                     None => {
+                        // Single-shot path: the real provider, or
+                        // the deterministic stub at the box center
+                        // in drill-pass stub-verify mode.
+                        let task_provider: Arc<dyn Provider> =
+                            match args.stub_verify {
+                                Some(StubVerifyMode::DrillPass) => {
+                                    Arc::new(StubProvider::for_task(box_center(task.box_)))
+                                }
+                                _ => Arc::clone(ollama_provider.as_ref().expect(
+                                    "real Ollama provider present outside stub-verify mode",
+                                )) as Arc<dyn Provider>,
+                            };
                         run_one_task(
                             task,
-                            &format!("ollama:{}", args.model),
-                            Arc::clone(provider) as Arc<dyn Provider>,
+                            &provider_name,
+                            task_provider,
                             &actor,
                             &frames,
                             &notebook,
@@ -824,6 +1000,7 @@ mod gate {
                 seed_prompt_ref: seed_prompt_ref(),
                 sampling: sampling_for_report(&records),
                 gated,
+                verification_mode: args.stub_verify.map(|m| m.as_str().to_string()),
             };
             let report = build_report(
                 mode,
@@ -1056,6 +1233,13 @@ mod gate {
         /// non-drill gates unless `--no-gate` was given or no
         /// Ollama task ran.
         gated: bool,
+        /// Stub-verification mode (gap-verify P8): `None` for a
+        /// real run; `Some("drill-pass" | "bon-in-box" |
+        /// "bon-out-of-box")` when the deterministic stub served
+        /// the Ollama task slots instead of the real model. The
+        /// report renders this prominently so the run can never
+        /// be read as a model measurement.
+        verification_mode: Option<String>,
     }
 
     /// Box area (F8.2-06): inclusive pixel count + share of the
@@ -1377,10 +1561,22 @@ mod gate {
                 }),
                 json!({"ok": pf.warmup_ok, "ms": pf.warmup_ms}),
             ),
-            None => (
-                json!({"responded": false, "model": model, "base_url": base_url, "model_present": false, "models": [], "digest": "unknown", "error": "no Ollama tasks in this run"}),
-                json!({"ok": false, "ms": 0}),
-            ),
+            None => {
+                // In stub-verify mode there is no preflight to
+                // report — but there WERE Ollama-slot tasks (served
+                // by the stub), so the default "no Ollama tasks"
+                // message would be wrong here.
+                let error = match &extra.verification_mode {
+                    Some(mode) => format!(
+                        "stub-verify mode ({mode}): Ollama preflight skipped by design — the deterministic stub served the task slots, no model was contacted"
+                    ),
+                    None => "no Ollama tasks in this run".to_string(),
+                };
+                (
+                    json!({"responded": false, "model": model, "base_url": base_url, "model_present": false, "models": [], "digest": "unknown", "error": error}),
+                    json!({"ok": false, "ms": 0}),
+                )
+            }
         };
         json!({
             "schema_version": 3,
@@ -1394,6 +1590,17 @@ mod gate {
             "commit_sha": extra.commit_sha,
             "seed_prompt_ref": extra.seed_prompt_ref,
             "exit_reason": extra.exit_reason,
+            "verification_mode": extra
+                .verification_mode
+                .clone()
+                .map(Value::String)
+                .unwrap_or(Value::Null),
+            "verification_note": match &extra.verification_mode {
+                Some(mode) => json!(format!(
+                    "STUB-VERIFY RUN ({mode}): the Ollama task slots were served by the deterministic stub (box centers / clustered points), NOT the real model. This run proves the exit-code / selection-rule / report PATH only; it does not measure model capability. Real-model numbers (drill 0/8, 0 majority activations) stand as measured."
+                )),
+                None => Value::Null,
+            },
             "best_of_n": best_of_n_summary,
             "validation_set": "held-out sealed (phase5/HELDOUT-SEAL.md) — NOT used in this run",
             "summary": {
@@ -1710,6 +1917,14 @@ mod gate {
         font_size: &str,
         prompt: &str,
         n: usize,
+        // Scripted cluster points for stub-verify BoN
+        // (gap-verify P8): `Some` replaces the per-rollout
+        // Ollama client with the deterministic stub clicking
+        // `points[i]`; `None` is the real path. The points are
+        // box-relative (see `stub_cluster_points`); the
+        // selection, grading and budget code below are
+        // untouched by this switch.
+        stub_points: Option<&[(i32, i32)]>,
     ) -> Value {
         let config = match BestOfNConfig::new(n, DEFAULT_TOKEN_BUDGET) {
             Ok(config) => config,
@@ -1747,31 +1962,37 @@ mod gate {
                     break;
                 }
             };
-            let rollout_provider = match build_rollout_client(
-                base_url,
-                model,
-                timeout_secs,
-                BestOfNConfig::rollout_temperature(),
-                config.rollout_seed(i),
-            ) {
-                Ok(provider) => provider,
-                Err(err) => {
-                    let _ = reservation.settle_unmeasured();
-                    candidates.push(RolloutCandidate {
-                        index: i,
-                        predicted: None,
-                        text: String::new(),
-                        tools_used: Vec::new(),
-                        steps: 0,
-                        latency_ms: 0,
-                        turn_error: Some(err),
-                        clicks_recorded: 0,
-                        has_frame: false,
-                        input_sha256: None,
-                        tokens_measured: None,
-                    });
-                    continue;
-                }
+            // Stub-verify BoN: rollout i clicks one scripted
+            // cluster point; the real path builds a fresh Ollama
+            // client per rollout (own sampling, D-P83-2).
+            let rollout_provider: Arc<dyn Provider> = match stub_points {
+                Some(points) => Arc::new(StubProvider::for_task(points[i % points.len()])),
+                None => match build_rollout_client(
+                    base_url,
+                    model,
+                    timeout_secs,
+                    BestOfNConfig::rollout_temperature(),
+                    config.rollout_seed(i),
+                ) {
+                    Ok(provider) => provider,
+                    Err(err) => {
+                        let _ = reservation.settle_unmeasured();
+                        candidates.push(RolloutCandidate {
+                            index: i,
+                            predicted: None,
+                            text: String::new(),
+                            tools_used: Vec::new(),
+                            steps: 0,
+                            latency_ms: 0,
+                            turn_error: Some(err),
+                            clicks_recorded: 0,
+                            has_frame: false,
+                            input_sha256: None,
+                            tokens_measured: None,
+                        });
+                        continue;
+                    }
+                },
             };
             // Per-rollout wall-clock deadline (F8.3-05): the
             // in-flight turn is dropped when it fires, and the
@@ -2107,6 +2328,7 @@ mod gate {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use mimint_core::best_of_n::majority_point;
 
         fn args_of(flags: &[&str]) -> Vec<String> {
             let mut v = vec!["golden".to_string()];
@@ -2179,6 +2401,137 @@ mod gate {
         }
 
         #[test]
+        fn parse_stub_verify_drill_pass_needs_drill() {
+            // Valid: drill-pass with --drill, no --best-of-n.
+            let mut flags = base_flags();
+            flags.extend(["--drill", "--stub-verify", "drill-pass"]);
+            let args = parse_args_from(&args_of(&flags)).unwrap();
+            assert_eq!(args.stub_verify, Some(StubVerifyMode::DrillPass));
+            // Missing --drill: rejected.
+            let mut flags = base_flags();
+            flags.extend(["--stub-verify", "drill-pass"]);
+            assert!(parse_args_from(&args_of(&flags)).is_err());
+            // With --best-of-n: rejected.
+            let mut flags = base_flags();
+            flags.extend(["--drill", "--best-of-n", "3", "--stub-verify", "drill-pass"]);
+            assert!(parse_args_from(&args_of(&flags)).is_err());
+        }
+
+        #[test]
+        fn parse_stub_verify_bon_needs_best_of_n_3_no_drill() {
+            // Valid: bon-in-box with --best-of-n 3, no --drill.
+            let mut flags = base_flags();
+            flags.extend([
+                "--ollama-tasks",
+                "GT-05",
+                "--tasks",
+                "none",
+                "--best-of-n",
+                "3",
+                "--stub-verify",
+                "bon-in-box",
+            ]);
+            let args = parse_args_from(&args_of(&flags)).unwrap();
+            assert_eq!(args.stub_verify, Some(StubVerifyMode::BonInBox));
+            // N != 3: rejected (exactly 3 scripted points).
+            let mut flags = base_flags();
+            flags.extend(["--best-of-n", "2", "--stub-verify", "bon-in-box"]);
+            assert!(parse_args_from(&args_of(&flags)).is_err());
+            // With --drill: rejected.
+            let mut flags = base_flags();
+            flags.extend([
+                "--drill",
+                "--best-of-n",
+                "3",
+                "--stub-verify",
+                "bon-out-of-box",
+            ]);
+            assert!(parse_args_from(&args_of(&flags)).is_err());
+            // Unknown mode: rejected.
+            let mut flags = base_flags();
+            flags.extend(["--drill", "--stub-verify", "bon-everywhere"]);
+            assert!(parse_args_from(&args_of(&flags)).is_err());
+        }
+
+        /// Squared distance, for the cluster-point tests below.
+        fn dist_sq(a: (i32, i32), b: (i32, i32)) -> i64 {
+            let dx = i64::from(a.0) - i64::from(b.0);
+            let dy = i64::from(a.1) - i64::from(b.1);
+            dx * dx + dy * dy
+        }
+
+        #[test]
+        fn stub_cluster_points_in_box_cluster_with_medoid_rollout_1() {
+            // Every task: all three points inside the box, one
+            // cluster (pairwise <= 16px), medoid = rollout 1 —
+            // never rollout 0, so a Majority win differs from
+            // First. This is the property the live bon-in-box run
+            // relies on.
+            for task in TASKS {
+                let points = stub_cluster_points(task, true);
+                assert!(
+                    points.iter().all(|&p| in_box(p, task.box_)),
+                    "{} in-box points leave the box: {points:?} vs {:?}",
+                    task.id,
+                    task.box_
+                );
+                for (i, &a) in points.iter().enumerate() {
+                    for &b in &points[i + 1..] {
+                        assert!(
+                            dist_sq(a, b) <= 16 * 16,
+                            "{} points too far apart: {a:?} vs {b:?}",
+                            task.id
+                        );
+                    }
+                }
+                assert_eq!(
+                    majority_point(&points.map(Some)),
+                    Some(points[1]),
+                    "{} medoid is not rollout 1: {points:?}",
+                    task.id
+                );
+            }
+        }
+
+        #[test]
+        fn stub_cluster_points_out_of_box_cluster_with_medoid_rollout_1() {
+            // Every task: all three points left of the box, one
+            // cluster (pairwise <= 16px), medoid = rollout 1.
+            // The live bon-out-of-box run relies on this: no
+            // oracle pass, Majority still fires, task fails
+            // OUT_OF_BOX.
+            for task in TASKS {
+                let points = stub_cluster_points(task, false);
+                assert!(
+                    points.iter().all(|&p| !in_box(p, task.box_)),
+                    "{} out-of-box points enter the box: {points:?} vs {:?}",
+                    task.id,
+                    task.box_
+                );
+                assert!(
+                    points.iter().all(|&(x, _)| (0..1024).contains(&x)),
+                    "{} out-of-box points leave the screen: {points:?}",
+                    task.id
+                );
+                for (i, &a) in points.iter().enumerate() {
+                    for &b in &points[i + 1..] {
+                        assert!(
+                            dist_sq(a, b) <= 16 * 16,
+                            "{} points too far apart: {a:?} vs {b:?}",
+                            task.id
+                        );
+                    }
+                }
+                assert_eq!(
+                    majority_point(&points.map(Some)),
+                    Some(points[1]),
+                    "{} medoid is not rollout 1: {points:?}",
+                    task.id
+                );
+            }
+        }
+
+        #[test]
         fn parse_tasks_none_and_unknown_arg() {
             let mut flags = base_flags();
             flags.extend(["--tasks", "none", "--ollama-task", "none"]);
@@ -2239,6 +2592,7 @@ mod gate {
                     "session_reset_per_task": true,
                 }),
                 gated: true,
+                verification_mode: None,
             }
         }
 
